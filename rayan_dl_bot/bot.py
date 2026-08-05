@@ -1192,10 +1192,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(i18n.t(lang, "banned"))
         return
 
-    if rate_limited(uid):
-        await update.message.reply_text(i18n.t(lang, "rate_limit"))
-        return
-
     # Extract the first URL from the message (handles "@bot" mentions, extra text, etc.)
     raw_text = update.message.text.strip()
     m = re.search(r'https?://[^\s]+', raw_text)
@@ -1211,6 +1207,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if is_group:
             return
         await update.message.reply_text(i18n.t(lang, "invalid_url"), parse_mode="Markdown")
+        return
+
+    # Rate limit only applies to actual link messages (not normal chat)
+    if rate_limited(uid):
+        await update.message.reply_text(i18n.t(lang, "rate_limit"))
         return
 
     site = dl.detect_site(url)
