@@ -264,8 +264,44 @@ def get_video_info(url: str) -> dict:
 
 # ── Download ──────────────────────────────────────────────────
 def download_audio_wav(url: str, out_wav: str, seconds: int = 30) -> bool:
-    """Download just the audio of a video link as mono WAV for fingerprinting."""
+    """Download just the audio of a video link as mono WAV for fingerprinting.
+    Instagram uses the embed workaround (ig_tw); everything else uses yt-dlp."""
     import shutil
+
+    def _ffmpeg_wav(src: str) -> bool:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", src, "-t", str(seconds),
+             "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", out_wav],
+            capture_output=True, text=True, timeout=120,
+        )
+        return r.returncode == 0 and os.path.exists(out_wav) and os.path.getsize(out_wav) > 0
+
+    # ── Instagram: fetch direct mp4 from embed page, then extract audio ──
+    if is_instagram(url):
+        try:
+            url = clean_instagram_url(url)
+            # igtw is loaded at module top (importlib)
+            video_url = igtw.extract_ig_video_url(url)
+            if not video_url:
+                return False
+            src = out_wav + ".ig.mp4"
+            r = subprocess.run(
+                ["curl", "-s", "-L", "--max-time", "120", "-A", igtw.UA, "-o", src, video_url],
+                capture_output=True, text=True, timeout=140,
+            )
+            if not (os.path.exists(src) and os.path.getsize(src) > 0):
+                return False
+            ok = _ffmpeg_wav(src)
+            try:
+                os.remove(src)
+            except Exception:
+                pass
+            return ok
+        except Exception as e:
+            log.error("ig download_audio_wav: %s", e)
+            return False
+
+    # ── Other sites: yt-dlp bestaudio ──
     tmp = out_wav + ".raw"
     try:
         r = subprocess.run(
@@ -281,17 +317,12 @@ def download_audio_wav(url: str, out_wav: str, seconds: int = 30) -> bool:
         if not cands:
             return False
         src = cands[0]
-        ok = subprocess.run(
-            ["ffmpeg", "-y", "-i", src, "-t", str(seconds),
-             "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", out_wav],
-            capture_output=True, text=True, timeout=120,
-        ).returncode == 0
-        shutil.rmtree(os.path.dirname(tmp), ignore_errors=True) if False else None
+        ok = _ffmpeg_wav(src)
         try:
             os.remove(src)
         except Exception:
             pass
-        return ok and os.path.exists(out_wav) and os.path.getsize(out_wav) > 0
+        return ok
     except Exception as e:
         log.error("download_audio_wav: %s", e)
         return False
