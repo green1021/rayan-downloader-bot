@@ -4,7 +4,7 @@ All notable changes to the Rayan Downloader Bot.
 
 ## [1.0.0] - 2026-08-05
 ### Added
-- Initial release (v3 codebase)
+- Initial release
 - Multi-language support (fa/en default full; tr/ru/de/es via extra packs)
 - Multi-site download: YouTube, TikTok, Instagram, Twitter/X
 - **Twitter full support**: video, photos, text, thread walking, quote tweets

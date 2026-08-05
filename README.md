@@ -24,7 +24,7 @@ pip install -r requirements.txt   # python-telegram-bot, yt-dlp
 export TG_BOT_TOKEN="YOUR_BOT_TOKEN"
 
 # 3. Run
-python3 rayan_dl_bot_v3_main.py
+python3 rayan_dl_bot_main.py
 ```
 
 > The bot reads its token from `TG_BOT_TOKEN` env var, or falls back to a legacy token file. Tokens are **never** committed.
@@ -32,7 +32,7 @@ python3 rayan_dl_bot_v3_main.py
 ## 🗂 Structure
 
 ```
-rayan_dl_bot_v3/
+rayan_dl_bot/
 ├── bot.py          # Handlers + admin panel + group mode
 ├── db.py           # SQLite + schema migration
 ├── downloader.py   # Download engine (yt-dlp)

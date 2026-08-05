@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-db.py — Extended SQLite database for Rayan Downloader Bot v3
+db.py — Extended SQLite database for Rayan Downloader Bot
 Tables: users (lang, banned), links (status), downloads (per-attempt stats)
 """
 

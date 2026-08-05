@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-downloader.py — Core download engine for Rayan Downloader Bot v3
+downloader.py — Core download engine for Rayan Downloader Bot
 - Fast concurrent downloads (yt-dlp -N)
 - Smart proxy routing (direct / Tor / WARP)
 - Pornhub custom downloader integration

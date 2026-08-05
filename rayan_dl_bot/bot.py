@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Rayan Downloader Bot v3 — main entrypoint
+Rayan Downloader Bot — main entrypoint
 Multi-language + admin panel + fast concurrent downloads
 """
 
@@ -56,7 +56,7 @@ ADMIN_IDS = [int(x) for x in os.environ.get("TG_ADMIN_IDS", "1073129651").split(
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
-log = logging.getLogger("rayan-dl-v3")
+log = logging.getLogger("rayan-dl")
 
 # ── Rate limiting (simple per-user) ───────────────────────────
 _rate = {}
@@ -693,7 +693,10 @@ async def _is_group_admin(update: Update, user_id: int) -> bool:
 
 
 async def group_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(i18n.t(lang_of(update), "group_help"))
+    text = i18n.t(lang_of(update), "group_help")
+    # Add a clear privacy-mode note
+    text += i18n.t(lang_of(update), "group_privacy_note")
+    await update.message.reply_text(text)
 
 
 async def group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1502,6 +1505,29 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ── Main ──────────────────────────────────────────────────────
+async def _register_commands(app) -> None:
+    """Register slash-command menu so Telegram shows them when user types '/'.
+    This is what makes commands appear in the group/private command picker."""
+    try:
+        from telegram import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
+        private_cmds = [
+            BotCommand("start", "🚀 Start / شروع"),
+            BotCommand("help", "ℹ️ Help / راهنما"),
+            BotCommand("lang", "🌍 Language / زبان"),
+            BotCommand("settings", "⚙️ Default quality"),
+            BotCommand("history", "📜 Download history"),
+            BotCommand("about", "🤖 About"),
+        ]
+        _all = private_cmds + [BotCommand("admin", "🛡 Admin panel")]
+        await app.bot.set_my_commands(_all, scope=BotCommandScopeDefault())
+        # Admin sees /admin in their private chat
+        await app.bot.set_my_commands(
+            _all, scope=BotCommandScopeChat(chat_id=ADMIN_IDS[0]))
+        log.info("registered command menu (private + admin)")
+    except Exception as e:
+        log.warning("set_my_commands failed: %s", e)
+
+
 def main():
     db.init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).base_url("http://127.0.0.1:8081/bot").build()
@@ -1535,8 +1561,9 @@ def main():
     app.add_handler(CallbackQueryHandler(button_click))
 
     app.add_error_handler(error_handler)
+    app.post_init = _register_commands
 
-    log.info("رایان دانلودر v3 started... (admins: %s)", ADMIN_IDS)
+    log.info("رایان دانلودر started... (admins: %s)", ADMIN_IDS)
     app.run_polling()
 
 

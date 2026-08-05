@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ig_tw.py — Instagram + Twitter downloaders for Rayan Downloader Bot v3
+ig_tw.py — Instagram + Twitter downloaders for Rayan Downloader Bot
 - Instagram: fetch /embed/ page, extract video_url (works logged-out for public posts)
 - Twitter: yt-dlp with syndication fallback (works for public video tweets)
 """

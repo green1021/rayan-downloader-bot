@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-i18n — Multi-language support for Rayan Downloader Bot v3
+i18n — Multi-language support for Rayan Downloader Bot
 Languages: fa (default), en, ar, tr, ru, de, es, fr, hi, zh, pt
 """
 
@@ -80,6 +80,7 @@ LANGUAGES = {
         "admin_link_line": "▫️ [{user}](tg://user?id={uid}) — {site}\n   📝 {title}\n   🔗 {url}\n   🕒 {time}",
         "no_links": "📭 هنوز لینکی ارسال نشده.",
         "group_help": "👥 **راهنمای گروه**\n\nاین ربات توی گروه هم کار می‌کنه! تنظیمات:\n\n/setquality <کیفیت> — حداکثر کیفیت (مثلا 720 یا 1080)\n/autodl on|off — دانلود خودکار بدون سوال\n/silent on|off — حالت بی‌صدا (بدون پیام اضافه)\n/commandonly on|off — فقط با /ytdl دانلود کن\n/ytdl <لینک> — دانلود صریح با کامند\n/groupsettings — وضعیت فعلی\n\nفقط ادمین‌های گروه می‌تونن تنظیم کنن.",
+        "group_privacy_note": "\n\n⚠️ **نکته مهم:** اگه کامندها جواب نمی‌دن، ربات رو **ادمین گروه** کن (تنظیمات گروه → ادمین‌ها → add bot) یا حالت privacy رو خاموش کن — تلگرام اگه ربات ادمین نباشه، پیام‌های گروه رو بهش نمی‌ده.",
         "group_settings": "⚙️ **تنظیمات گروه:**\n\n🎯 حداکثر کیفیت: {quality}p\n⚡ دانلود خودکار: {auto}\n🔇 حالت بی‌صدا: {silent}\n🔒 فقط با کامند: {cmdonly}",
         "group_on": "✅ روشن",
         "group_off": "❌ خاموش",
@@ -128,7 +129,7 @@ LANGUAGES = {
         "name": "English",
         "start": "🎬 **Rayan Downloader** — Download anything you love!\n\nJust send **a link**:\n🔹 YouTube 🎥 | Instagram 📸 | Twitter 🐦 | TikTok ⏱\n🔹 And dozens more!\n\n✨ **What you can do:**\n⚡ Fast concurrent downloads (up to 8× faster)\n🎵 Convert videos to MP3\n📸 Download Twitter & Instagram photos\n🧵 Full Twitter threads\n📝 Read tweet text\n🌍 10+ languages\n\n🚀 **Send me a link right now and let's start!**\n\n💡 Help: /help — Change language: /lang",
         "help": "📖 **Bot Help**\n\n▫️ **Send a link** to start downloading\n▫️ Use **buttons** to pick quality\n▫️ 🎵 = audio only (MP3)\n\n🛠 **Commands:**\n/start — Start\n/help — Help\n/lang — Change language\n/settings — Default quality\n/history — Download history\n/about — About\n\n👥 **In groups:**\n/grouphelp — Group mode guide\n\n🌍 To change language: /lang",
-        "about": "🤖 **Rayan Downloader** — v3\n\n⚙️ **Powerful engine:** yt-dlp + custom downloader\n🚀 **High speed:** 8 concurrent downloads\n🌍 **Languages:** 10+ supported\n🛡 **Features:** admin panel, group mode, personal settings\n\n🔒 **Privacy:** files are deleted right after sending.\n\nMade with ❤️ for fast & easy downloads",
+        "about": "🤖 **Rayan Downloader**\n\n⚙️ **Powerful engine:** yt-dlp + custom downloader\n🚀 **High speed:** 8 concurrent downloads\n🌍 **Languages:** 10+ supported\n🛡 **Features:** admin panel, group mode, personal settings\n\n🔒 **Privacy:** files are deleted right after sending.\n\nMade with ❤️ for fast & easy downloads",
         "lang_menu": "🌍 **Choose Language:**",
         "lang_prompt": "🌍 **Welcome to Rayan Downloader!**\n\nPlease choose your language:\n*(English is default if you don't choose)*",
         "lang_set": "✅ Language set to **{lang}**.",
@@ -192,6 +193,7 @@ LANGUAGES = {
         "admin_link_line": "▫️ [{user}](tg://user?id={uid}) — {site}\n   📝 {title}\n   🔗 {url}\n   🕒 {time}",
         "no_links": "📭 No links sent yet.",
         "group_help": "👥 **Group Help**\n\nThis bot works in groups too! Settings:\n\n/setquality <quality> — max quality (e.g. 720 or 1080)\n/autodl on|off — auto-download without asking\n/silent on|off — silent mode (no extra messages)\n/commandonly on|off — only download via /ytdl\n/ytdl <link> — explicit download\n/groupsettings — current settings\n\nOnly group admins can configure.",
+        "group_privacy_note": "\n\n⚠️ **Important:** If commands don't respond, add the bot as a **group admin** (Group Settings → Administrators → Add Bot) or disable privacy mode — Telegram won't forward group messages to the bot unless it's an admin.",
         "group_settings": "⚙️ **Group Settings:**\n\n🎯 Max quality: {quality}p\n⚡ Auto download: {auto}\n🔇 Silent mode: {silent}\n🔒 Command only: {cmdonly}",
         "group_on": "✅ On",
         "group_off": "❌ Off",
