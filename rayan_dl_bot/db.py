@@ -127,7 +127,13 @@ def init_db():
 
 
 def _conn():
-    return sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH)
+    # Speed: WAL + synchronous=NORMAL dramatically improves write throughput
+    # (batches many small writes instead of fsync per transaction).
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
+    c.execute("PRAGMA busy_timeout=5000")
+    return c
 
 
 def record_user(update) -> int:
@@ -138,23 +144,20 @@ def record_user(update) -> int:
         now = datetime.utcnow().isoformat()
         conn = _conn()
         cur = conn.cursor()
-        cur.execute("SELECT user_id, lang, lang_chosen FROM users WHERE user_id = ?", (u.id,))
-        row = cur.fetchone()
-        if row:
-            cur.execute("""
-                UPDATE users SET username=?, first_name=?, last_name=?,
-                language_code=?, last_seen=? WHERE user_id=?
-            """, (u.username, u.first_name, u.last_name, u.language_code, now, u.id))
-            conn.commit()
-            conn.close()
-            return 0
+        # Single upsert (INSERT OR IGNORE + UPDATE) — avoids the SELECT round-trip
         cur.execute("""
-            INSERT INTO users (user_id, username, first_name, last_name, language_code, lang, lang_chosen, first_seen, last_seen)
+            INSERT OR IGNORE INTO users
+              (user_id, username, first_name, last_name, language_code, lang, lang_chosen, first_seen, last_seen)
             VALUES (?, ?, ?, ?, ?, 'en', 0, ?, ?)
         """, (u.id, u.username, u.first_name, u.last_name, u.language_code, now, now))
+        created = cur.rowcount > 0
+        cur.execute("""
+            UPDATE users SET username=?, first_name=?, last_name=?,
+            language_code=?, last_seen=? WHERE user_id=?
+        """, (u.username, u.first_name, u.last_name, u.language_code, now, u.id))
         conn.commit()
         conn.close()
-        return 1
+        return 1 if created else 0
     except Exception as e:
         log.error("record_user error: %s", e)
         return 0
