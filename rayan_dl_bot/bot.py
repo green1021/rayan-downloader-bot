@@ -1196,7 +1196,13 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(i18n.t(lang, "rate_limit"))
         return
 
-    url = update.message.text.strip()
+    # Extract the first URL from the message (handles "@bot" mentions, extra text, etc.)
+    raw_text = update.message.text.strip()
+    m = re.search(r'https?://[^\s]+', raw_text)
+    if not m:
+        await update.message.reply_text(i18n.t(lang, "invalid_url"), parse_mode="Markdown")
+        return
+    url = m.group(0).rstrip('.,;!?،؛')
     if not url.startswith("http"):
         await update.message.reply_text(i18n.t(lang, "invalid_url"), parse_mode="Markdown")
         return
