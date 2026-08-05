@@ -1200,10 +1200,16 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     raw_text = update.message.text.strip()
     m = re.search(r'https?://[^\s]+', raw_text)
     if not m:
+        # In groups, normal chat messages must be ignored silently (no "invalid link" spam).
+        # Only in private chat do we explain what the bot expects.
+        if is_group:
+            return
         await update.message.reply_text(i18n.t(lang, "invalid_url"), parse_mode="Markdown")
         return
     url = m.group(0).rstrip('.,;!?،؛')
     if not url.startswith("http"):
+        if is_group:
+            return
         await update.message.reply_text(i18n.t(lang, "invalid_url"), parse_mode="Markdown")
         return
 
