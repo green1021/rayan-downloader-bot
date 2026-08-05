@@ -22,3 +22,14 @@ All notable changes to the Rayan Downloader Bot.
 - Twitter long-tweet truncation (fxtwitter full-text fallback)
 - Force-join "permanent pass" bug (confirmation expiry + always re-check checkable channels)
 - Admin panel back-button navigation error
+
+## [1.1.0] - 2026-08-05
+### Changed
+- Package renamed `rayan_dl_bot_v3` -> `rayan_dl_bot` (no version suffix); entry `rayan_dl_bot_main.py`
+- Removed all version-suffix references from user-facing texts
+- Register slash-command menu via set_my_commands (private + admin scope) — commands now appear when typing '/'
+- `group_help` shows privacy-mode guidance (add bot as group admin)
+
+### Performance
+- Global download concurrency cap (asyncio.Semaphore(2)) — prevents CPU/RAM spikes on concurrent downloads
+- yt-dlp runs as subprocess only (not imported as module) — keeps RSS ~49MB, idle CPU <1%

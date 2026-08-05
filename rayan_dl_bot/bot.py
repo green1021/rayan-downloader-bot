@@ -61,6 +61,10 @@ log = logging.getLogger("rayan-dl")
 # ── Rate limiting (simple per-user) ───────────────────────────
 _rate = {}
 
+# Global download concurrency cap: max 2 concurrent downloads across all users.
+# Prevents CPU/RAM spikes when several people send links at once.
+_download_sem = asyncio.Semaphore(2)
+
 
 def rate_limited(user_id: int, seconds: int = 8) -> bool:
     now = time.time()
@@ -69,6 +73,12 @@ def rate_limited(user_id: int, seconds: int = 8) -> bool:
         return True
     _rate[user_id] = now
     return False
+
+
+async def _limited_download(*args, **kwargs):
+    """Run dl.download_video under the global semaphore (max 2 concurrent)."""
+    async with _download_sem:
+        return await asyncio.to_thread(dl.download_video, *args, **kwargs)
 
 
 # ── Disk management ───────────────────────────────────────────
@@ -1268,7 +1278,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                                        parse_mode="Markdown")
             out_path = os.path.join(DOWNLOAD_DIR, f"grp_{chat.id}_{int(time.time())}")
             dl.cleanup(out_path)
-            ok = await asyncio.to_thread(dl.download_video, url, str(chosen), False, out_path)
+            ok = await _limited_download(url, str(chosen), False, out_path)
             out_path = resolve_out_path(out_path)
             if not ok:
                 db.record_download(uid, url, site, str(chosen), False)
@@ -1335,7 +1345,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     out_path = os.path.join(DOWNLOAD_DIR, f"dl_{uid}_{best}.mp4")
     dl.cleanup(out_path)
 
-    ok = await asyncio.to_thread(dl.download_video, url, str(best), False, out_path)
+    ok = await _limited_download(url, str(best), False, out_path)
     out_path = resolve_out_path(out_path)
     if not ok:
         db.record_download(uid, url, site, str(best), False)
@@ -1438,7 +1448,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     out_path = os.path.join(DOWNLOAD_DIR, f"dl_{uid}_{dl_id}_{quality}.{ext}")
     dl.cleanup(out_path)
 
-    ok = await asyncio.to_thread(dl.download_video, url, quality, is_audio, out_path)
+    ok = await _limited_download(url, quality, is_audio, out_path)
     out_path = resolve_out_path(out_path)
     if not ok:
         db.record_download(uid, url, dl.detect_site(url), label, False)
