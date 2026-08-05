@@ -14,20 +14,31 @@ Telegram downloader bot built with **python-telegram-bot** + **yt-dlp**, support
 - **Per-user default quality** (`/settings`)
 - **Download history** (`/history`), playlists, smart proxy routing
 
-## 🚀 Quick Start
+## 🚀 Quick Start (deploy your own instance)
 
 ```bash
-# 1. Install dependencies
-pip install -r requirements.txt   # python-telegram-bot, yt-dlp
+# 1. Clone & install
+git clone https://github.com/green1021/rayan-downloader-bot
+cd rayan-downloader-bot
+pip install -r requirements.txt
 
-# 2. Set your bot token (never hardcode)
-export TG_BOT_TOKEN="YOUR_BOT_TOKEN"
+# 2. Set YOUR bot token + YOUR admin user id (never hardcode)
+export TG_BOT_TOKEN="YOUR_BOT_TOKEN"        # from @BotFather
+export TG_ADMIN_IDS="YOUR_TELEGRAM_USER_ID" # your numeric ID (get from @userinfobot)
 
 # 3. Run
 python3 rayan_dl_bot_main.py
 ```
 
 > The bot reads its token from `TG_BOT_TOKEN` env var, or falls back to a legacy token file. Tokens are **never** committed.
+> **Admins:** the first admin(s) come from `TG_ADMIN_IDS`. Additional admins can be added at runtime via the `/admin` panel ("➕ Add admin") and are stored in the local SQLite DB — which is **never committed** to git. Any server can deploy and define its own admins.
+
+## 🔐 Group Usage (important)
+Telegram's privacy mode means the bot only sees group messages when it's **a group admin**.
+After adding the bot to a group:
+1. Group Settings → Administrators → Add Bot
+2. Enable "Access messages"
+Then group commands work: `/grouphelp /groupsettings /setquality /autodl /silent /commandonly /ytdl`
 
 ## 🗂 Structure
 

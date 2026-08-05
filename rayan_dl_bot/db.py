@@ -72,6 +72,11 @@ CREATE TABLE IF NOT EXISTS channel_members (
     joined_at TEXT,
     PRIMARY KEY (user_id, channel_id)
 );
+CREATE TABLE IF NOT EXISTS admins (
+    user_id INTEGER PRIMARY KEY,
+    added_by INTEGER,
+    created_at TEXT
+);
 """
 
 
@@ -557,3 +562,55 @@ def is_channel_joined_ttl(user_id: int, channel_id: int, ttl_hours: int = 24) ->
             return True  # unparseable → assume valid (legacy row)
     except Exception:
         return False
+
+
+# ── Admin management (DB-backed, so it works on ANY server) ───
+def get_db_admins():
+    """Return admin user ids from DB."""
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM admins ORDER BY user_id")
+        rows = cur.fetchall()
+        conn.close()
+        return [r[0] for r in rows]
+    except Exception as e:
+        log.error("get_db_admins: %s", e)
+        return []
+
+
+def add_admin(user_id: int, added_by: int) -> bool:
+    """Add an admin. Returns True if newly added."""
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,))
+        if cur.fetchone():
+            conn.close()
+            return False
+        now = datetime.utcnow().isoformat()
+        cur.execute("INSERT INTO admins (user_id, added_by, created_at) VALUES (?,?,?)", (user_id, added_by, now))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        log.error("add_admin: %s", e)
+        return False
+
+
+def remove_admin(user_id: int) -> bool:
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
+        conn.commit()
+        removed = cur.rowcount > 0
+        conn.close()
+        return removed
+    except Exception as e:
+        log.error("remove_admin: %s", e)
+        return False
+
+
+def is_db_admin(user_id: int) -> bool:
+    return user_id in get_db_admins()

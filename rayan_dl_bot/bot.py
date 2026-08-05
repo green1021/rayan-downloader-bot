@@ -50,8 +50,10 @@ DB_PATH = "/root/hermes-workspace/data/rayan.db"
 DISK_LIMIT_GB = 2
 MAX_FILE_SIZE_MB = 1900  # local Bot API allows up to 2GB
 
-# Admin IDs — the owner. Load from env, fallback to hardcoded owner.
-ADMIN_IDS = [int(x) for x in os.environ.get("TG_ADMIN_IDS", "1073129651").split(",") if x.strip()]
+# Admin IDs — initial owners from env (used for first-run bootstrap).
+# Additional admins are stored in DB (admins table) so ANY server deployment
+# can define its own admins. The DB is gitignored (never committed).
+ADMIN_IDS = [int(x) for x in os.environ.get("TG_ADMIN_IDS", "").split(",") if x.strip()]
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -192,17 +194,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _private_only(update):
+        return
     db.record_user(update)
     await update.message.reply_text(i18n.t(lang_of(update), "help"), parse_mode="Markdown")
 
 
 async def about_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _private_only(update):
+        return
     db.record_user(update)
     await update.message.reply_text(i18n.t(lang_of(update), "about"), parse_mode="Markdown")
 
 
 # ── Language selection ────────────────────────────────────────
 async def lang_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _private_only(update):
+        return
     db.record_user(update)
     await update.message.reply_text(i18n.t(lang_of(update), "lang_menu"),
                                     reply_markup=lang_keyboard())
@@ -241,7 +249,18 @@ async def set_lang_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception:
             pass
 # ── History ───────────────────────────────────────────────────
+def _private_only(update: Update) -> bool:
+    """Return True if the message is in a private chat.
+    Group-only commands should be used in groups; private-only (history,
+    settings, admin) should NOT clutter a group."""
+    chat = update.effective_chat
+    return bool(chat and chat.type == "private")
+
+
 async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # History is a personal feature — only in private chat, never in groups
+    if not _private_only(update):
+        return
     db.record_user(update)
     lang = lang_of(update)
     rows = db.get_history(update.effective_user.id)
@@ -266,10 +285,19 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 # ── Admin panel ───────────────────────────────────────────────
 def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    """Admin = one of env-bootstrapped owners OR a DB-registered admin."""
+    if user_id in ADMIN_IDS:
+        return True
+    try:
+        return db.is_db_admin(user_id)
+    except Exception:
+        return False
 
 
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Admin panel is private-only — never visible in a group
+    if not _private_only(update):
+        return
     if not is_admin(update.effective_user.id):
         await update.message.reply_text(i18n.t(lang_of(update), "not_admin"))
         return
@@ -281,6 +309,8 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
          InlineKeyboardButton("🔗 کانال‌ها", callback_data="adm|channels")],
         [InlineKeyboardButton("📤 خروجی کاربر", callback_data="adm|userlinks"),
          InlineKeyboardButton("💾 دیتابیس", callback_data="adm|db")],
+        [InlineKeyboardButton("👥 ادمین‌ها", callback_data="adm|adminlist"),
+         InlineKeyboardButton("➕ افزودن ادمین", callback_data="adm|addadmin")],
         [InlineKeyboardButton(i18n.t(lang, "broadcast_btn") + " پیام گروهی", callback_data="adm|broadcast"),
          InlineKeyboardButton(i18n.t(lang, "ban_btn") + " مسدود", callback_data="adm|ban")],
         [InlineKeyboardButton(i18n.t(lang, "unban_btn") + " رفع مسدودی", callback_data="adm|unban"),
@@ -306,6 +336,8 @@ async def _admin_menu_edit(q, lang: str):
          InlineKeyboardButton("🔗 کانال‌ها", callback_data="adm|channels")],
         [InlineKeyboardButton("📤 خروجی کاربر", callback_data="adm|userlinks"),
          InlineKeyboardButton("💾 دیتابیس", callback_data="adm|db")],
+        [InlineKeyboardButton("👥 ادمین‌ها", callback_data="adm|adminlist"),
+         InlineKeyboardButton("➕ افزودن ادمین", callback_data="adm|addadmin")],
         [InlineKeyboardButton(i18n.t(lang, "broadcast_btn") + " پیام گروهی", callback_data="adm|broadcast"),
          InlineKeyboardButton(i18n.t(lang, "ban_btn") + " مسدود", callback_data="adm|ban")],
         [InlineKeyboardButton(i18n.t(lang, "unban_btn") + " رفع مسدودی", callback_data="adm|unban"),
@@ -508,6 +540,43 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             context.user_data["adm_state"] = "delchan"
             await q.message.edit_text("🎯 یوزرنیم کانالی که می‌خوای حذف کنی رو بفرست (مثل mychannel):",
                                       reply_markup=admin_back_keyboard(lang))
+    elif action == "adminlist":
+        db_admins = db.get_db_admins()
+        env_admins = ADMIN_IDS
+        lines = ["👥 **لیست ادمین‌ها:**\n"]
+        for a in env_admins:
+            lines.append(f"▫️ `{a}` — (env owner)")
+        for a in db_admins:
+            lines.append(f"▫️ `{a}` — (panel)")
+        if not env_admins and not db_admins:
+            lines.append("📭 هیچ ادمینی تعریف نشده!")
+        btns = []
+        for a in db_admins:
+            btns.append([InlineKeyboardButton(f"🗑 حذف ادمین {a}", callback_data=f"adm|removeadmin|{a}")])
+        btns.append([InlineKeyboardButton("➕ افزودن ادمین", callback_data="adm|addadmin")])
+        btns.append([InlineKeyboardButton(i18n.t(lang, "back"), callback_data="adm|menu"),
+                     InlineKeyboardButton(i18n.t(lang, "close"), callback_data="adm|close")])
+        await q.message.edit_text("\n".join(lines), parse_mode="Markdown",
+                                  reply_markup=InlineKeyboardMarkup(btns))
+    elif action == "addadmin":
+        context.user_data["adm_state"] = "addadmin"
+        await q.message.edit_text("🎯 آیدی عددی کاربری که می‌خوای ادمین کنه رو بفرست:",
+                                  reply_markup=admin_back_keyboard(lang))
+    elif action == "removeadmin":
+        # parts: adm|removeadmin|<uid>
+        if len(parts) >= 3:
+            try:
+                uid = int(parts[2])
+            except ValueError:
+                uid = 0
+            if uid in ADMIN_IDS:
+                await q.message.edit_text("❌ نمی‌تونی ادمین env رو حذف کنی (توی systemd تنظیم شده).",
+                                          reply_markup=admin_back_keyboard(lang))
+            elif db.remove_admin(uid):
+                await q.message.edit_text(f"✅ ادمین `{uid}` حذف شد.", parse_mode="Markdown",
+                                          reply_markup=admin_back_keyboard(lang))
+            else:
+                await q.message.edit_text("❌ این کاربر ادمین نیست.", reply_markup=admin_back_keyboard(lang))
     elif action == "userlinks":
         # Show all users, ask for an ID to export their links
         rows = db.get_top_users(50)
@@ -658,6 +727,21 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         else:
             await update.message.reply_text(i18n.t(lang, "force_join_not_found").format(ch=username))
 
+    elif state == "addadmin":
+        context.user_data.pop("adm_state", None)
+        try:
+            uid = int(text.strip())
+        except ValueError:
+            await update.message.reply_text(i18n.t(lang, "invalid_id"))
+            return
+        if uid == update.effective_user.id:
+            await update.message.reply_text("❌ تو خودت ادمینی!")
+            return
+        if db.add_admin(uid, update.effective_user.id):
+            await update.message.reply_text(f"✅ کاربر `{uid}` ادمین شد.", parse_mode="Markdown")
+        else:
+            await update.message.reply_text(f"⚠️ کاربر `{uid}` از قبل ادمینه.", parse_mode="Markdown")
+
     elif state == "userlinks":
         context.user_data.pop("adm_state", None)
         try:
@@ -787,6 +871,9 @@ async def silent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── Per-user settings ─────────────────────────────────────────
 async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Personal settings — private only
+    if not _private_only(update):
+        return
     db.record_user(update)
     uid = update.effective_user.id
     lang = lang_of(update)
@@ -1514,6 +1601,38 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         pass
 
 
+async def on_bot_added(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """When the bot is added to a group/channel, greet with a setup hint.
+    Because of Telegram privacy mode, the bot only sees group messages when it's
+    a group admin — this message tells the admin exactly that."""
+    mc = update.my_chat_member
+    if not mc or not mc.new_chat_member:
+        return
+    status = mc.new_chat_member.status
+    chat = mc.chat
+    if status not in ("member", "administrator") or chat.type not in ("group", "supergroup"):
+        return
+    try:
+        bot_username = (await context.bot.get_me()).username
+    except Exception:
+        bot_username = "the bot"
+    msg = (
+        "👋 **سلام! ربات به گروه اضافه شد.**\n\n"
+        "⚠️ **برای اینکه ربات توی گروه کار کنه (لینک‌ها رو ببینه و دانلود کنه)، "
+        "ادمین گروه باید ربات رو ادمین کنه:**\n\n"
+        "۱. تنظیمات گروه → ادمین‌ها → افزودن ادمین\n"
+        "۲. این ربات رو انتخاب کن\n"
+        "۳. «دسترسی به پیام‌ها» رو فعال کن\n\n"
+        "بعدش می‌تونی با کامندها استفاده کنی:\n"
+        "/grouphelp — راهنمای گروه\n"
+        f"یا ربات رو با @{bot_username} صدا بزن"
+    )
+    try:
+        await context.bot.send_message(chat_id=chat.id, text=msg, parse_mode="Markdown")
+    except Exception as e:
+        log.warning("bot_added welcome failed: %s", e)
+
+
 # ── Main ──────────────────────────────────────────────────────
 async def _register_commands(app) -> None:
     """Register slash-command menu so Telegram shows them when user types '/'.
@@ -1562,6 +1681,7 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     app.add_handler(MessageHandler(filters.TEXT & filters.COMMAND, admin_input))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_bot_added))
 
     app.add_handler(CallbackQueryHandler(admin_cb, pattern="^adm"))
     app.add_handler(CallbackQueryHandler(set_lang_cb, pattern="^setlang"))
