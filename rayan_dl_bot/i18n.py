@@ -3,6 +3,9 @@
 i18n — Multi-language support for Rayan Downloader Bot
 Languages: fa (default), en, ar, tr, ru, de, es, fr, hi, zh, pt
 """
+import json
+import urllib.parse
+import urllib.request
 
 # Merge extra languages (tr/ru/de/es/...) into LANGUAGES
 try:
@@ -104,6 +107,13 @@ LANGUAGES = {
         "shazam_no_match": "😕 نتونستم این آهنگ رو تشخیص بدم. مطمئن شو فایل صوتی واضحی داره (حداقل ۱۰ ثانیه).",
         "shazam_error": "❌ خطا در شناسایی: {err}",
         "shazam_not_found": "📭 هنوز چیزی پیدا نشده. یه فایل صوتی/ویدیویی بفرست!",
+        "search_title": "🔎 نتایج جستجو برای «{query}»\n\n👇 یکی از آهنگ‌ها رو انتخاب کن:",
+        "search_no_results": "😕 چیزی پیدا نشد. اسم آهنگ رو دقیق‌تر بنویس.",
+        "search_next": "▶️ بعدی",
+        "search_prev": "◀️ قبلی",
+        "search_page": "📄 صفحه {page}",
+        "search_downloading": "📥 در حال دانلود...",
+        "search_cancel": "❌ بستن جستجو",
         "force_join_required": "🔒 **برای استفاده از ربات، اول باید عضو این کانال‌ها بشی:**\n\n{channels}\n\nبعد از عضویت، دکمه «✅ عضو شدم» رو بزن.",
         "force_join_uncheckable_note": "\n\nℹ️ ربات نمی‌تونه عضویت رو خودکار چک کنه (ادمین کانال نیست). بعد از عضویت، «✅ عضو شدم» رو بزن تا تایید بشی.",
         "force_join_channels": "🔗 {title} — [عضویت](https://t.me/{username})",
@@ -223,6 +233,13 @@ LANGUAGES = {
         "shazam_no_match": "😕 Couldn't identify this song. Make sure it's clear audio (at least 10 seconds).",
         "shazam_error": "❌ Recognition error: {err}",
         "shazam_not_found": "📭 Nothing found yet. Send an audio/video file!",
+        "search_title": "🔎 Results for \"{query}\"\n\n👇 Pick a song:",
+        "search_no_results": "😕 Nothing found. Try a more specific song name.",
+        "search_next": "▶️ Next",
+        "search_prev": "◀️ Prev",
+        "search_page": "📄 Page {page}",
+        "search_downloading": "📥 Downloading...",
+        "search_cancel": "❌ Close search",
         "force_join_required": "🔒 **To use this bot you must join these channels first:**\n\n{channels}\n\nAfter joining, press the button below.",
         "force_join_uncheckable_note": "\n\nℹ️ The bot can't auto-check membership (it's not an admin of the channel). After joining, press \"✅ I joined\" to confirm.",
         "force_join_channels": "🔗 {title} — [Join](https://t.me/{username})",
@@ -271,7 +288,24 @@ def get_lang(user_lang: str = "en") -> str:
 
 
 def t(lang: str, key: str, **kwargs) -> str:
-    """Translate a key to the given language, fallback to en (then fa)."""
+    """Translate a key to the given language, fallback to en (then fa).
+    Admin-customized messages (bot_messages table) override the default text."""
+    # Admin override (custom start text, etc.) — check DB first
+    try:
+        import db as _db
+        override = _db.get_custom_msg(lang, key)
+        if override is None and lang != "en":
+            override = _db.get_custom_msg("en", key)
+        if override:
+            text = override
+            if kwargs:
+                try:
+                    return text.format(**kwargs)
+                except Exception:
+                    return text
+            return text
+    except Exception:
+        pass
     text = (LANGUAGES.get(lang, {}).get(key)
             or LANGUAGES["en"].get(key)
             or LANGUAGES["fa"].get(key)
@@ -282,3 +316,44 @@ def t(lang: str, key: str, **kwargs) -> str:
         except Exception:
             pass
     return text
+
+
+# ── Automatic translation (admin sets a start text in one language, auto-translates) ──
+# Language code -> Google Translate 'tl' target
+TARGET_MAP = {
+    "fa": "fa", "en": "en", "ar": "ar", "tr": "tr", "ru": "ru",
+    "de": "de", "es": "es", "fr": "fr", "hi": "hi", "zh": "zh", "pt": "pt",
+}
+
+
+def _gt_translate(text: str, srclang: str, tgtlang: str, timeout: int = 30) -> str | None:
+    """Translate via free Google translate endpoint. Returns None on failure."""
+    if srclang == tgtlang:
+        return text
+    url = ("https://translate.googleapis.com/translate_a/single?client=gtx"
+           f"&sl={srclang}&tl={tgtlang}&dt=t&q=" + urllib.parse.quote(text))
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            d = json.loads(resp.read().decode("utf-8"))
+        return "".join(part[0] or "" for part in d[0])
+    except Exception as e:
+        log = None
+        try:
+            import logging
+            logging.getLogger("rayan-dl").warning("gt_translate %s→%s: %s", srclang, tgtlang, e)
+        except Exception:
+            pass
+        return None
+
+
+def translate_to_all(base_text: str, srclang: str) -> dict:
+    """Translate base_text into all bot languages. Returns {code: translated}."""
+    out = {}
+    for code, tl in TARGET_MAP.items():
+        if code == srclang:
+            out[code] = base_text
+            continue
+        tr = _gt_translate(base_text, srclang, tl) or base_text
+        out[code] = tr
+    return out

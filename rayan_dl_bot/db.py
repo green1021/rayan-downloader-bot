@@ -82,6 +82,12 @@ CREATE TABLE IF NOT EXISTS shazam_cache (
     result_json TEXT,
     created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS bot_messages (
+    lang TEXT,
+    msg_key TEXT,
+    value TEXT,
+    PRIMARY KEY (lang, msg_key)
+);
 """
 
 
@@ -651,3 +657,54 @@ def shazam_cache_set(file_hash: str, result_json: str, ttl_days: int = 30):
         conn.close()
     except Exception as e:
         log.error("shazam_cache_set: %s", e)
+
+
+# ── Custom bot messages (admin-editable texts, e.g. start) ────
+def get_custom_msg(lang: str, msg_key: str):
+    """Return custom override for (lang, msg_key) or None."""
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM bot_messages WHERE lang=? AND msg_key=?", (lang, msg_key))
+        row = cur.fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception as e:
+        log.error("get_custom_msg: %s", e)
+        return None
+
+
+def set_custom_msg(lang: str, msg_key: str, value: str):
+    try:
+        conn = _conn()
+        conn.execute("INSERT OR REPLACE INTO bot_messages (lang, msg_key, value) VALUES (?,?,?)",
+                     (lang, msg_key, value))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.error("set_custom_msg: %s", e)
+
+
+def remove_custom_msg(lang: str, msg_key: str):
+    try:
+        conn = _conn()
+        conn.execute("DELETE FROM bot_messages WHERE lang=? AND msg_key=?", (lang, msg_key))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.error("remove_custom_msg: %s", e)
+
+
+def all_custom_msgs():
+    """Return {lang: {msg_key: value}} for all overrides."""
+    try:
+        conn = _conn()
+        rows = conn.execute("SELECT lang, msg_key, value FROM bot_messages").fetchall()
+        conn.close()
+        out = {}
+        for lang, key, val in rows:
+            out.setdefault(lang, {})[key] = val
+        return out
+    except Exception as e:
+        log.error("all_custom_msgs: %s", e)
+        return {}

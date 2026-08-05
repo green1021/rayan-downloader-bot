@@ -254,6 +254,146 @@ async def set_lang_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await q.answer()
         except Exception:
             pass
+# ── Song search (text query → 10 buttons, paginated) ─────────
+def _fmt_duration(sec):
+    sec = int(sec or 0)
+    m, s = divmod(sec, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+async def _show_search_page(update, context, uid, page=0):
+    """Render 10 results for the given page + prev/next buttons."""
+    data = context.user_data.get("srch")
+    if not data:
+        return
+    results = data["results"]
+    query = data["query"]
+    lang = data["lang"]
+    total_pages = (len(results) + 9) // 10
+    if page < 0:
+        page = 0
+    if page >= total_pages:
+        page = total_pages - 1
+    data["page"] = page
+    start = page * 10
+    chunk = results[start:start + 10]
+    lines = [i18n.t(lang, "search_title").format(query=query), ""]
+    kb = []
+    for i, r in enumerate(chunk):
+        idx = start + i
+        dur = _fmt_duration(r.get("duration"))
+        title = r.get("title", "")
+        chan = r.get("channel", "")
+        lines.append(f"{i+1}. 🎵 {title} — {dur} ({chan})")
+        kb.append([InlineKeyboardButton(f"{i+1}. {title[:35]} ({dur})",
+                                        callback_data=f"srch|pick|{idx}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(i18n.t(lang, "search_prev"), callback_data="srch|prev"))
+    nav.append(InlineKeyboardButton(i18n.t(lang, "search_page").format(page=page + 1),
+                                     callback_data="srch|noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(i18n.t(lang, "search_next"), callback_data="srch|next"))
+    kb.append(nav)
+    kb.append([InlineKeyboardButton(i18n.t(lang, "search_cancel"), callback_data="srch|close")])
+    try:
+        await update.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
+    except Exception:
+        await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def start_song_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str) -> None:
+    """Text without a link in private chat → search songs, show 10 buttons."""
+    db.record_user(update)
+    uid = update.effective_user.id
+    lang = lang_of(update)
+    status = await update.message.reply_text(i18n.t(lang, "shazam_searching"))
+    results = await asyncio.to_thread(dl.search_youtube, query, 30)
+    if not results:
+        await status.edit_text(i18n.t(lang, "search_no_results"))
+        return
+    context.user_data["srch"] = {"results": results, "query": query, "lang": lang, "page": 0}
+    await _show_search_page(update, context, uid, 0)
+
+
+async def search_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    data = q.data or ""
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    lang = lang_of(update)
+    uid = q.from_user.id
+    if data == "srch|close":
+        try:
+            await q.message.edit_text(i18n.t(lang, "cancelled"))
+        except Exception:
+            pass
+        context.user_data.pop("srch", None)
+        return
+    if data == "srch|noop":
+        return
+    if data == "srch|next":
+        d = context.user_data.get("srch")
+        if d:
+            await _show_search_page(update, context, uid, d.get("page", 0) + 1)
+        return
+    if data == "srch|prev":
+        d = context.user_data.get("srch")
+        if d:
+            await _show_search_page(update, context, uid, d.get("page", 0) - 1)
+        return
+    if data.startswith("srch|pick|"):
+        try:
+            idx = int(data.split("|")[2])
+        except (ValueError, IndexError):
+            return
+        d = context.user_data.get("srch")
+        if not d or idx >= len(d["results"]):
+            await q.message.edit_text(i18n.t(lang, "link_expired"))
+            return
+        r = d["results"][idx]
+        try:
+            await q.message.edit_text(i18n.t(lang, "search_downloading"))
+        except Exception:
+            pass
+        # force-join gate (private)
+        if not await _ensure_membership(update, context):
+            return
+        if db.is_banned(uid):
+            await q.message.reply_text(i18n.t(lang, "banned"))
+            return
+        try:
+            await context.bot.send_chat_action(chat_id=q.message.chat_id, action="upload_audio")
+        except Exception:
+            pass
+        song = os.path.join(DOWNLOAD_DIR, f"srch_{uid}_{int(time.time())}.m4a")
+        dl.cleanup(song)
+        ok = await asyncio.to_thread(dl.download_url_audio, r["url"], song)
+        if ok and os.path.getsize(song) < MAX_FILE_SIZE_MB * 1024 * 1024:
+            try:
+                await context.bot.send_audio(
+                    chat_id=q.message.chat_id,
+                    audio=open(song, "rb"),
+                    title=r.get("title", ""),
+                    performer=r.get("channel", ""),
+                    caption=f"🎵 {r.get('title','')}",
+                )
+                db.record_download(uid, r["url"], "youtube", "search", True)
+            except Exception as e:
+                log.warning("search send audio: %s", e)
+        else:
+            await q.message.reply_text(i18n.t(lang, "download_failed"))
+        dl.cleanup(song)
+        await asyncio.to_thread(enforce_disk_limit)
+        context.user_data.pop("srch", None)
+        return
+
+
 # ── History ───────────────────────────────────────────────────
 def _private_only(update: Update) -> bool:
     """Return True if the message is in a private chat.
@@ -317,6 +457,8 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
          InlineKeyboardButton("💾 دیتابیس", callback_data="adm|db")],
         [InlineKeyboardButton("👥 ادمین‌ها", callback_data="adm|adminlist"),
          InlineKeyboardButton("➕ افزودن ادمین", callback_data="adm|addadmin")],
+        [InlineKeyboardButton("📝 متن شروع", callback_data="adm|startmsg"),
+         InlineKeyboardButton("🔄 بازنشانی متن", callback_data="adm|resetmsg")],
         [InlineKeyboardButton(i18n.t(lang, "broadcast_btn") + " پیام گروهی", callback_data="adm|broadcast"),
          InlineKeyboardButton(i18n.t(lang, "ban_btn") + " مسدود", callback_data="adm|ban")],
         [InlineKeyboardButton(i18n.t(lang, "unban_btn") + " رفع مسدودی", callback_data="adm|unban"),
@@ -344,6 +486,8 @@ async def _admin_menu_edit(q, lang: str):
          InlineKeyboardButton("💾 دیتابیس", callback_data="adm|db")],
         [InlineKeyboardButton("👥 ادمین‌ها", callback_data="adm|adminlist"),
          InlineKeyboardButton("➕ افزودن ادمین", callback_data="adm|addadmin")],
+        [InlineKeyboardButton("📝 متن شروع", callback_data="adm|startmsg"),
+         InlineKeyboardButton("🔄 بازنشانی متن", callback_data="adm|resetmsg")],
         [InlineKeyboardButton(i18n.t(lang, "broadcast_btn") + " پیام گروهی", callback_data="adm|broadcast"),
          InlineKeyboardButton(i18n.t(lang, "ban_btn") + " مسدود", callback_data="adm|ban")],
         [InlineKeyboardButton(i18n.t(lang, "unban_btn") + " رفع مسدودی", callback_data="adm|unban"),
@@ -583,6 +727,23 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                                           reply_markup=admin_back_keyboard(lang))
             else:
                 await q.message.edit_text("❌ این کاربر ادمین نیست.", reply_markup=admin_back_keyboard(lang))
+    elif action == "startmsg":
+        context.user_data["adm_state"] = "startmsg"
+        current = db.get_custom_msg("fa", "start") or i18n.LANGUAGES["fa"].get("start", "")
+        preview = current[:200]
+        await q.message.edit_text(
+            f"📝 **تغییر متن شروع ربات**\n\n"
+            f"متن فعلی (فارسی):\n```\n{preview}\n```\n\n"
+            f"۱. **متن جدید رو به فارسی بنویس** و بفرست (متن ساده یا با Markdown و ایموجی)\n"
+            f"۲. بعدش ازت می‌پرسم ترجمه خودکار به بقیه زبان‌ها باشه یا دستی.\n\n"
+            f"✍️ متن جدیدت رو بفرست:",
+            parse_mode="Markdown", reply_markup=admin_back_keyboard(lang))
+    elif action == "resetmsg":
+        # Remove all custom start overrides → back to defaults
+        for code in i18n.TARGET_MAP:
+            db.remove_custom_msg(code, "start")
+        await q.message.edit_text("✅ متن شروع به **پیش‌فرض** برگشت (همه زبان‌ها).",
+                                  reply_markup=admin_back_keyboard(lang))
     elif action == "userlinks":
         # Show all users, ask for an ID to export their links
         rows = db.get_top_users(50)
@@ -748,6 +909,28 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         else:
             await update.message.reply_text(f"⚠️ کاربر `{uid}` از قبل ادمینه.", parse_mode="Markdown")
 
+    elif state == "startmsg":
+        # Save the raw text temporarily, ask translate method
+        text = (update.message.text or "").strip()
+        if not text:
+            await update.message.reply_text("❌ متن خالی بود. دوباره بفرست.")
+            return
+        context.user_data["startmsg_new"] = text
+        context.user_data["adm_state"] = "startmsg_translate"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🤖 ترجمه خودکار به همه زبان‌ها", callback_data="smt|auto")],
+            [InlineKeyboardButton("✍️ فقط همین (فارسی)", callback_data="smt|manual")],
+            [InlineKeyboardButton(i18n.t(lang, "back"), callback_data="adm|menu")],
+        ])
+        await update.message.reply_text(
+            f"✅ متن جدید ذخیره شد:\n```\n{text[:150]}\n```\n\n"
+            f"حالا چیکار کنم؟",
+            parse_mode="Markdown", reply_markup=kb)
+
+    elif state == "startmsg_translate":
+        # handled by startmsg_translate_cb callback
+        pass
+
     elif state == "userlinks":
         context.user_data.pop("adm_state", None)
         try:
@@ -805,26 +988,26 @@ async def _send_shazam_result(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         sent = await context.bot.send_message(chat_id=chat_id, text=txt,
                                               parse_mode="Markdown", disable_web_page_preview=True)
-    # Then download the actual song and send the music file
+    # Then download the actual song and send the music file (fast m4a, no re-encode)
     try:
         await context.bot.send_chat_action(chat_id=chat_id, action="upload_audio")
     except Exception:
         pass
-    mp3 = os.path.join(DOWNLOAD_DIR, f"song_{int(time.time())}_{result.get('key','x')}.mp3")
+    song = os.path.join(DOWNLOAD_DIR, f"song_{int(time.time())}_{result.get('key','x')}.m4a")
     ok = await asyncio.to_thread(
-        dl.download_song_mp3, result.get("title", ""), result.get("artist", ""), mp3)
-    if ok and os.path.getsize(mp3) < MAX_FILE_SIZE_MB * 1024 * 1024:
+        dl.download_song, result.get("title", ""), result.get("artist", ""), song)
+    if ok and os.path.getsize(song) < MAX_FILE_SIZE_MB * 1024 * 1024:
         try:
             await context.bot.send_audio(
                 chat_id=chat_id,
-                audio=open(mp3, "rb"),
+                audio=open(song, "rb"),
                 title=result.get("title", ""),
                 performer=result.get("artist", ""),
                 caption=f"🎵 {result.get('title','')} — {result.get('artist','')}",
             )
         except Exception as e:
             log.warning("shazam send audio: %s", e)
-    dl.cleanup(mp3)
+    dl.cleanup(song)
     return sent
 
 
@@ -1304,10 +1487,14 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     m = re.search(r'https?://[^\s]+', raw_text)
     if not m:
         # In groups, normal chat messages must be ignored silently (no "invalid link" spam).
-        # Only in private chat do we explain what the bot expects.
+        # In private chat: if there's no link, treat it as a song search query!
         if is_group:
             return
-        await update.message.reply_text(i18n.t(lang, "invalid_url"), parse_mode="Markdown")
+        query = raw_text.strip()
+        if len(query) < 3:
+            await update.message.reply_text(i18n.t(lang, "invalid_url"), parse_mode="Markdown")
+            return
+        await start_song_search(update, context, query)
         return
     url = m.group(0).rstrip('.,;!?،؛')
     if not url.startswith("http"):
@@ -1784,6 +1971,38 @@ async def on_bot_added(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         log.warning("bot_added welcome failed: %s", e)
 
 
+async def startmsg_translate_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Callback for choosing auto-translate vs manual-only after entering new start text."""
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    lang = lang_of(update)
+    uid = q.from_user.id
+    new_text = context.user_data.pop("startmsg_new", None)
+    context.user_data.pop("adm_state", None)
+    if not new_text:
+        await q.message.edit_text(i18n.t(lang, "cancelled"))
+        return
+    choice = (q.data or "").split("|")[-1]
+    if choice == "manual":
+        db.set_custom_msg("fa", "start", new_text)
+        await q.message.edit_text("✅ متن شروع فقط برای **فارسی** ذخیره شد.\n"
+                                  "بقیه زبان‌ها پیش‌فرض می‌مونن.",
+                                  reply_markup=admin_back_keyboard(lang))
+        return
+    # auto translate to all languages
+    status = await q.message.edit_text("🤖 در حال ترجمه به همه زبان‌ها...")
+    translations = await asyncio.to_thread(i18n.translate_to_all, new_text, "fa")
+    for code, txt in translations.items():
+        db.set_custom_msg(code, "start", txt)
+    done = len(translations)
+    await status.edit_text(f"✅ متن شروع **به {done} زبان** ترجمه و ذخیره شد!\n\n"
+                           f"📝 اگه یه زبانی رو درست نمی‌خوای، از همین‌جا دوباره تغییر بده.",
+                           reply_markup=admin_back_keyboard(lang))
+
+
 # ── Main ──────────────────────────────────────────────────────
 async def _register_commands(app) -> None:
     """Register slash-command menu so Telegram shows them when user types '/'.
@@ -1845,6 +2064,8 @@ def main():
     app.add_handler(CallbackQueryHandler(set_lang_cb, pattern="^setlang"))
     app.add_handler(CallbackQueryHandler(set_def_q_cb, pattern="^setdefq"))
     app.add_handler(CallbackQueryHandler(force_join_check_cb, pattern="^fjcheck$"))
+    app.add_handler(CallbackQueryHandler(search_cb, pattern="^srch"))
+    app.add_handler(CallbackQueryHandler(startmsg_translate_cb, pattern="^smt"))
     app.add_handler(CallbackQueryHandler(more_qualities, pattern="^more"))
     app.add_handler(CallbackQueryHandler(button_click))
 

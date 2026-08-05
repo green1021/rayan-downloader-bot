@@ -263,34 +263,113 @@ def get_video_info(url: str) -> dict:
 
 
 # ── Download ──────────────────────────────────────────────────
-def download_song_mp3(title: str, artist: str, out_mp3: str) -> bool:
-        """Download a full song (search YouTube by title+artist) as MP3, with cover embed."""
+def search_youtube(query: str, limit: int = 30) -> list:
+    """Search YouTube, return list of {id, title, channel, duration, url}.
+    Filters out channels/non-video entries; includes enough results for paging."""
+    try:
+        r = subprocess.run(
+            ["/usr/local/bin/yt-dlp", "--flat-playlist", "-J", "--no-check-certificates",
+             f"ytsearch{limit}:{query}"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if r.returncode != 0:
+            return []
+        data = json.loads(r.stdout)
+        out = []
+        for e in data.get("entries", []):
+            url = e.get("url") or ""
+            if not url.startswith("http"):
+                continue  # skip channels
+            dur = e.get("duration")
+            if dur is None:
+                continue  # live/no duration
+            title = (e.get("title") or "").strip()
+            if not title:
+                continue
+            out.append({
+                "id": e.get("id"),
+                "title": title[:80],
+                "channel": (e.get("channel") or "")[:30],
+                "duration": int(dur),
+                "url": url,
+            })
+        return out
+    except Exception as e:
+        log.error("search_youtube: %s", e)
+        return []
+
+
+def download_url_audio(url: str, out_file: str) -> bool:
+    """Download audio (m4a) directly from a video URL, no re-encode (fast)."""
+    import shutil
+    d = os.path.dirname(out_file)
+    stem = os.path.basename(out_file).rsplit(".", 1)[0]
+    out = os.path.join(d, stem + ".m4a")
+    try:
+        r = subprocess.run(
+            ["/usr/local/bin/yt-dlp", "-f", "bestaudio[ext=m4a]/bestaudio", "--no-playlist",
+             "--no-check-certificates", "--force-overwrites", "-o", out, url],
+            capture_output=True, text=True, timeout=240,
+        )
+        if r.returncode != 0:
+            return False
+        if not (os.path.exists(out) and os.path.getsize(out) > 0):
+            return False
+        if os.path.abspath(out) != os.path.abspath(out_file):
+            shutil.move(out, out_file)
+        return os.path.exists(out_file) and os.path.getsize(out_file) > 0
+    except Exception as e:
+        log.error("download_url_audio: %s", e)
+        return False
+
+
+def download_song(title: str, artist: str, out_file: str, want_mp3: bool = False) -> bool:
+        """Download a song from YouTube (search by title+artist).
+        By default downloads m4a directly (NO re-encode -> fast, ~4s). If want_mp3,
+        converts with ffmpeg (slower). Returns True on success."""
         import shutil
-        d = os.path.dirname(out_mp3)
-        base = os.path.basename(out_mp3)  # e.g. song_123_abc.mp3
-        stem = base.rsplit(".", 1)[0]       # song_123_abc
+        d = os.path.dirname(out_file)
+        stem = os.path.basename(out_file).rsplit(".", 1)[0]
+        query = f"ytsearch1:{title} {artist} official audio"
         try:
-            query = f"ytsearch1:{title} {artist} official audio"
-            r = subprocess.run(
-                ["/usr/local/bin/yt-dlp", "-f", "bestaudio/best", "--no-playlist",
-                 "--no-check-certificates", "--extract-audio", "--audio-format", "mp3",
-                 "--audio-quality", "0", "-o", os.path.join(d, stem), query],
-                capture_output=True, text=True, timeout=200,
-            )
-            if r.returncode != 0:
-                return False
-            # yt-dlp produced <stem>.mp3 (and possibly thumbnail), find it
-            cands = [os.path.join(d, f) for f in os.listdir(d)
-                     if f.startswith(stem) and f.endswith(".mp3")]
+            if want_mp3:
+                r = subprocess.run(
+                    ["/usr/local/bin/yt-dlp", "-f", "bestaudio[ext=m4a]/bestaudio", "--no-playlist",
+                     "--no-check-certificates", "--force-overwrites",
+                     "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
+                     "-o", os.path.join(d, stem), query],
+                    capture_output=True, text=True, timeout=200,
+                )
+                if r.returncode != 0:
+                    return False
+                cands = [os.path.join(d, f) for f in os.listdir(d)
+                         if f.startswith(stem) and f.endswith(".mp3")]
+            else:
+                # Fast path: download m4a (aac) directly, no re-encode
+                out = os.path.join(d, stem + ".m4a")
+                r = subprocess.run(
+                    ["/usr/local/bin/yt-dlp", "-f", "bestaudio[ext=m4a]/bestaudio", "--no-playlist",
+                     "--no-check-certificates", "--force-overwrites",
+                     "-o", out, query],
+                    capture_output=True, text=True, timeout=200,
+                )
+                if r.returncode != 0:
+                    return False
+                cands = [out] if os.path.exists(out) and os.path.getsize(out) > 0 else []
             if not cands:
                 return False
             src = cands[0]
-            if src != out_mp3:
-                shutil.move(src, out_mp3)
-            return os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 0
+            if os.path.abspath(src) != os.path.abspath(out_file):
+                shutil.move(src, out_file)
+            return os.path.exists(out_file) and os.path.getsize(out_file) > 0
         except Exception as e:
-            log.error("download_song_mp3: %s", e)
+            log.error("download_song: %s", e)
             return False
+
+
+# keep alias for backwards compatibility
+def download_song_mp3(title, artist, out_mp3):
+    return download_song(title, artist, out_mp3, want_mp3=True)
 
 
 def download_audio_wav(url: str, out_wav: str, seconds: int = 30) -> bool:
