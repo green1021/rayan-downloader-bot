@@ -88,6 +88,11 @@ CREATE TABLE IF NOT EXISTS bot_messages (
     value TEXT,
     PRIMARY KEY (lang, msg_key)
 );
+CREATE TABLE IF NOT EXISTS bot_config (
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    updated_at TEXT
+);
 """
 
 
@@ -707,4 +712,39 @@ def all_custom_msgs():
         return out
     except Exception as e:
         log.error("all_custom_msgs: %s", e)
+        return {}
+
+
+# ── Bot config (admin-editable settings) ──────────────────────
+def get_config(key: str, default=None):
+    try:
+        conn = _conn()
+        row = conn.execute("SELECT value FROM bot_config WHERE key=?", (key,)).fetchone()
+        conn.close()
+        return row[0] if row else default
+    except Exception as e:
+        log.error("get_config: %s", e)
+        return default
+
+
+def set_config(key: str, value):
+    try:
+        conn = _conn()
+        now = datetime.utcnow().isoformat()
+        conn.execute("INSERT OR REPLACE INTO bot_config (key, value, updated_at) VALUES (?,?,?)",
+                     (key, str(value), now))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.error("set_config: %s", e)
+
+
+def all_config():
+    try:
+        conn = _conn()
+        rows = conn.execute("SELECT key, value FROM bot_config").fetchall()
+        conn.close()
+        return dict(rows)
+    except Exception as e:
+        log.error("all_config: %s", e)
         return {}

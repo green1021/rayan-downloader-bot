@@ -17,6 +17,9 @@ log = logging.getLogger("rayan-dl")
 
 DOWNLOAD_DIR = "/root/hermes-workspace/tmp/downloads"
 YTDLP = "/usr/local/bin/yt-dlp"
+# Node is available — use it as the JS runtime so yt-dlp can extract all
+# YouTube formats (without a JS runtime some formats/qualities are missing).
+JS_RUNTIME = ["--js-runtimes", "node:/usr/bin/node"]
 FFMPEG = "/usr/bin/ffmpeg"
 WARP_PROXY = "socks5://127.0.0.1:40000"
 TOR_PROXY = "socks5h://127.0.0.1:9050"
@@ -204,7 +207,7 @@ def get_video_info(url: str) -> dict:
 
     proxy = get_proxy_args(url)
     # -N 8: concurrent fragment downloads; --no-check-certificates for speed on some hosts
-    cmd = [YTDLP, *proxy, "-J", "--no-warnings", "--skip-download",
+    cmd = [YTDLP, *JS_RUNTIME, *proxy, "-J", "--no-warnings", "--skip-download",
            "--no-check-certificates", url]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -268,7 +271,7 @@ def search_youtube(query: str, limit: int = 30) -> list:
     Filters out channels/non-video entries; includes enough results for paging."""
     try:
         r = subprocess.run(
-            ["/usr/local/bin/yt-dlp", "--flat-playlist", "-J", "--no-check-certificates",
+            ["/usr/local/bin/yt-dlp", *JS_RUNTIME, "--flat-playlist", "-J", "--no-check-certificates",
              f"ytsearch{limit}:{query}"],
             capture_output=True, text=True, timeout=60,
         )
@@ -307,7 +310,7 @@ def download_url_audio(url: str, out_file: str) -> bool:
     out = os.path.join(d, stem + ".m4a")
     try:
         r = subprocess.run(
-            ["/usr/local/bin/yt-dlp", "-f", "bestaudio[ext=m4a]/bestaudio", "--no-playlist",
+            ["/usr/local/bin/yt-dlp", *JS_RUNTIME, "-f", "bestaudio[ext=m4a]/bestaudio", "--no-playlist",
              "--no-check-certificates", "--force-overwrites", "-o", out, url],
             capture_output=True, text=True, timeout=240,
         )
@@ -334,7 +337,7 @@ def download_song(title: str, artist: str, out_file: str, want_mp3: bool = False
         try:
             if want_mp3:
                 r = subprocess.run(
-                    ["/usr/local/bin/yt-dlp", "-f", "bestaudio[ext=m4a]/bestaudio", "--no-playlist",
+                    ["/usr/local/bin/yt-dlp", *JS_RUNTIME, "-f", "bestaudio[ext=m4a]/bestaudio", "--no-playlist",
                      "--no-check-certificates", "--force-overwrites",
                      "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
                      "-o", os.path.join(d, stem), query],
@@ -348,7 +351,7 @@ def download_song(title: str, artist: str, out_file: str, want_mp3: bool = False
                 # Fast path: download m4a (aac) directly, no re-encode
                 out = os.path.join(d, stem + ".m4a")
                 r = subprocess.run(
-                    ["/usr/local/bin/yt-dlp", "-f", "bestaudio[ext=m4a]/bestaudio", "--no-playlist",
+                    ["/usr/local/bin/yt-dlp", *JS_RUNTIME, "-f", "bestaudio[ext=m4a]/bestaudio", "--no-playlist",
                      "--no-check-certificates", "--force-overwrites",
                      "-o", out, query],
                     capture_output=True, text=True, timeout=200,
@@ -414,8 +417,8 @@ def download_audio_wav(url: str, out_wav: str, seconds: int = 30) -> bool:
     tmp = out_wav + ".raw"
     try:
         r = subprocess.run(
-            ["/usr/local/bin/yt-dlp", "-f", "bestaudio/best", "--no-playlist",
-             "--no-check-certificates", "-o", tmp, url],
+            ["/usr/local/bin/yt-dlp", *JS_RUNTIME, "-f", "bestaudio/best", "--no-playlist",
+             "--no-check-certificates", "-N", "8", "-o", tmp, url],
             capture_output=True, text=True, timeout=180,
         )
         if r.returncode != 0:
@@ -474,7 +477,7 @@ def download_video(url: str, quality: str, is_audio: bool, out_path: str) -> boo
     proxy = get_proxy_args(url)
 
     if is_audio:
-        cmd = [YTDLP, *proxy, "-x", "--audio-format", "mp3", "-f", "bestaudio",
+        cmd = [YTDLP, *JS_RUNTIME, *proxy, "-x", "--audio-format", "mp3", "-f", "bestaudio",
                "--no-check-certificates", "-N", "8",
                "-o", out_path, "--no-warnings", url]
     else:
@@ -485,7 +488,7 @@ def download_video(url: str, quality: str, is_audio: bool, out_path: str) -> boo
         else:
             # bv+ba merge with fallback — fast and robust
             fmt = f"bv[height<={quality}]+ba/b[height<={quality}]"
-        cmd = [YTDLP, *proxy, "-f", fmt,
+        cmd = [YTDLP, *JS_RUNTIME, *proxy, "-f", fmt,
                "--merge-output-format", "mp4",
                "--no-check-certificates", "-N", "8",
                "--no-playlist",
@@ -509,7 +512,7 @@ def download_playlist(url: str, out_dir: str) -> int:
     """Download a whole playlist. Returns number of files downloaded."""
     proxy = get_proxy_args(url)
     os.makedirs(out_dir, exist_ok=True)
-    cmd = [YTDLP, *proxy, "-f", "best[height<=720]+bestaudio/best[height<=720]",
+    cmd = [YTDLP, *JS_RUNTIME, *proxy, "-f", "best[height<=720]+bestaudio/best[height<=720]",
            "--merge-output-format", "mp4",
            "--no-check-certificates", "-N", "8",
            "-o", os.path.join(out_dir, "%(title).80s.%(ext)s"),

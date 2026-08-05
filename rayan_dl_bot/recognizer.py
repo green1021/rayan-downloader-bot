@@ -27,17 +27,6 @@ FPCALC = "/usr/bin/fpcalc"
 ACOUSTID_KEY = "KcghHD5WT6"
 
 
-def _audio_hash(audio_path: str) -> str:
-    """SHA256 of the first 1MB of audio (fast, cache key — not full file)."""
-    h = hashlib.sha256()
-    with open(audio_path, "rb") as f:
-        chunk = f.read(1024 * 1024)
-        while chunk and h.__sizeof__() < 16:  # read up to 16 chunks
-            h.update(chunk)
-            chunk = f.read(1024 * 1024)
-    return h.hexdigest()
-
-
 def to_mono_wav(audio_path: str, out_wav: str, seconds: int = 30) -> bool:
     """Downmix any audio to 30s mono 16kHz WAV (ideal for Shazam fingerprinting)."""
     try:

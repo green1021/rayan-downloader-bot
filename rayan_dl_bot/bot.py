@@ -64,9 +64,19 @@ log = logging.getLogger("rayan-dl")
 # ── Rate limiting (simple per-user) ───────────────────────────
 _rate = {}
 
-# Global download concurrency cap: max 2 concurrent downloads across all users.
+# Global download concurrency cap: default 2 concurrent downloads across all users.
 # Prevents CPU/RAM spikes when several people send links at once.
+# Admin can change via /admin → settings (stored in bot_config).
 _download_sem = asyncio.Semaphore(2)
+
+
+def _sem_value() -> int:
+    """Current max concurrent downloads from bot_config (default 2)."""
+    try:
+        v = int(db.get_config("max_concurrent_downloads", 2) or 2)
+        return max(1, min(v, 6))  # sane bounds
+    except Exception:
+        return 2
 
 
 def rate_limited(user_id: int, seconds: int = 8) -> bool:
@@ -75,12 +85,18 @@ def rate_limited(user_id: int, seconds: int = 8) -> bool:
     if now - last < seconds:
         return True
     _rate[user_id] = now
+    # light cleanup: drop entries older than 10 minutes to avoid memory growth
+    if len(_rate) > 500:
+        cutoff = now - 600
+        for uid in [u for u, ts in _rate.items() if ts < cutoff]:
+            del _rate[uid]
     return False
 
 
 async def _limited_download(*args, **kwargs):
-    """Run dl.download_video under the global semaphore (max 2 concurrent)."""
-    async with _download_sem:
+    """Run dl.download_video under a dynamic concurrency cap (1-6, admin-configurable)."""
+    sem = asyncio.Semaphore(_sem_value())
+    async with sem:
         return await asyncio.to_thread(dl.download_video, *args, **kwargs)
 
 
@@ -430,14 +446,31 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # ── Admin panel ───────────────────────────────────────────────
+# Cache admin list in memory (60s TTL) — is_admin is called on many messages;
+# avoids a DB query on every single message for non-admin users.
+_admin_cache = {}
+_admin_cache_ts = 0.0
+
+
+def _refresh_admin_cache():
+    global _admin_cache_ts
+    now = time.time()
+    if now - _admin_cache_ts > 60:
+        try:
+            _admin_cache.clear()
+            for uid in db.get_db_admins():
+                _admin_cache[uid] = True
+            _admin_cache_ts = now
+        except Exception:
+            pass
+
+
 def is_admin(user_id: int) -> bool:
     """Admin = one of env-bootstrapped owners OR a DB-registered admin."""
     if user_id in ADMIN_IDS:
         return True
-    try:
-        return db.is_db_admin(user_id)
-    except Exception:
-        return False
+    _refresh_admin_cache()
+    return user_id in _admin_cache
 
 
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -459,8 +492,11 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
          InlineKeyboardButton("➕ افزودن ادمین", callback_data="adm|addadmin")],
         [InlineKeyboardButton("📝 متن شروع", callback_data="adm|startmsg"),
          InlineKeyboardButton("🔄 بازنشانی متن", callback_data="adm|resetmsg")],
-        [InlineKeyboardButton(i18n.t(lang, "broadcast_btn") + " پیام گروهی", callback_data="adm|broadcast"),
-         InlineKeyboardButton(i18n.t(lang, "ban_btn") + " مسدود", callback_data="adm|ban")],
+        [InlineKeyboardButton("📊 آمار فنی", callback_data="adm|techstats"),
+         InlineKeyboardButton("🪵 لاگ خطاها", callback_data="adm|logs")],
+        [InlineKeyboardButton("⚙️ تنظیمات ربات", callback_data="adm|botsettings"),
+         InlineKeyboardButton(i18n.t(lang, "broadcast_btn") + " پیام گروهی", callback_data="adm|broadcast")],
+        [InlineKeyboardButton(i18n.t(lang, "ban_btn") + " مسدود", callback_data="adm|ban")],
         [InlineKeyboardButton(i18n.t(lang, "unban_btn") + " رفع مسدودی", callback_data="adm|unban"),
          InlineKeyboardButton("➕ کانال", callback_data="adm|addchan")],
     ])
@@ -488,8 +524,11 @@ async def _admin_menu_edit(q, lang: str):
          InlineKeyboardButton("➕ افزودن ادمین", callback_data="adm|addadmin")],
         [InlineKeyboardButton("📝 متن شروع", callback_data="adm|startmsg"),
          InlineKeyboardButton("🔄 بازنشانی متن", callback_data="adm|resetmsg")],
-        [InlineKeyboardButton(i18n.t(lang, "broadcast_btn") + " پیام گروهی", callback_data="adm|broadcast"),
-         InlineKeyboardButton(i18n.t(lang, "ban_btn") + " مسدود", callback_data="adm|ban")],
+        [InlineKeyboardButton("📊 آمار فنی", callback_data="adm|techstats"),
+         InlineKeyboardButton("🪵 لاگ خطاها", callback_data="adm|logs")],
+        [InlineKeyboardButton("⚙️ تنظیمات ربات", callback_data="adm|botsettings"),
+         InlineKeyboardButton(i18n.t(lang, "broadcast_btn") + " پیام گروهی", callback_data="adm|broadcast")],
+        [InlineKeyboardButton(i18n.t(lang, "ban_btn") + " مسدود", callback_data="adm|ban")],
         [InlineKeyboardButton(i18n.t(lang, "unban_btn") + " رفع مسدودی", callback_data="adm|unban"),
          InlineKeyboardButton("➕ کانال", callback_data="adm|addchan")],
     ])
@@ -744,6 +783,67 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             db.remove_custom_msg(code, "start")
         await q.message.edit_text("✅ متن شروع به **پیش‌فرض** برگشت (همه زبان‌ها).",
                                   reply_markup=admin_back_keyboard(lang))
+    elif action == "techstats":
+        import subprocess as _sp
+        # system resource stats
+        try:
+            r = _sp.run(["free", "-m"], capture_output=True, text=True, timeout=10)
+            mem_line = r.stdout.splitlines()[1].split()
+            used_mb = int(mem_line[2]); total_mb = int(mem_line[1])
+        except Exception:
+            used_mb, total_mb = 0, 0
+        try:
+            r = _sp.run(["df", "-h", "/"], capture_output=True, text=True, timeout=10)
+            df_parts = r.stdout.splitlines()[1].split()
+            disk_used = df_parts[4] if len(df_parts) > 4 else "?"
+        except Exception:
+            disk_used = "?"
+        try:
+            r = _sp.run(["bash", "-c", "cat /proc/loadavg"], capture_output=True, text=True, timeout=10)
+            load = r.stdout.split()[:1][0] if r.stdout.strip() else "?"
+        except Exception:
+            load = "?"
+        text = f"🤖 **آمار فنی ربات**\n\n"
+        text += f"💾 حافظه: {used_mb}MB / {total_mb}MB ({int(used_mb/total_mb*100) if total_mb else 0}%)\n"
+        text += f"💿 دیسک: استفاده {disk_used}\n"
+        text += f"⏱ بار سیستم (loadavg): {load}\n"
+        text += f"📦 حجم دانلود فعلی: {folder_size(DOWNLOAD_DIR)//1024//1024} MB\n"
+        await q.message.edit_text(text, parse_mode="Markdown", reply_markup=admin_back_keyboard(lang))
+    elif action == "logs":
+        # Show recent errors from systemd journal
+        try:
+            r = subprocess.run(
+                ["journalctl", "-u", "tg-download-bot", "--no-pager", "-n", "40", "-o", "cat"],
+                capture_output=True, text=True, timeout=15)
+            lines = [l for l in r.stdout.splitlines()
+                      if any(x in l.lower() for x in ("error", "exception", "traceback"))]
+            if not lines:
+                text = "✅ **هیچ خطایی در سابقه نیست!** ربات سالم کار می‌کنه."
+            else:
+                tail = lines[-6:]
+                text = "🪵 **آخرین خطاها:**\n\n" + "\n".join(f"• `{l[:120]}`" for l in tail)
+                text += "n\n(برای خطای کامل، لاگ سیستم رو ببین)"
+        except Exception as e:
+            text = f"❌ خوندن لاگ: {e}"
+        await q.message.edit_text(text, parse_mode="Markdown", reply_markup=admin_back_keyboard(lang))
+    elif action == "botsettings":
+        current = db.get_config("max_concurrent_downloads", "2")
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"⬇️ حداکثر دانلود همزمان: {current}", callback_data="adm|setdl")],
+            [InlineKeyboardButton(i18n.t(lang, "back"), callback_data="adm|menu"),
+             InlineKeyboardButton(i18n.t(lang, "close"), callback_data="adm|close")],
+        ])
+        await q.message.edit_text(
+            "⚙️ **تنظیمات ربات**\n\n"
+            "تنظیم «حداکثر دانلود همزمان» کنترل می‌کنه چند دانلود هم‌زمان انجام شه.\n"
+            "• کم (۱) = پایدارتر ولی کندتر\n"
+            "• زیاد (۶) = سریع‌تر ولی CPU/رم بیشتر\n\n"
+            "برای تغییر، روی دکمه بزن و عدد ۱ تا ۶ رو بفرست.",
+            parse_mode="Markdown", reply_markup=kb)
+    elif action == "setdl":
+        context.user_data["adm_state"] = "setdl"
+        await q.message.edit_text("🔢 عدد ۱ تا ۶ رو بفرست (حداکثر دانلود همزمان):",
+                                  reply_markup=admin_back_keyboard(lang))
     elif action == "userlinks":
         # Show all users, ask for an ID to export their links
         rows = db.get_top_users(50)
@@ -905,6 +1005,8 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text("❌ تو خودت ادمینی!")
             return
         if db.add_admin(uid, update.effective_user.id):
+            # invalidate admin cache so the new admin works immediately
+            _admin_cache_ts = 0.0
             await update.message.reply_text(f"✅ کاربر `{uid}` ادمین شد.", parse_mode="Markdown")
         else:
             await update.message.reply_text(f"⚠️ کاربر `{uid}` از قبل ادمینه.", parse_mode="Markdown")
@@ -930,6 +1032,19 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     elif state == "startmsg_translate":
         # handled by startmsg_translate_cb callback
         pass
+
+    elif state == "setdl":
+        context.user_data.pop("adm_state", None)
+        try:
+            v = int(text.strip())
+        except ValueError:
+            await update.message.reply_text("❌ عدد نامعتبر. ۱ تا ۶ بفرست.")
+            return
+        if 1 <= v <= 6:
+            db.set_config("max_concurrent_downloads", v)
+            await update.message.reply_text(f"✅ حداکثر دانلود همزمان: **{v}** شد.")
+        else:
+            await update.message.reply_text("❌ فقط ۱ تا ۶ مجازه.")
 
     elif state == "userlinks":
         context.user_data.pop("adm_state", None)
