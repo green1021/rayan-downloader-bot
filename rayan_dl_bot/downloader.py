@@ -52,6 +52,16 @@ def is_twitter(url): return any(s in url for s in TWITTER)
 def is_tiktok(url): return TIKTOK in url
 
 
+def clean_instagram_url(url: str) -> str:
+    """Instagram links with '?igsh=...' (or any query) often fail the embed
+    workaround — strip the query string so the reel/post downloads without login."""
+    if INSTAGRAM not in url:
+        return url
+    if "?" in url:
+        return url.split("?", 1)[0]
+    return url
+
+
 def detect_site(url: str) -> str:
     if is_pornhub(url):
         return "pornhub"
@@ -140,7 +150,8 @@ def get_video_info(url: str) -> dict:
         return info
 
     if is_instagram(url):
-        # Instagram: extract direct video URL from embed page
+        # Instagram: strip ?igsh query (it breaks the embed workaround), then extract direct video URL
+        url = clean_instagram_url(url)
         video_url = igtw.extract_ig_video_url(url)
         if not video_url:
             return {"error": "Instagram sent an empty media response. This post may be private or need login."}
@@ -262,7 +273,8 @@ def download_video(url: str, quality: str, is_audio: bool, out_path: str) -> boo
         return ph.download_hls(hls, out_path)
 
     if is_instagram(url):
-        # Direct download from the embed-extracted video URL
+        # Direct download from the embed-extracted video URL (strip ?igsh first)
+        url = clean_instagram_url(url)
         video_url = igtw.extract_ig_video_url(url)
         if not video_url:
             return False
