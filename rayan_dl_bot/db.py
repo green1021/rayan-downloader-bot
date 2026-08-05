@@ -643,7 +643,7 @@ def shazam_cache_set(file_hash: str, result_json: str, ttl_days: int = 30):
         conn = _conn()
         cur = conn.cursor()
         cur.execute("DELETE FROM shazam_cache WHERE created_at < ?",
-                    (datetime.utcnow() - timedelta(days=ttl_days)).isoformat())
+                    ((datetime.utcnow() - timedelta(days=ttl_days)).isoformat(),))
         now = datetime.utcnow().isoformat()
         conn.execute("INSERT OR REPLACE INTO shazam_cache (file_hash, result_json, created_at) VALUES (?,?,?)",
                      (file_hash, result_json, now))

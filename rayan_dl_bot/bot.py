@@ -780,7 +780,9 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ── Shazam-like song recognition ─────────────────────────────
 async def _send_shazam_result(update: Update, context: ContextTypes.DEFAULT_TYPE,
                               result: dict, lang: str) -> None:
-    """Send the full recognition card: cover photo + metadata + links + music file."""
+    """Send the full recognition card: cover photo + metadata + links + music file.
+    Works from both a message and a callback_query (button click)."""
+    chat_id = update.effective_chat.id
     txt = i18n.t(lang, "shazam_match").format(
         title=result.get("title", "?"),
         artist=result.get("artist", "?"),
@@ -792,17 +794,20 @@ async def _send_shazam_result(update: Update, context: ContextTypes.DEFAULT_TYPE
         shazam_url=result.get("shazam_url") or "https://www.shazam.com",
     )
     cover = result.get("cover")
-    # Send the card (photo + caption) first
+    # Send the card (photo + caption) first — use bot.send_* so it works from callbacks
     if cover:
         try:
-            sent = await update.message.reply_photo(photo=cover, caption=txt, parse_mode="Markdown")
+            sent = await context.bot.send_photo(chat_id=chat_id, photo=cover, caption=txt,
+                                                parse_mode="Markdown")
         except Exception:
-            sent = await update.message.reply_text(txt, parse_mode="Markdown", disable_web_page_preview=True)
+            sent = await context.bot.send_message(chat_id=chat_id, text=txt,
+                                                  parse_mode="Markdown", disable_web_page_preview=True)
     else:
-        sent = await update.message.reply_text(txt, parse_mode="Markdown", disable_web_page_preview=True)
+        sent = await context.bot.send_message(chat_id=chat_id, text=txt,
+                                              parse_mode="Markdown", disable_web_page_preview=True)
     # Then download the actual song and send the music file
     try:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_audio")
+        await context.bot.send_chat_action(chat_id=chat_id, action="upload_audio")
     except Exception:
         pass
     mp3 = os.path.join(DOWNLOAD_DIR, f"song_{int(time.time())}_{result.get('key','x')}.mp3")
@@ -811,7 +816,7 @@ async def _send_shazam_result(update: Update, context: ContextTypes.DEFAULT_TYPE
     if ok and os.path.getsize(mp3) < MAX_FILE_SIZE_MB * 1024 * 1024:
         try:
             await context.bot.send_audio(
-                chat_id=update.effective_chat.id,
+                chat_id=chat_id,
                 audio=open(mp3, "rb"),
                 title=result.get("title", ""),
                 performer=result.get("artist", ""),
