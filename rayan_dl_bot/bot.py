@@ -781,6 +781,7 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Remove all custom start overrides → back to defaults
         for code in i18n.TARGET_MAP:
             db.remove_custom_msg(code, "start")
+        i18n.invalidate_msg_cache()
         await q.message.edit_text("✅ متن شروع به **پیش‌فرض** برگشت (همه زبان‌ها).",
                                   reply_markup=admin_back_keyboard(lang))
     elif action == "techstats":
@@ -2103,6 +2104,7 @@ async def startmsg_translate_cb(update: Update, context: ContextTypes.DEFAULT_TY
     choice = (q.data or "").split("|")[-1]
     if choice == "manual":
         db.set_custom_msg("fa", "start", new_text)
+        i18n.invalidate_msg_cache()
         await q.message.edit_text("✅ متن شروع فقط برای **فارسی** ذخیره شد.\n"
                                   "بقیه زبان‌ها پیش‌فرض می‌مونن.",
                                   reply_markup=admin_back_keyboard(lang))
@@ -2112,6 +2114,7 @@ async def startmsg_translate_cb(update: Update, context: ContextTypes.DEFAULT_TY
     translations = await asyncio.to_thread(i18n.translate_to_all, new_text, "fa")
     for code, txt in translations.items():
         db.set_custom_msg(code, "start", txt)
+    i18n.invalidate_msg_cache()
     done = len(translations)
     await status.edit_text(f"✅ متن شروع **به {done} زبان** ترجمه و ذخیره شد!\n\n"
                            f"📝 اگه یه زبانی رو درست نمی‌خوای، از همین‌جا دوباره تغییر بده.",

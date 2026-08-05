@@ -287,25 +287,48 @@ def get_lang(user_lang: str = "en") -> str:
     return mapping.get(code, "en")
 
 
+# In-memory cache of admin-customized messages. Loaded once at first t() call and
+# invalidated via set_custom_msg/remove_custom_msg (bot.py calls db.refresh_msg_cache()).
+# This avoids a SQLite connection per t() call (t() runs hundreds of times per day).
+_MSG_CACHE = None
+
+
+def _load_msg_cache():
+    global _MSG_CACHE
+    if _MSG_CACHE is None:
+        try:
+            # Import the SAME db module used by the bot package
+            try:
+                from . import db as _db
+            except ImportError:
+                import db as _db
+            _MSG_CACHE = _db.all_custom_msgs()
+        except Exception:
+            _MSG_CACHE = {}
+    return _MSG_CACHE
+
+
+def invalidate_msg_cache():
+    global _MSG_CACHE
+    _MSG_CACHE = None
+
+
 def t(lang: str, key: str, **kwargs) -> str:
     """Translate a key to the given language, fallback to en (then fa).
     Admin-customized messages (bot_messages table) override the default text."""
-    # Admin override (custom start text, etc.) — check DB first
-    try:
-        import db as _db
-        override = _db.get_custom_msg(lang, key)
-        if override is None and lang != "en":
-            override = _db.get_custom_msg("en", key)
-        if override:
-            text = override
-            if kwargs:
-                try:
-                    return text.format(**kwargs)
-                except Exception:
-                    return text
-            return text
-    except Exception:
-        pass
+    # Admin override (custom start text, etc.) — read from in-memory cache
+    cache = _load_msg_cache()
+    override = (cache.get(lang, {}) or {}).get(key)
+    if override is None and lang != "en":
+        override = (cache.get("en", {}) or {}).get(key)
+    if override:
+        text = override
+        if kwargs:
+            try:
+                return text.format(**kwargs)
+            except Exception:
+                return text
+        return text
     text = (LANGUAGES.get(lang, {}).get(key)
             or LANGUAGES["en"].get(key)
             or LANGUAGES["fa"].get(key)

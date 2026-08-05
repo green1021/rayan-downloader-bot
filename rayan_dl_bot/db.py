@@ -93,6 +93,11 @@ CREATE TABLE IF NOT EXISTS bot_config (
     value TEXT,
     updated_at TEXT
 );
+-- Indexes for hot query paths (avoid full-table scans as tables grow)
+CREATE INDEX IF NOT EXISTS idx_links_user ON links(user_id);
+CREATE INDEX IF NOT EXISTS idx_links_url ON links(url);
+CREATE INDEX IF NOT EXISTS idx_downloads_user ON downloads(user_id);
+CREATE INDEX IF NOT EXISTS idx_downloads_created ON downloads(created_at);
 """
 
 
@@ -322,6 +327,8 @@ def set_chat_settings(chat_id: int, max_quality=None, auto_mode=None, silent=Non
                 sets.append("command_only=?"); vals.append(command_only)
             sets.append("set_by=?"); vals.append(set_by)
             vals.append(chat_id)
+            # safety: column names are built only from literals above
+            assert all(s.split("=")[0] in {"max_quality", "auto_mode", "silent", "command_only", "set_by"} for s in sets)
             conn.execute(f"UPDATE chat_settings SET {', '.join(sets)} WHERE chat_id=?", vals)
         else:
             conn.execute(
@@ -636,15 +643,33 @@ def is_db_admin(user_id: int) -> bool:
 
 
 # ── Shazam cache ──────────────────────────────────────────────
-def shazam_cache_get(file_hash: str):
-    """Return cached shazam result JSON or None."""
+def shazam_cache_get(file_hash: str, ttl_days: int = 30):
+    """Return cached shazam result JSON if fresh (within TTL), else None."""
     try:
+        from datetime import datetime, timedelta
         conn = _conn()
         cur = conn.cursor()
-        cur.execute("SELECT result_json FROM shazam_cache WHERE file_hash = ?", (file_hash,))
+        cur.execute("SELECT result_json, created_at FROM shazam_cache WHERE file_hash = ?",
+                    (file_hash,))
         row = cur.fetchone()
         conn.close()
-        return row[0] if row else None
+        if not row:
+            return None
+        try:
+            created = datetime.fromisoformat(row[1])
+        except (ValueError, TypeError):
+            created = datetime.min
+        if datetime.utcnow() - created > timedelta(days=ttl_days):
+            # stale — remove and treat as miss
+            try:
+                conn = _conn()
+                conn.execute("DELETE FROM shazam_cache WHERE file_hash = ?", (file_hash,))
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+            return None
+        return row[0]
     except Exception as e:
         log.error("shazam_cache_get: %s", e)
         return None

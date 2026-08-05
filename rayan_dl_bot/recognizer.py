@@ -100,9 +100,9 @@ async def main():
         print("ERROR:" + str(e)[:200])
 asyncio.run(main())
 '''
-    # Substitute placeholders (avoid f-string brace escaping)
-    code = code.replace("WARP_PROXY_PLACEHOLDER", WARP_PROXY)
-    code = code.replace("AUDIO_PATH_PLACEHOLDER", audio_path)
+    # Substitute placeholders safely (json.dumps escapes quotes/newlines → no code injection)
+    code = code.replace("WARP_PROXY_PLACEHOLDER", json.dumps(WARP_PROXY))
+    code = code.replace("AUDIO_PATH_PLACEHOLDER", json.dumps(audio_path))
     try:
         r = subprocess.run([VENV311, "-c", code], capture_output=True, text=True, timeout=90)
         out = r.stdout.strip()
@@ -193,7 +193,8 @@ async def recognize_audio(audio_path: str, cache=True) -> dict:
 
 # NOTE: helpers below are defined by the bot database module at runtime.
 def _get_hash(p):
-    return hashlib.sha256(open(p, "rb").read(16 * 1024 * 1024)).hexdigest()
+    with open(p, "rb") as f:
+        return hashlib.sha256(f.read(16 * 1024 * 1024)).hexdigest()
 
 
 def _db_cache_get(fhash):
