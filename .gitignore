@@ -1,0 +1,28 @@
+# ── Secrets - NEVER commit these ──
+*.env
+.env
+/.github_token
+/.git-credentials
+*.token
+*password*
+
+# ── Database & runtime data ──
+*.db
+*.db-*
+*.db.gz
+/data/
+tmp/
+downloads/
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+venv*/
+
+# ── systemd / local files ──
+*.service
+/tg-download-bot*
+*.log
