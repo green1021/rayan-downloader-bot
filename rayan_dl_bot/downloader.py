@@ -263,6 +263,36 @@ def get_video_info(url: str) -> dict:
 
 
 # ── Download ──────────────────────────────────────────────────
+def download_song_mp3(title: str, artist: str, out_mp3: str) -> bool:
+        """Download a full song (search YouTube by title+artist) as MP3, with cover embed."""
+        import shutil
+        d = os.path.dirname(out_mp3)
+        base = os.path.basename(out_mp3)  # e.g. song_123_abc.mp3
+        stem = base.rsplit(".", 1)[0]       # song_123_abc
+        try:
+            query = f"ytsearch1:{title} {artist} official audio"
+            r = subprocess.run(
+                ["/usr/local/bin/yt-dlp", "-f", "bestaudio/best", "--no-playlist",
+                 "--no-check-certificates", "--extract-audio", "--audio-format", "mp3",
+                 "--audio-quality", "0", "-o", os.path.join(d, stem), query],
+                capture_output=True, text=True, timeout=200,
+            )
+            if r.returncode != 0:
+                return False
+            # yt-dlp produced <stem>.mp3 (and possibly thumbnail), find it
+            cands = [os.path.join(d, f) for f in os.listdir(d)
+                     if f.startswith(stem) and f.endswith(".mp3")]
+            if not cands:
+                return False
+            src = cands[0]
+            if src != out_mp3:
+                shutil.move(src, out_mp3)
+            return os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 0
+        except Exception as e:
+            log.error("download_song_mp3: %s", e)
+            return False
+
+
 def download_audio_wav(url: str, out_wav: str, seconds: int = 30) -> bool:
     """Download just the audio of a video link as mono WAV for fingerprinting.
     Instagram uses the embed workaround (ig_tw); everything else uses yt-dlp."""

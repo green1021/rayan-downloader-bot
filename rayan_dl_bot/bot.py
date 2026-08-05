@@ -778,6 +778,51 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # ── Shazam-like song recognition ─────────────────────────────
+async def _send_shazam_result(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                              result: dict, lang: str) -> None:
+    """Send the full recognition card: cover photo + metadata + links + music file."""
+    txt = i18n.t(lang, "shazam_match").format(
+        title=result.get("title", "?"),
+        artist=result.get("artist", "?"),
+        album=result.get("album") or "-",
+        year=result.get("year") or "-",
+        genre=result.get("genre") or "-",
+        ytm_url=result.get("ytm_url") or "https://music.youtube.com",
+        spotify_url=result.get("spotify_url") or "https://open.spotify.com",
+        shazam_url=result.get("shazam_url") or "https://www.shazam.com",
+    )
+    cover = result.get("cover")
+    # Send the card (photo + caption) first
+    if cover:
+        try:
+            sent = await update.message.reply_photo(photo=cover, caption=txt, parse_mode="Markdown")
+        except Exception:
+            sent = await update.message.reply_text(txt, parse_mode="Markdown", disable_web_page_preview=True)
+    else:
+        sent = await update.message.reply_text(txt, parse_mode="Markdown", disable_web_page_preview=True)
+    # Then download the actual song and send the music file
+    try:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_audio")
+    except Exception:
+        pass
+    mp3 = os.path.join(DOWNLOAD_DIR, f"song_{int(time.time())}_{result.get('key','x')}.mp3")
+    ok = await asyncio.to_thread(
+        dl.download_song_mp3, result.get("title", ""), result.get("artist", ""), mp3)
+    if ok and os.path.getsize(mp3) < MAX_FILE_SIZE_MB * 1024 * 1024:
+        try:
+            await context.bot.send_audio(
+                chat_id=update.effective_chat.id,
+                audio=open(mp3, "rb"),
+                title=result.get("title", ""),
+                performer=result.get("artist", ""),
+                caption=f"🎵 {result.get('title','')} — {result.get('artist','')}",
+            )
+        except Exception as e:
+            log.warning("shazam send audio: %s", e)
+    dl.cleanup(mp3)
+    return sent
+
+
 async def shazam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db.record_user(update)
     await update.message.reply_text(i18n.t(lang_of(update), "shazam_cmd"))
@@ -790,7 +835,9 @@ async def handle_media_file(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if db.is_banned(uid):
         await update.message.reply_text(i18n.t(lang, "banned"))
         return
-    # Extract the file
+    # GIFs have no music — in groups people send them for fun; ignore animations entirely.
+    if update.message.animation:
+        return
     msg = update.message
     file_obj = (msg.audio or msg.video or msg.voice or msg.document
                 or (msg.video_note))
@@ -818,25 +865,17 @@ async def handle_media_file(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     result = await recog.recognize_audio(wav)
     dl.cleanup(local_path)
     dl.cleanup(wav)
+    try:
+        await status.delete()
+    except Exception:
+        pass
     if result.get("matched"):
-        cover = result.get("cover")
-        txt = i18n.t(lang, "shazam_match").format(
-            title=result.get("title", "?"), artist=result.get("artist", "?"),
-            shazam_url=result.get("shazam_url") or ("https://www.shazam.com"))
+        await _send_shazam_result(update, context, result, lang)
+    else:
         try:
-            await status.delete()
+            await update.message.reply_text(i18n.t(lang, "shazam_no_match"))
         except Exception:
             pass
-        if cover:
-            try:
-                await update.message.reply_photo(photo=cover, caption=txt, parse_mode="Markdown")
-                return
-            except Exception:
-                await update.message.reply_text(txt, parse_mode="Markdown", disable_web_page_preview=True)
-        else:
-            await update.message.reply_text(txt, parse_mode="Markdown", disable_web_page_preview=True)
-    else:
-        await status.edit_text(i18n.t(lang, "shazam_no_match"))
 
 
 # ── Group settings handlers ───────────────────────────────────
@@ -1626,21 +1665,11 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             result = await recog.recognize_audio(out_audio)
             dl.cleanup(out_audio)
         if result and result.get("matched"):
-            txt = i18n.t(lang, "shazam_match").format(
-                title=result.get("title", "?"), artist=result.get("artist", "?"),
-                shazam_url=result.get("shazam_url") or "https://www.shazam.com")
             try:
                 await status2.delete()
             except Exception:
                 pass
-            if result.get("cover"):
-                try:
-                    await q.message.reply_photo(photo=result["cover"], caption=txt, parse_mode="Markdown")
-                    return
-                except Exception:
-                    await q.message.reply_text(txt, parse_mode="Markdown", disable_web_page_preview=True)
-                    return
-            await q.message.reply_text(txt, parse_mode="Markdown", disable_web_page_preview=True)
+            await _send_shazam_result(update, context, result, lang)
         else:
             await status2.edit_text(i18n.t(lang, "shazam_no_match"))
         return

@@ -54,34 +54,66 @@ def to_mono_wav(audio_path: str, out_wav: str, seconds: int = 30) -> bool:
 # ── Shazam (primary) via WARP proxy ───────────────────────────
 async def _shazam_recognize(audio_path: str) -> dict | None:
     """Recognize via Shazam API through WARP proxy. Returns track dict or None."""
-    code = f'''
+    code = r'''
 import asyncio, json, sys
 async def main():
     try:
         import aiohttp
         from aiohttp_socks import ProxyConnector
         from shazamio import Shazam
-        conn = ProxyConnector.from_url("{WARP_PROXY}")
+        conn = ProxyConnector.from_url("WARP_PROXY_PLACEHOLDER")
         async with aiohttp.ClientSession(connector=conn) as session:
             shazam = Shazam(http_client=session)
-            resp = await shazam.recognize({audio_path!r})
+            resp = await shazam.recognize("AUDIO_PATH_PLACEHOLDER")
             data = json.loads(await resp.text())
             track = data.get("track")
             if track and data.get("matches"):
-                print(json.dumps({{
-                    "title": track.get("title"),
-                    "artist": track.get("subtitle"),
-                    "cover": (track.get("images") or {{}}).get("coverart"),
+                title = track.get("title") or ""
+                artist = track.get("subtitle") or ""
+                q = (title + " " + artist).strip().replace(" ", "+")
+                album = ""
+                year = ""
+                label = ""
+                genre = ""
+                for s in track.get("sections", []) or []:
+                    if s.get("type") == "SONG":
+                        for md in s.get("metadata", []) or []:
+                            t = (md.get("title") or "").lower()
+                            if t == "album" and not album:
+                                album = md.get("text") or ""
+                            elif t == "released" and not year:
+                                year = md.get("text") or ""
+                            elif t == "label" and not label:
+                                label = md.get("text") or ""
+                    elif s.get("type") == "ARTIST":
+                        for md in s.get("metadata", []) or []:
+                            t = (md.get("title") or "").lower()
+                            if t == "genre" and not genre:
+                                genre = md.get("text") or ""
+                if not genre:
+                    genre = (track.get("genres") or {}).get("primary") or ""
+                print(json.dumps({
+                    "title": title,
+                    "artist": artist,
+                    "album": album,
+                    "year": year,
+                    "label": label,
+                    "genre": genre,
+                    "cover": (track.get("images") or {}).get("coverart"),
                     "key": track.get("key"),
-                    "shazam_url": (track.get("share") or {{}}).get("href"),
-                    "match_score": data["matches"][0].get("offset", 0),
-                }}))
+                    "shazam_url": (track.get("share") or {}).get("href"),
+                    "ytm_url": "https://music.youtube.com/search?q=" + q,
+                    "spotify_url": "https://open.spotify.com/search/" + q,
+                }))
             else:
                 print("NOMATCH")
     except Exception as e:
         print("ERROR:" + str(e)[:200])
 asyncio.run(main())
 '''
+    # Substitute placeholders (avoid f-string brace escaping)
+    code = code.replace("WARP_PROXY_PLACEHOLDER", WARP_PROXY)
+    code = code.replace("AUDIO_PATH_PLACEHOLDER", audio_path)
     try:
         r = subprocess.run([VENV311, "-c", code], capture_output=True, text=True, timeout=90)
         out = r.stdout.strip()
