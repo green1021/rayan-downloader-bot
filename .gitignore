@@ -21,6 +21,8 @@ __pycache__/
 .venv/
 venv/
 venv*/
+venv311/
+venv311*/
 
 # ── systemd / local files ──
 *.service

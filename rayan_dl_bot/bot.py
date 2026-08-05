@@ -25,6 +25,7 @@ import i18n
 import db
 import downloader as dl
 import ig_tw as igtw
+import recognizer as recog
 
 # ── Config ────────────────────────────────────────────────────
 def _load_token() -> str:
@@ -776,6 +777,68 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         os.remove(fpath)
 
 
+# ── Shazam-like song recognition ─────────────────────────────
+async def shazam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db.record_user(update)
+    await update.message.reply_text(i18n.t(lang_of(update), "shazam_cmd"))
+
+
+async def handle_media_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Recognize the song from an audio/video file the user sends."""
+    uid = update.effective_user.id
+    lang = lang_of(update)
+    if db.is_banned(uid):
+        await update.message.reply_text(i18n.t(lang, "banned"))
+        return
+    # Extract the file
+    msg = update.message
+    file_obj = (msg.audio or msg.video or msg.voice or msg.document
+                or (msg.video_note))
+    # Documents might be arbitrary; only treat audio/video docs
+    if msg.document and not any(x in (msg.document.mime_type or "").lower()
+                                 for x in ("audio", "video")):
+        return
+    if not file_obj:
+        return
+    status = await update.message.reply_text(i18n.t(lang, "shazam_searching"))
+    local_path = os.path.join(DOWNLOAD_DIR, f"shz_{uid}_{int(time.time())}")
+    try:
+        tg_file = await context.bot.get_file(file_obj.file_id)
+        await tg_file.download_to_drive(local_path)
+    except Exception as e:
+        log.error("shazam download file: %s", e)
+        await status.edit_text(i18n.t(lang, "shazam_error").format(err=str(e)[:100]))
+        return
+    # Convert to mono wav for fingerprinting
+    wav = local_path + ".wav"
+    if not recog.to_mono_wav(local_path, wav):
+        await status.edit_text(i18n.t(lang, "shazam_error").format(err="ffmpeg convert failed"))
+        dl.cleanup(local_path)
+        return
+    result = await recog.recognize_audio(wav)
+    dl.cleanup(local_path)
+    dl.cleanup(wav)
+    if result.get("matched"):
+        cover = result.get("cover")
+        txt = i18n.t(lang, "shazam_match").format(
+            title=result.get("title", "?"), artist=result.get("artist", "?"),
+            shazam_url=result.get("shazam_url") or ("https://www.shazam.com"))
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        if cover:
+            try:
+                await update.message.reply_photo(photo=cover, caption=txt, parse_mode="Markdown")
+                return
+            except Exception:
+                await update.message.reply_text(txt, parse_mode="Markdown", disable_web_page_preview=True)
+        else:
+            await update.message.reply_text(txt, parse_mode="Markdown", disable_web_page_preview=True)
+    else:
+        await status.edit_text(i18n.t(lang, "shazam_no_match"))
+
+
 # ── Group settings handlers ───────────────────────────────────
 async def _is_group_admin(update: Update, user_id: int) -> bool:
     """Check if user is a group admin (or bot owner)."""
@@ -1443,6 +1506,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             label = f"🎥 {h}p" + (f" ({dl.human_size(est)})" if est else "")
             keyboard.append([InlineKeyboardButton(label, callback_data=f"dl|{dl_id}|{h}")])
     keyboard.append([InlineKeyboardButton(i18n.t(lang, "mp3_only"), callback_data=f"dl|{dl_id}|audio")])
+    keyboard.append([InlineKeyboardButton("🎵 تشخیص آهنگ", callback_data=f"dl|{dl_id}|shazam")])
 
     await status_msg.edit_text(i18n.t(lang, "downloading").format(title=info.get("title", "")[:80], quality=f"{best}p"),
                                parse_mode="Markdown")
@@ -1546,6 +1610,41 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     lang = dl_entry.get("lang", lang)
 
     is_audio = quality == "audio"
+    # Shazam recognition: extract audio from the link's video, identify the song
+    if quality == "shazam":
+        try:
+            await q.answer("🎵 در حال بررسی آهنگ...")
+        except Exception:
+            pass
+        status2 = await q.message.reply_text(i18n.t(lang, "shazam_searching"))
+        out_audio = os.path.join(DOWNLOAD_DIR, f"shz_{uid}_{dl_id}.wav")
+        dl.cleanup(out_audio)
+        # Download just the audio (bestaudio -> wav, 30s) for fingerprinting
+        ok_audio = await asyncio.to_thread(dl.download_audio_wav, url, out_audio)
+        result = None
+        if ok_audio:
+            result = await recog.recognize_audio(out_audio)
+            dl.cleanup(out_audio)
+        if result and result.get("matched"):
+            txt = i18n.t(lang, "shazam_match").format(
+                title=result.get("title", "?"), artist=result.get("artist", "?"),
+                shazam_url=result.get("shazam_url") or "https://www.shazam.com")
+            try:
+                await status2.delete()
+            except Exception:
+                pass
+            if result.get("cover"):
+                try:
+                    await q.message.reply_photo(photo=result["cover"], caption=txt, parse_mode="Markdown")
+                    return
+                except Exception:
+                    await q.message.reply_text(txt, parse_mode="Markdown", disable_web_page_preview=True)
+                    return
+            await q.message.reply_text(txt, parse_mode="Markdown", disable_web_page_preview=True)
+        else:
+            await status2.edit_text(i18n.t(lang, "shazam_no_match"))
+        return
+
     label = "MP3" if is_audio else f"{quality}p"
     msg = await q.message.reply_text(i18n.t(lang, "download_started"))
 
@@ -1695,11 +1794,18 @@ def main():
     # Per-user settings
     app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CommandHandler("ytdl", ytdl_cmd))
+    # Shazam-like recognition
+    app.add_handler(CommandHandler("shazam", shazam_cmd))
     # Force-join channels are managed INSIDE the /admin panel (adm|channels, adm|addchan, adm|delchan)
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     app.add_handler(MessageHandler(filters.TEXT & filters.COMMAND, admin_input))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_bot_added))
+    # Shazam: recognize song from audio/video files
+    app.add_handler(MessageHandler(
+        filters.AUDIO | filters.VIDEO | filters.VOICE | filters.VIDEO_NOTE
+        | (filters.Document.AUDIO | filters.Document.VIDEO),
+        handle_media_file))
 
     app.add_handler(CallbackQueryHandler(admin_cb, pattern="^adm"))
     app.add_handler(CallbackQueryHandler(set_lang_cb, pattern="^setlang"))

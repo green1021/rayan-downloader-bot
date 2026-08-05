@@ -77,6 +77,11 @@ CREATE TABLE IF NOT EXISTS admins (
     added_by INTEGER,
     created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS shazam_cache (
+    file_hash TEXT PRIMARY KEY,
+    result_json TEXT,
+    created_at TEXT
+);
 """
 
 
@@ -614,3 +619,35 @@ def remove_admin(user_id: int) -> bool:
 
 def is_db_admin(user_id: int) -> bool:
     return user_id in get_db_admins()
+
+
+# ── Shazam cache ──────────────────────────────────────────────
+def shazam_cache_get(file_hash: str):
+    """Return cached shazam result JSON or None."""
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute("SELECT result_json FROM shazam_cache WHERE file_hash = ?", (file_hash,))
+        row = cur.fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception as e:
+        log.error("shazam_cache_get: %s", e)
+        return None
+
+
+def shazam_cache_set(file_hash: str, result_json: str, ttl_days: int = 30):
+    """Cache a shazam result with expiry (clean old rows)."""
+    try:
+        from datetime import datetime, timedelta
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM shazam_cache WHERE created_at < ?",
+                    (datetime.utcnow() - timedelta(days=ttl_days)).isoformat())
+        now = datetime.utcnow().isoformat()
+        conn.execute("INSERT OR REPLACE INTO shazam_cache (file_hash, result_json, created_at) VALUES (?,?,?)",
+                     (file_hash, result_json, now))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.error("shazam_cache_set: %s", e)

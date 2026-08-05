@@ -263,6 +263,40 @@ def get_video_info(url: str) -> dict:
 
 
 # ── Download ──────────────────────────────────────────────────
+def download_audio_wav(url: str, out_wav: str, seconds: int = 30) -> bool:
+    """Download just the audio of a video link as mono WAV for fingerprinting."""
+    import shutil
+    tmp = out_wav + ".raw"
+    try:
+        r = subprocess.run(
+            ["/usr/local/bin/yt-dlp", "-f", "bestaudio/best", "--no-playlist",
+             "--no-check-certificates", "-o", tmp, url],
+            capture_output=True, text=True, timeout=180,
+        )
+        if r.returncode != 0:
+            return False
+        # find the actual downloaded file (may have extension appended)
+        cands = [os.path.join(os.path.dirname(out_wav), f)
+                 for f in os.listdir(os.path.dirname(out_wav)) if f.startswith(os.path.basename(tmp))]
+        if not cands:
+            return False
+        src = cands[0]
+        ok = subprocess.run(
+            ["ffmpeg", "-y", "-i", src, "-t", str(seconds),
+             "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", out_wav],
+            capture_output=True, text=True, timeout=120,
+        ).returncode == 0
+        shutil.rmtree(os.path.dirname(tmp), ignore_errors=True) if False else None
+        try:
+            os.remove(src)
+        except Exception:
+            pass
+        return ok and os.path.exists(out_wav) and os.path.getsize(out_wav) > 0
+    except Exception as e:
+        log.error("download_audio_wav: %s", e)
+        return False
+
+
 def download_video(url: str, quality: str, is_audio: bool, out_path: str) -> bool:
     """Download video/audio. Uses -N concurrency and fast merge."""
     if is_pornhub(url):
