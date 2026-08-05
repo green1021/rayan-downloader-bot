@@ -194,10 +194,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _private_only(update):
-        return
     db.record_user(update)
-    await update.message.reply_text(i18n.t(lang_of(update), "help"), parse_mode="Markdown")
+    lang = lang_of(update)
+    if not _private_only(update):
+        # In a group: show a short, group-appropriate help (no personal stuff)
+        await update.message.reply_text(
+            i18n.t(lang, "help") + "\n\n" + i18n.t(lang, "group_help")[:400],
+            parse_mode="Markdown", disable_web_page_preview=True)
+        return
+    await update.message.reply_text(i18n.t(lang, "help"), parse_mode="Markdown")
 
 
 async def about_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
