@@ -819,16 +819,17 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Show recent errors from systemd journal
         try:
             r = subprocess.run(
-                ["journalctl", "-u", "tg-download-bot", "--no-pager", "-n", "40", "-o", "cat"],
+                ["journalctl", "-u", "tg-download-bot", "--no-pager", "-n", "200", "-o", "short-iso"],
                 capture_output=True, text=True, timeout=15)
             lines = [l for l in r.stdout.splitlines()
-                      if any(x in l.lower() for x in ("error", "exception", "traceback"))]
+                     if any(x in l.lower() for x in ("error", "exception", "traceback"))
+                     and "HTTP Request" not in l]
             if not lines:
                 text = "✅ **هیچ خطایی در سابقه نیست!** ربات سالم کار می‌کنه."
             else:
-                tail = lines[-6:]
-                text = "🪵 **آخرین خطاها:**\n\n" + "\n".join(f"• `{l[:120]}`" for l in tail)
-                text += "n\n(برای خطای کامل، لاگ سیستم رو ببین)"
+                tail = lines[-8:]
+                text = "🪵 **آخرین خطاها:**\n\n" + "\n".join(f"• `{l[:150]}`" for l in tail)
+                text += "\n\n(برای خطای کامل، لاگ سیستم رو ببین)"
         except Exception as e:
             text = f"❌ خوندن لاگ: {e}"
         await q.message.edit_text(text, parse_mode="Markdown", reply_markup=admin_back_keyboard(lang))
@@ -1441,23 +1442,24 @@ async def _show_chapters_page(update: Update, context, plugin_meta, chapters, pa
     start = page * PER_PAGE
     chunk = chapters[start:start + PER_PAGE]
 
-    lines = [f"🔰 **{plugin_meta['name']}** — {len(chapters)} قسمت",
-             f"📄 صفحه {page + 1} از {total_pages}\n"]
+    lines = [i18n.t(lang, "ch_list").format(name=plugin_meta['name'], total=len(chapters),
+                                            page=page + 1, total_pages=total_pages)]
     kb = []
     for i, ch in enumerate(chunk):
         idx = start + i
         lines.append(f"{idx + 1}. {ch['title'][:60]}")
-        kb.append([InlineKeyboardButton(f"📥 قسمت {ch['num']}", callback_data=f"pldl|{plugin_meta['name']}|{idx}")])
+        kb.append([InlineKeyboardButton(i18n.t(lang, "ch_pick").format(num=ch['num']),
+                                        callback_data=f"pldl|{plugin_meta['name']}|{idx}")])
 
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("◀️ قبلی", callback_data=f"plpg|{plugin_meta['name']}|{page - 1}"))
+        nav.append(InlineKeyboardButton(i18n.t(lang, "ch_prev"), callback_data=f"plpg|{plugin_meta['name']}|{page - 1}"))
     nav.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="plnoop"))
     if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"plpg|{plugin_meta['name']}|{page + 1}"))
+        nav.append(InlineKeyboardButton(i18n.t(lang, "ch_next"), callback_data=f"plpg|{plugin_meta['name']}|{page + 1}"))
     if nav:
         kb.append(nav)
-    kb.append([InlineKeyboardButton("❌ بستن", callback_data="plclose")])
+    kb.append([InlineKeyboardButton(i18n.t(lang, "ch_close"), callback_data="plclose")])
 
     text = "\n".join(lines)
     if status_msg:
@@ -1498,7 +1500,7 @@ async def chapter_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     chapters = context.user_data.get(f"plchaps_{pname}") or []
     if not chapters:
         try:
-            await q.message.edit_text("❌ لیست قسمت‌ها منقضی شد. لینک کامیک رو دوباره بفرست.")
+            await q.message.edit_text(i18n.t(lang_of(update), "ch_expired"))
         except Exception:
             pass
         return
@@ -1524,7 +1526,7 @@ async def chapter_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         # tell the user download started, keep the picker visible
         try:
             await q.message.edit_text(
-                f"⬇️ در حال دانلود **قسمت {ch['num']}**...\nمنو باز می‌مونه، بعدش می‌تونی قسمت بعدی رو هم بزنی.",
+                i18n.t(lang, "ch_downloading").format(num=ch['num']),
                 parse_mode="Markdown")
         except Exception:
             pass
@@ -1538,8 +1540,8 @@ async def chapter_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if result.get("error"):
             try:
                 await q.message.edit_text(
-                    f"❌ قسمت {ch['num']} ناموفق: {result['error'][:150]}\n\n"
-                    f"یک قسمت دیگه انتخاب کن 👇", reply_markup=None)
+                    i18n.t(lang, "ch_error").format(num=ch['num'], err=result['error'][:150]),
+                    reply_markup=None)
             except Exception:
                 pass
             await _show_chapters_page(update, context, meta, chapters, page=resume_page)
@@ -2211,17 +2213,15 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # ── AUTO-DETECT: unknown site with no plugin — heuristically guess media type ──
     if site == "other":
-        status_msg = await update.message.reply_text("🔎 در حال بررسی خودکار سایت...")
+        status_msg = await update.message.reply_text(i18n.t(lang, "auto_checking"))
         try:
             detection = await asyncio.to_thread(adetect.detect, url)
         except Exception:
             detection = {"type": "error", "error": "analysis failed"}
         if detection.get("type") in ("comic", "video", "photos", "text"):
             try:
-                await status_msg.edit_text(
-                    f"🧠 **پشتیبانی خودکار** — این سایت به صورت خودکار پردازش می‌شه.\n"
-                    f"⚠️ این نوع پشتیبانی آزمایشیه و ممکنه باگ داشته باشه.\n\n"
-                    f"📊 تشخیص: **{detection.get('detail', detection['type'])}**")
+                await status_msg.edit_text(i18n.t(lang, "auto_support").format(
+                    detail=detection.get("detail", detection["type"])))
             except Exception:
                 pass
             try:
@@ -2235,8 +2235,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             if result.get("error"):
                 try:
                     await status_msg.edit_text(
-                        f"⚠️ پشتیبانی خودکار ناموفق بود:\n`{result['error'][:200]}`\n\n"
-                        f"💡 این سایت رو می‌تونی با **پلاگین‌ساز** (از پنل ادمین) دقیق پشتیبانی کنی!",
+                        i18n.t(lang, "auto_failed").format(err=result["error"][:200]),
                         parse_mode="Markdown")
                 except Exception:
                     pass
@@ -2247,8 +2246,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if detection.get("type") == "error":
             try:
                 await status_msg.edit_text(
-                    f"⚠️ نتونستم این سایت رو خودکار تشخیص بدم: {detection.get('error', '')[:120]}\n\n"
-                    f"💡 از پنل ادمین → پلاگین‌ساز می‌تونی پشتیبانی دقیق بسازی.",
+                    i18n.t(lang, "auto_cant_detect").format(err=detection.get("error", "")[:120]),
                     disable_web_page_preview=True)
             except Exception:
                 pass
