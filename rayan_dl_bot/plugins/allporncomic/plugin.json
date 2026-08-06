@@ -1,6 +1,6 @@
 {
   "name": "allporncomic",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Download any comic from allporncomic.com as PDF (extracts all pages from a chapter/comic page)",
   "sites": [
     "allporncomic.com",
@@ -10,6 +10,49 @@
   "enabled": true,
   "config": {
     "max_pages": 300,
-    "timeout": 60
+    "timeout": 60,
+    "max_workers": 8,
+    "image_quality": 92,
+    "keep_images": false
+  },
+  "config_schema": {
+    "max_pages": {
+      "label": "📄 حداکثر صفحات",
+      "type": "int",
+      "default": 300,
+      "min": 10,
+      "max": 1000,
+      "help": "حداکثر تعداد عکس‌هایی که از یک فصل دانلود می‌شه. برای فصل‌های خیلی بزرگ (مثلا 500 صفحه) این رو بالا ببر."
+    },
+    "timeout": {
+      "label": "⏱ زمان انتظار (ثانیه)",
+      "type": "int",
+      "default": 60,
+      "min": 10,
+      "max": 180,
+      "help": "مهلت هر دانلود عکس. اگه سایت کند بود این رو بالا ببر (اما دانلود هم کندتر می‌شه)."
+    },
+    "max_workers": {
+      "label": "⚡ دانلود همزمان",
+      "type": "int",
+      "default": 8,
+      "min": 1,
+      "max": 16,
+      "help": "چند عکس به صورت همزمان دانلود بشه. بالاتر = سریع‌تر ولی فشار بیشتر به سایت/سرور. برای سایت‌های ضعیف به 4 یا کمتر کم کن."
+    },
+    "image_quality": {
+      "label": "🖼 کیفیت تصویر در PDF",
+      "type": "int",
+      "default": 92,
+      "min": 40,
+      "max": 100,
+      "help": "کیفیت JPEG وقتی عکس PNG با شفافیت به PDF تبدیل می‌شه. بالاتر = کیفیت بهتر ولی حجم PDF بیشتر."
+    },
+    "keep_images": {
+      "label": "🗂 نگه‌داری عکس‌های خام",
+      "type": "bool",
+      "default": false,
+      "help": "اگر True باشه، عکس‌های دانلودشده بعد از ساخت PDF پاک نمی‌شن (به درد بررسی/اشکال‌یابی می‌خوره). پیشنهادی: false."
+    }
   }
 }

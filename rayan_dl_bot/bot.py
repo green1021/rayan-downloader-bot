@@ -28,6 +28,7 @@ import ig_tw as igtw
 import recognizer as recog
 import plugin_manager as pm
 import plugin_builder as pb
+import auto_detect as adetect
 
 # ── Config ────────────────────────────────────────────────────
 def _load_token() -> str:
@@ -896,7 +897,10 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 return
             state = "🟢 فعال" if meta.get("enabled") else "🔴 غیرفعال"
             cfg = meta.get("config", {})
-            cfg_lines = "\n".join(f"   {k}: {v}" for k, v in cfg.items()) or "   (بدون تنظیمات)"
+            schema = meta.get("config_schema", {})
+            cfg_lines = "\n".join(
+                f"   {schema.get(k, {}).get('label', k)}: {v}"
+                for k, v in cfg.items()) or "   (بدون تنظیمات)"
             lines = [f"🔌 **{pname}** v{meta.get('version')}",
                      f"📝 {meta.get('description','')}",
                      f"🟢 وضعیت: {state}",
@@ -940,15 +944,44 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if not cfg:
                 await q.message.edit_text("❌ این پلاگین تنظیماتی نداره.", reply_markup=admin_back_keyboard(lang))
                 return
+            schema = meta.get("config_schema", {})
             context.user_data["adm_state"] = "plugin_set"
             context.user_data["plugin_set_name"] = pname
             key_btns = []
             for k in cfg.keys():
-                key_btns.append([InlineKeyboardButton(f"🔧 {k}", callback_data=f"adm|plugin_setkey|{pname}|{k}")])
+                sch = schema.get(k, {})
+                label = sch.get("label", f"🔧 {k}")
+                help_txt = sch.get("help", "")
+                if help_txt:
+                    label += "  ℹ️"
+                key_btns.append([InlineKeyboardButton(label, callback_data=f"adm|plugin_setkey|{pname}|{k}")])
+            key_btns.append([InlineKeyboardButton("❓ راهنمای تنظیمات", callback_data=f"adm|plugin_help|{pname}")])
             key_btns.append([InlineKeyboardButton(i18n.t(lang, "back"), callback_data=f"adm|plugin_info|{pname}")])
             await q.message.edit_text(
-                f"✏️ **تنظیمات {pname}**\n\nکدوم کلید رو تغییر بدی؟\n(مقدار فعلی توی منوی قبل هست)",
+                f"✏️ **تنظیمات {pname}**\n\n"
+                f"کدوم کلید رو تغییر بدی؟\n(ℹ️ یعنی توضیح داره — دکمه «راهنما» همه رو توضیح می‌ده)",
                 parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(key_btns))
+    elif action == "plugin_help":
+        if len(parts) >= 3:
+            pname = parts[2]
+            meta = pm.get_plugin(pname)
+            if not meta:
+                await q.message.edit_text("❌ پلاگین پیدا نشد.", reply_markup=admin_back_keyboard(lang))
+                return
+            schema = meta.get("config_schema", {})
+            cfg = meta.get("config", {})
+            lines = [f"❓ **راهنمای تنظیمات {pname}**:\n"]
+            for k, v in cfg.items():
+                sch = schema.get(k, {})
+                label = sch.get("label", k)
+                help_txt = sch.get("help", "—")
+                lines.append(f"• **{label}** = `{v}`\n  {help_txt}\n")
+            if not cfg:
+                lines.append("(تنظیماتی تعریف نشده)")
+            kb = [[InlineKeyboardButton(i18n.t(lang, "back"), callback_data=f"adm|plugin_set|{pname}")],
+                  [InlineKeyboardButton(i18n.t(lang, "close"), callback_data="adm|close")]]
+            await q.message.edit_text("\n".join(lines), parse_mode="Markdown",
+                                      reply_markup=InlineKeyboardMarkup(kb))
     elif action == "plugin_setkey":
         # parts: adm|plugin_setkey|<name>|<key>
         if len(parts) >= 4:
@@ -966,6 +999,14 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "فقط حروف انگلیسی، عدد، `-` یا `_` (۲ تا ۴۰ کاراکتر).\n\n"
             "مثال: `mysitecomics`",
             parse_mode="Markdown", reply_markup=admin_back_keyboard(lang))
+        return
+    elif action == "pbauto":
+        context.user_data["adm_state"] = "pb_auto_url"
+        await q.message.edit_text(
+            "🔎 **تشخیص خودکار**\n\n"
+            "یک **لینک نمونه** از سایتت بفرست تا خودم صفحه رو تحلیل کنم و\n"
+            "نوع محتوا (کامیک/ویدیو/عکس) + الگوی regex رو پیشنهاد بدم.\n\n"
+            "لینک رو بفرست:", reply_markup=admin_back_keyboard(lang))
         return
     elif action == "pbtype":
         # parts: adm|pbtype|<ctype>
@@ -1265,10 +1306,79 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         kb = []
         for ctype, info in pb.CONTENT_TYPES.items():
             kb.append([InlineKeyboardButton(info["label"], callback_data=f"adm|pbtype|{ctype}")])
+        kb.append([InlineKeyboardButton("🔎 تشخیص خودکار (با URL نمونه)", callback_data="adm|pbauto")])
         kb.append([InlineKeyboardButton(i18n.t(lang, "back"), callback_data="adm|plugins")])
         await update.message.reply_text(
-            "✅ دامنه ذخیره شد. قدم ۳ از ۴: **نوع محتوا** رو انتخاب کن:",
+            "✅ دامنه ذخیره شد. قدم ۳ از ۴: **نوع محتوا** رو انتخاب کن،\n"
+            "یا بذار خودم با یه URL نمونه تشخیص بدم 👇",
             reply_markup=InlineKeyboardMarkup(kb))
+    elif state == "pb_auto_url":
+        context.user_data["adm_state"] = "pb_auto_pattern"
+        context.user_data["pb_sample_url"] = (text or "").strip()
+        await update.message.reply_text(
+            "🔎 در حال تحلیل صفحه... (حداکثر ۳۰ ثانیه)")
+        import asyncio as _asyncio
+        det = await _asyncio.to_thread(adetect.detect, context.user_data.get("pb_sample_url", ""))
+        if det.get("type") in ("comic", "photos"):
+            # suggest a pattern from the samples
+            samples = det.get("samples") or []
+            suggested = ""
+            if samples:
+                s = samples[0]
+                import re as _re
+                # build a generic pattern: escape the domain part, keep path shape
+                m = _re.match(r"https?://([^/]+)(/.*?)(\.[a-z]+)$", s)
+                if m:
+                    domain, path, ext = m.group(1), m.group(2), m.group(3)
+                    domain_esc = _re.escape(domain)
+                    path_esc = _re.escape(path).replace(_re.escape("\\"), "\\\\")
+                    suggested = f"https?://{domain_esc}{path_esc[:60]}[^\\\"']+\\.(?:jpg|jpeg|png)"
+            context.user_data["pb_auto_type"] = det["type"]
+            context.user_data["pb_auto_pattern"] = suggested
+            await update.message.reply_text(
+                f"🧠 **تشخیص خودکار:** {det.get('detail', det['type'])}\n\n"
+                f"پیشنهاد الگو:\n`{suggested or '(الگو قابل ساخت نیست — دستی بنویس)'}`\n\n"
+                f"الگو رو تأیید کن یا تغییرش بده و بفرست:",
+                parse_mode="Markdown")
+        elif det.get("type") == "video":
+            context.user_data["pb_auto_type"] = "video"
+            context.user_data["pb_auto_pattern"] = r"https?://[^\s\"]+\.(?:mp4|m3u8)"
+            await update.message.reply_text(
+                f"🧠 **تشخیص خودکار:** {det.get('detail', 'video')}\n\n"
+                f"الگوی پیشنهادی:\n`https?://[^\\s\\\"]+\\.(?:mp4|m3u8)`\n\n"
+                f"تأیید کن یا تغییرش بده و بفرست:", parse_mode="Markdown")
+        else:
+            context.user_data.pop("pb_auto_type", None)
+            context.user_data.pop("pb_auto_pattern", None)
+            context.user_data["adm_state"] = "pb_type"
+            await update.message.reply_text(
+                f"😕 چیزی قابل استخراج پیدا نشد: {det.get('detail', '')}\n\n"
+                f"توی این حالت بهتره **نوع رو دستی انتخاب کنی** 👇",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(info["label"], callback_data=f"adm|pbtype|{ctype}")]
+                    for ctype, info in pb.CONTENT_TYPES.items()
+                ] + [[InlineKeyboardButton(i18n.t(lang, "back"), callback_data="adm|plugins")]]))
+    elif state == "pb_auto_pattern":
+        context.user_data.pop("adm_state", None)
+        name = context.user_data.pop("pb_name", "").strip()
+        site = context.user_data.pop("pb_site", "").strip()
+        ctype = context.user_data.get("pb_auto_type", "multi")
+        pattern = (text or "").strip()
+        context.user_data.pop("pb_auto_type", None)
+        context.user_data.pop("pb_auto_pattern", None)
+        if not name or not site or not pattern:
+            await update.message.reply_text("❌ اطلاعات ناقصه. دوباره از «🛠 پلاگین‌ساز» شروع کن.")
+            return
+        status = await update.message.reply_text("🔧 در حال ساخت پلاگین...")
+        result = pb.build_plugin(name, site, ctype, pattern)
+        if not result.get("ok"):
+            await status.edit_text(f"❌ {result.get('message')}")
+            return
+        await status.edit_text(
+            f"✅ **{result['message']}**\n\n"
+            f"📋 خلاصه:\n• نام: `{name}`\n• دامنه: `{site}`\n• نوع: `{ctype}`\n"
+            f"• الگو: `{pattern[:80]}`\n\n"
+            f"حالا یه لینک از `{site}` بفرست تا تستش کنی! 🚀")
     elif state == "pb_pattern":
         context.user_data.pop("adm_state", None)
         name = context.user_data.pop("pb_name", "").strip()
@@ -2099,7 +2209,56 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     db.record_link(update, url, site)
 
-    status_msg = await update.message.reply_text(i18n.t(lang, "checking"))
+    # ── AUTO-DETECT: unknown site with no plugin — heuristically guess media type ──
+    if site == "other":
+        status_msg = await update.message.reply_text("🔎 در حال بررسی خودکار سایت...")
+        try:
+            detection = await asyncio.to_thread(adetect.detect, url)
+        except Exception:
+            detection = {"type": "error", "error": "analysis failed"}
+        if detection.get("type") in ("comic", "video", "photos", "text"):
+            try:
+                await status_msg.edit_text(
+                    f"🧠 **پشتیبانی خودکار** — این سایت به صورت خودکار پردازش می‌شه.\n"
+                    f"⚠️ این نوع پشتیبانی آزمایشیه و ممکنه باگ داشته باشه.\n\n"
+                    f"📊 تشخیص: **{detection.get('detail', detection['type'])}**")
+            except Exception:
+                pass
+            try:
+                await context.bot.send_chat_action(chat_id=update.effective_chat.id,
+                                                   action="upload_document")
+            except Exception:
+                pass
+            result = await asyncio.to_thread(
+                adetect.auto_download, url, detection["type"], DOWNLOAD_DIR,
+                detection.get("samples"))
+            if result.get("error"):
+                try:
+                    await status_msg.edit_text(
+                        f"⚠️ پشتیبانی خودکار ناموفق بود:\n`{result['error'][:200]}`\n\n"
+                        f"💡 این سایت رو می‌تونی با **پلاگین‌ساز** (از پنل ادمین) دقیق پشتیبانی کنی!",
+                        parse_mode="Markdown")
+                except Exception:
+                    pass
+                return
+            await _send_plugin_result(update, context, result, lang, status_msg)
+            await asyncio.to_thread(enforce_disk_limit)
+            return
+        if detection.get("type") == "error":
+            try:
+                await status_msg.edit_text(
+                    f"⚠️ نتونستم این سایت رو خودکار تشخیص بدم: {detection.get('error', '')[:120]}\n\n"
+                    f"💡 از پنل ادمین → پلاگین‌ساز می‌تونی پشتیبانی دقیق بسازی.",
+                    disable_web_page_preview=True)
+            except Exception:
+                pass
+            return
+        # type == "none": let normal flow try (may give a clear error)
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        status_msg = await update.message.reply_text(i18n.t(lang, "checking"))
 
     info = dl.get_video_info(url)
     if info.get("error"):

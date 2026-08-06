@@ -146,6 +146,25 @@ def call_plugin_chapters(meta, url):
         return []
 
 
+def call_plugin_detect_type(meta, url) -> str | None:
+    """Ask a plugin for its type classification (comic/video/photos/text) — used
+    by multi-type plugins. Returns None if the plugin has no detect() method."""
+    entry = plugin_entry_path(meta)
+    if not os.path.isfile(entry):
+        return None
+    try:
+        mod = _load_module_from_file(entry, f"plugin_{meta['name']}")
+        if not hasattr(mod, "Plugin"):
+            return None
+        plugin = mod.Plugin()
+        if not hasattr(plugin, "detect"):
+            return None
+        return plugin.detect(url)
+    except Exception as e:
+        log.error("plugin %s detect error: %s", meta.get("name"), e)
+        return None
+
+
 def call_plugin_download_chapter(meta, chapter_url, config=None):
     """Ask a plugin to download a specific chapter. Returns result dict."""
     entry = plugin_entry_path(meta)

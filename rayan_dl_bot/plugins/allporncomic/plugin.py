@@ -120,6 +120,9 @@ class Plugin:
         config = config or {}
         max_pages = int(config.get("max_pages", 300))
         timeout = int(config.get("timeout", 60))
+        max_workers = int(config.get("max_workers", 8))
+        image_quality = int(config.get("image_quality", 92))
+        keep_images = bool(config.get("keep_images", False))
         workdir = config.get("workdir", "/root/hermes-workspace/tmp/downloads")
         try:
             pages = _extract_pages(chapter_url, max_pages)
@@ -138,7 +141,7 @@ class Plugin:
             outdir = os.path.join(workdir, f"apc_{int(__import__('time').time())}")
             os.makedirs(outdir, exist_ok=True)
             img_paths = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
                 futures = {
                     ex.submit(_download_image, u, os.path.join(outdir, f"{i:04d}.jpg"), timeout): u
                     for i, u in enumerate(pages, 1)
@@ -153,14 +156,35 @@ class Plugin:
                 return {"error": "failed to download any page"}
 
             import img2pdf
-            pdf_path = os.path.join(outdir, f"{slug}.pdf")
-            with open(pdf_path, "wb") as f:
-                f.write(img2pdf.convert(img_paths))
+            from PIL import Image
+            # img2pdf can't embed PNG with alpha — flatten transparent images to JPEG
+            flat_paths = []
             for p in img_paths:
                 try:
-                    os.remove(p)
+                    im = Image.open(p)
+                    if im.mode in ("RGBA", "LA", "P"):
+                        fp = p.rsplit(".", 1)[0] + "_flat.jpg"
+                        im.convert("RGB").save(fp, "JPEG", quality=image_quality)
+                        flat_paths.append(fp)
+                    else:
+                        flat_paths.append(p)
+                except Exception:
+                    flat_paths.append(p)
+            pdf_path = os.path.join(outdir, f"{slug}.pdf")
+            with open(pdf_path, "wb") as f:
+                f.write(img2pdf.convert(flat_paths))
+            for p in flat_paths:
+                try:
+                    if p.endswith("_flat.jpg"):
+                        os.remove(p)
                 except OSError:
                     pass
+            if not keep_images:
+                for p in img_paths:
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
             return {
                 "type": "pdf",
                 "title": title,
