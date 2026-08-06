@@ -80,11 +80,43 @@ def detect_site(url: str) -> str:
 
 
 def get_proxy_args(url: str) -> list:
-    if is_pornhub(url):
-        return []
+    """Smart proxy routing: prefer WARP (fast, ~16MB/s) for blocked sites,
+    fall back to Tor (slow, ~1MB/s) only when WARP is blocked.
+    Pornhub is handled by ph_downloader (already WARP-first internally)."""
     if is_tor_site(url):
+        # WARP is ~16x faster than Tor; Tor is the fallback for anti-bot sites
+        if _warp_can_reach(url):
+            return ["--proxy", WARP_PROXY]
         return ["--proxy", TOR_PROXY]
     return []
+
+
+_warp_check_cache: dict = {}
+import threading
+_warp_lock = threading.Lock()
+
+
+def _warp_can_reach(url: str, timeout: float = 6.0) -> bool:
+    """Cheap check: can WARP reach this site? Cached per-domain for 60s."""
+    from urllib.parse import urlparse
+    domain = urlparse(url).netloc
+    now = __import__("time").time()
+    with _warp_lock:
+        cached = _warp_check_cache.get(domain)
+        if cached and now - cached[1] < 60:
+            return cached[0]
+    ok = False
+    try:
+        r = subprocess.run(
+            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", str(int(timeout)),
+             "--socks5-hostname", "127.0.0.1:40000", "-A", "Mozilla/5.0", f"https://{domain}/"],
+            capture_output=True, text=True, timeout=int(timeout) + 5)
+        ok = r.stdout.strip() not in ("", "000", "403", "407")
+    except Exception:
+        ok = False
+    with _warp_lock:
+        _warp_check_cache[domain] = (ok, now)
+    return ok
 
 
 # ── Formatting ────────────────────────────────────────────────
