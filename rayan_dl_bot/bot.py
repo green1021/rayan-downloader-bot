@@ -442,10 +442,32 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "other": i18n.t(lang, "site_other"),
     }
     for site, url, created in rows:
-        short = url[:50] + ("..." if len(url) > 50 else "")
+        # Show the FULL link as a clickable Markdown link — no truncation.
+        # Only escape chars that actually break Markdown links: parens.
+        # (Telegram does NOT want \-style escapes inside link URLs.)
+        esc = url.replace("\\", "/").replace(")", "%29").replace("(", "%28")
+        esc = esc.replace("]", "%5D")
+        link = f"[{url}]({esc})"
         lines.append(i18n.t(lang, "history_item").format(
-            site=site_names.get(site, site), url=short, time=created[:16]))
-    await update.message.reply_text("\n".join(lines), disable_web_page_preview=True)
+            site=site_names.get(site, site), url=link, time=created[:16]))
+    text = "\n".join(lines)
+    # Telegram limit ~4096 chars: if over, show fewer items with a note
+    if len(text) > 4000:
+        lines = lines[:1]
+        shown = 0
+        for line in rows:
+            esc = line[1].replace("\\", "/").replace(")", "%29").replace("(", "%28").replace("]", "%5D")
+            link = f"[{line[1]}]({esc})"
+            item = i18n.t(lang, "history_item").format(
+                site=site_names.get(line[0], line[0]), url=link, time=(line[2] or "")[:16])
+            if len("\n".join(lines + [item])) > 3900:
+                break
+            lines.append(item)
+            shown += 1
+        lines.append(f"\n… و {len(rows) - shown} مورد دیگر")
+        text = "\n".join(lines)
+    await update.message.reply_text(text, parse_mode="Markdown",
+                                    disable_web_page_preview=True)
 
 
 # ── Admin panel ───────────────────────────────────────────────
@@ -687,10 +709,12 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         for lid, uid, username, first, last, site, title, url, created in rows:
             name = first or last or username or str(uid)
             title_s = (title or "—")[:60]
-            url_s = (url[:45] + ("..." if len(url) > 45 else ""))
+            # Full clickable link (no truncation of the URL itself)
+            esc_url = url.replace("\\", "/").replace(")", "%29").replace("(", "%28").replace("]", "%5D")
+            link = f"[{url}]({esc_url})"
             lines.append(i18n.t(lang, "admin_link_line").format(
                 user=name, uid=uid, site=site_names.get(site, site),
-                title=title_s, url=url_s, time=(created or "")[:16]))
+                title=title_s, url=link, time=(created or "")[:16]))
         # Telegram message limit ~4096 chars — truncate if needed
         text = "\n".join(lines)
         if len(text) > 4000:
