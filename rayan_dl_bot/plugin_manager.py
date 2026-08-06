@@ -126,6 +126,48 @@ def call_plugin(meta, url, config=None):
         return {"error": f"plugin error: {e}"}
 
 
+def call_plugin_chapters(meta, url):
+    """Ask a plugin for its chapter list (multi-chapter support).
+    Returns list of {num, title, url} or [] if plugin has no chapters."""
+    entry = plugin_entry_path(meta)
+    if not os.path.isfile(entry):
+        return []
+    try:
+        mod = _load_module_from_file(entry, f"plugin_{meta['name']}")
+        if not hasattr(mod, "Plugin"):
+            return []
+        plugin = mod.Plugin()
+        if not hasattr(plugin, "get_chapters"):
+            return []
+        chapters = plugin.get_chapters(url)
+        return chapters or []
+    except Exception as e:
+        log.error("plugin %s get_chapters error: %s", meta.get("name"), e)
+        return []
+
+
+def call_plugin_download_chapter(meta, chapter_url, config=None):
+    """Ask a plugin to download a specific chapter. Returns result dict."""
+    entry = plugin_entry_path(meta)
+    if not os.path.isfile(entry):
+        return {"error": f"plugin entry missing: {os.path.basename(entry)}"}
+    try:
+        cfg = dict(meta.get("config", {}))
+        if config:
+            cfg.update(config)
+        mod = _load_module_from_file(entry, f"plugin_{meta['name']}")
+        if not hasattr(mod, "Plugin"):
+            return {"error": "plugin has no Plugin class"}
+        plugin = mod.Plugin()
+        if hasattr(plugin, "download_chapter"):
+            return plugin.download_chapter(chapter_url, cfg)
+        # fallback: use handle() (resolves first chapter only)
+        return plugin.handle(chapter_url, cfg)
+    except Exception as e:
+        log.error("plugin %s download_chapter error: %s", meta.get("name"), e)
+        return {"error": f"plugin error: {e}"}
+
+
 # ── Install / remove ──────────────────────────────────────────
 def _validate_meta(meta) -> str | None:
     """Return error string or None if valid."""

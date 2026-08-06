@@ -1221,6 +1221,136 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         os.remove(fpath)
 
 
+# ── Plugin chapter picker (paginated glass buttons) ──────────
+PER_PAGE = 10
+
+
+async def _show_chapters_page(update: Update, context, plugin_meta, chapters, page=0,
+                              status_msg=None) -> None:
+    """Render a page of chapter buttons (10 per page) with prev/next navigation."""
+    lang = lang_of(update)
+    total_pages = max(1, (len(chapters) + PER_PAGE - 1) // PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * PER_PAGE
+    chunk = chapters[start:start + PER_PAGE]
+
+    lines = [f"🔰 **{plugin_meta['name']}** — {len(chapters)} قسمت",
+             f"📄 صفحه {page + 1} از {total_pages}\n"]
+    kb = []
+    for i, ch in enumerate(chunk):
+        idx = start + i
+        lines.append(f"{idx + 1}. {ch['title'][:60]}")
+        kb.append([InlineKeyboardButton(f"📥 قسمت {ch['num']}", callback_data=f"pldl|{plugin_meta['name']}|{idx}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️ قبلی", callback_data=f"plpg|{plugin_meta['name']}|{page - 1}"))
+    nav.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="plnoop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"plpg|{plugin_meta['name']}|{page + 1}"))
+    if nav:
+        kb.append(nav)
+    kb.append([InlineKeyboardButton("❌ بستن", callback_data="plclose")])
+
+    text = "\n".join(lines)
+    if status_msg:
+        try:
+            await status_msg.edit_text(text, parse_mode="Markdown",
+                                       reply_markup=InlineKeyboardMarkup(kb))
+            return
+        except Exception:
+            pass
+    await update.effective_message.reply_text(text, parse_mode="Markdown",
+                                              reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def chapter_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle chapter picker callbacks: pldl (download chapter), plpg (page), plnoop, plclose."""
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    data = q.data or ""
+    parts = data.split("|")
+    action = parts[0]
+
+    if action == "plclose":
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+        return
+
+    if action == "plnoop":
+        return
+
+    if len(parts) < 3:
+        return
+    pname = parts[1]
+    chapters = context.user_data.get(f"plchaps_{pname}") or []
+    if not chapters:
+        try:
+            await q.message.edit_text("❌ لیست قسمت‌ها منقضی شد. لینک کامیک رو دوباره بفرست.")
+        except Exception:
+            pass
+        return
+
+    if action == "plpg":
+        page = int(parts[2])
+        await _show_chapters_page(update, context, {"name": pname}, chapters, page=page,
+                                  status_msg=q.message)
+        return
+
+    if action == "pldl":
+        idx = int(parts[2])
+        if idx < 0 or idx >= len(chapters):
+            return
+        ch = chapters[idx]
+        meta = pm.get_plugin(pname)
+        if not meta:
+            await q.message.edit_text("❌ پلاگین پیدا نشد.")
+            return
+        lang = lang_of(update)
+        # tell the user download started, keep the picker visible
+        try:
+            await q.message.edit_text(
+                f"⬇️ در حال دانلود **قسمت {ch['num']}**...\nمنو باز می‌مونه، بعدش می‌تونی قسمت بعدی رو هم بزنی.",
+                parse_mode="Markdown")
+        except Exception:
+            pass
+        try:
+            await context.bot.send_chat_action(chat_id=q.message.chat_id, action="upload_document")
+        except Exception:
+            pass
+        result = await asyncio.to_thread(
+            pm.call_plugin_download_chapter, meta, ch["url"],
+            {"workdir": DOWNLOAD_DIR, "lang": lang})
+        if result.get("error"):
+            try:
+                await q.message.edit_text(
+                    f"❌ قسمت {ch['num']} ناموفق: {result['error'][:150]}\n\n"
+                    f"یک قسمت دیگه انتخاب کن 👇", reply_markup=None)
+            except Exception:
+                pass
+            await _show_chapters_page(update, context, meta, chapters, page=0)
+            return
+        # send the PDF, then RE-OPEN the picker (menu stays open for next chapter)
+        try:
+            path = result.get("path")
+            if path and os.path.exists(path):
+                await context.bot.send_document(
+                    chat_id=q.message.chat_id, document=open(path, "rb"),
+                    caption=f"📄 {result.get('title', '')}",
+                    filename=os.path.basename(path))
+                db.record_download(q.from_user.id, ch["url"], f"plugin:{pname}", "pdf", True)
+                dl.cleanup(path)
+        except Exception as e:
+            log.warning("chapter pdf send: %s", e)
+        await _show_chapters_page(update, context, meta, chapters, page=0,
+                                  status_msg=q.message)
+
+
 # ── Plugin result sender ──────────────────────────────────────
 async def _send_plugin_result(update: Update, context, result: dict, lang: str,
                               status_msg=None) -> None:
@@ -1834,6 +1964,17 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if plugin_meta and site in ("other", "twitter", "instagram", "youtube"):
         db.record_link(update, url, f"plugin:{plugin_meta['name']}")
         status_msg = await update.message.reply_text(i18n.t(lang, "checking"))
+
+        # Multi-chapter plugin? Show a chapter picker with paginated glass buttons.
+        try:
+            chapters = await asyncio.to_thread(pm.call_plugin_chapters, plugin_meta, url)
+        except Exception:
+            chapters = []
+        if chapters:
+            context.user_data[f"plchaps_{plugin_meta['name']}"] = chapters
+            await _show_chapters_page(update, context, plugin_meta, chapters, page=0, status_msg=status_msg)
+            return
+
         try:
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_document")
         except Exception:
@@ -2408,6 +2549,7 @@ def main():
     app.add_handler(CallbackQueryHandler(force_join_check_cb, pattern="^fjcheck$"))
     app.add_handler(CallbackQueryHandler(search_cb, pattern="^srch"))
     app.add_handler(CallbackQueryHandler(startmsg_translate_cb, pattern="^smt"))
+    app.add_handler(CallbackQueryHandler(chapter_cb, pattern="^pl(dl|pg|noop|close)"))
     app.add_handler(CallbackQueryHandler(more_qualities, pattern="^more"))
     app.add_handler(CallbackQueryHandler(button_click))
 
