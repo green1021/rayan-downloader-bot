@@ -127,13 +127,13 @@ class Plugin:
         try:
             pages = _extract_pages(chapter_url, max_pages)
             if not pages:
-                return {"error": "no comic pages found (page may need login)"}
+                return {"error": "هیچ صفحه‌ای از کامیک پیدا نشد (ممکنه نیاز به ورود داشته باشه)"}
 
             slug = chapter_url.rstrip("/").rsplit("/", 1)[-1]
-            # nicer title: "1-milf-catchers" -> "Chapter 1 …", take chapter number
+            # nicer title: "1-milf-catchers" -> "فصل ۱ …", take chapter number
             m = re.match(r"(\d+)-(.+)", slug)
             if m:
-                title = f"Chapter {m.group(1)} — {m.group(2).replace('-', ' ').title()}"
+                title = f"فصل {m.group(1)} — {m.group(2).replace('-', ' ').title()}"
             else:
                 title = slug.replace("-", " ").title()
             title = title[:80]
@@ -150,10 +150,10 @@ class Plugin:
                     try:
                         img_paths.append(fut.result())
                     except Exception as e:
-                        log.warning("page download failed: %s", e)
+                        log.warning("خطا در دانلود صفحه: %s", e)
             img_paths = sorted(img_paths)
             if not img_paths:
-                return {"error": "failed to download any page"}
+                return {"error": "دانلود صفحات ناموفق بود"}
 
             import img2pdf
             from PIL import Image
@@ -194,7 +194,7 @@ class Plugin:
             }
         except Exception as e:
             log.error("allporncomic download_chapter: %s", e)
-            return {"error": f"allporncomic error: {e}"}
+            return {"error": f"خطای پلاگین کامیک: {e}"}
 
     def handle(self, url, config=None):
         config = config or {}
@@ -205,5 +205,5 @@ class Plugin:
         # Otherwise try to find first chapter (backward compatible)
         first = _find_first_chapter(url)
         if not first:
-            return {"error": "could not find a chapter in this comic page"}
+            return {"error": "نتونستم قسمتی در این کامیک پیدا کنم"}
         return self.download_chapter(first, config)
