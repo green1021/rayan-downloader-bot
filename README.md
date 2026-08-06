@@ -40,6 +40,35 @@ After adding the bot to a group:
 2. Enable "Access messages"
 Then group commands work: `/grouphelp /groupsettings /setquality /autodl /silent /commandonly /ytdl`
 
+## 🔌 Plugin System
+
+The bot supports **installable plugins** that handle sites the core doesn't support (comics → PDF, custom galleries, etc).
+
+### Install from the admin panel
+1. `/admin` → **🔌 Plugins** → **➕ Install Plugin**
+2. Send a URL to the plugin:
+   - a `.zip` containing `plugin.json` + code
+   - a raw GitHub URL to `plugin.json` (e.g. `https://raw.githubusercontent.com/green1021/rayan-plugins/main/allporncomic/plugin.json`)
+3. Plugin is validated (name, sites, entry path) and installed automatically
+
+### Write your own plugin
+```
+plugins/<name>/
+  plugin.json   { name, version, description, sites[], entry, enabled, config{} }
+  plugin.py     class Plugin: def handle(self, url, config) -> dict
+```
+
+`handle()` returns:
+```python
+{"type": "pdf"|"video"|"photos"|"text",
+ "title": "...", "path": "/abs/file.pdf",   # pdf/video
+ "photos": ["/abs/1.jpg"],                    # photos
+ "text": "caption", "error": "..."}           # on failure
+```
+See `rayan_dl_bot/plugins/allporncomic/plugin.py` as an example (downloads comic pages → single PDF via img2pdf).
+
+Plugin contributions repo: `github.com/green1021/rayan-plugins`
+
 ## 🗂 Structure
 
 ```
