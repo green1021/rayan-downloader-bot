@@ -27,6 +27,7 @@ import downloader as dl
 import ig_tw as igtw
 import recognizer as recog
 import plugin_manager as pm
+import plugin_builder as pb
 
 # ── Config ────────────────────────────────────────────────────
 def _load_token() -> str:
@@ -852,8 +853,10 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         plugins = pm.discover_plugins()
         if not plugins:
             text = "🔌 **پلاگین‌ها**\n\n📭 هیچ پلاگینی نصب نیست.\n\n"
-            text += "برای نصب، دکمه «➕ نصب پلاگین» رو بزن و لینک پلاگین (zip یا raw GitHub) رو بفرست."
+            text += "برای نصب، دکمه «➕ نصب پلاگین» رو بزن و فایل zip یا لینک بفرست.\n"
+            text += "یا با «🛠 پلاگین‌ساز» یک پلاگین دستی بساز!"
             kb = [[InlineKeyboardButton("➕ نصب پلاگین", callback_data="adm|plugin_install")],
+                  [InlineKeyboardButton("🛠 پلاگین‌ساز", callback_data="adm|pbbuild")],
                   [InlineKeyboardButton(i18n.t(lang, "back"), callback_data="adm|menu"),
                    InlineKeyboardButton(i18n.t(lang, "close"), callback_data="adm|close")]]
             await q.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
@@ -866,6 +869,7 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             lines.append(f"   {p.get('description','')[:60]}")
             kb.append([InlineKeyboardButton(f"🔧 {p['name']} — تنظیمات", callback_data=f"adm|plugin_info|{p['name']}")])
         kb.append([InlineKeyboardButton("➕ نصب پلاگین", callback_data="adm|plugin_install")])
+        kb.append([InlineKeyboardButton("🛠 پلاگین‌ساز", callback_data="adm|pbbuild")])
         kb.append([InlineKeyboardButton(i18n.t(lang, "back"), callback_data="adm|menu"),
                    InlineKeyboardButton(i18n.t(lang, "close"), callback_data="adm|close")])
         await q.message.edit_text("\n".join(lines), parse_mode="Markdown",
@@ -954,6 +958,26 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             context.user_data["plugin_set_key"] = key
             await q.message.edit_text(f"🔧 مقدار جدید برای `{key}` رو بفرست کدوم پلاگین {pname}:",
                                       parse_mode="Markdown", reply_markup=admin_back_keyboard(lang))
+    elif action == "pbbuild":
+        context.user_data["adm_state"] = "pb_name"
+        await q.message.edit_text(
+            "🛠 **پلاگین‌ساز دستی**\n\n"
+            "قدم ۱ از ۴: اسم پلاگین رو بنویس.\n"
+            "فقط حروف انگلیسی، عدد، `-` یا `_` (۲ تا ۴۰ کاراکتر).\n\n"
+            "مثال: `mysitecomics`",
+            parse_mode="Markdown", reply_markup=admin_back_keyboard(lang))
+        return
+    elif action == "pbtype":
+        # parts: adm|pbtype|<ctype>
+        if len(parts) >= 3:
+            ctype = parts[2]
+            context.user_data["pb_type"] = ctype
+            context.user_data["adm_state"] = "pb_pattern"
+            info = pb.CONTENT_TYPES.get(ctype, {})
+            await q.message.edit_text(
+                f"🛠 **{info.get('label', ctype)}**\n\n{info.get('prompt', '')}\n\n"
+                f"الگوی **regex** رو بفرست:",
+                parse_mode="Markdown", reply_markup=admin_back_keyboard(lang))
     elif action == "userlinks":
         # Show all users, ask for an ID to export their links
         rows = db.get_top_users(50)
@@ -1228,6 +1252,43 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         else:
             await update.message.reply_text("❌ خطا در ذخیره تنظیمات.")
 
+    elif state == "pb_name":
+        context.user_data["adm_state"] = "pb_site"
+        context.user_data["pb_name"] = (text or "").strip()
+        await update.message.reply_text(
+            "✅ اسم ذخیره شد. قدم ۲ از ۴: **دامنه سایت** رو بنویس.\n\n"
+            "فقط دامنه کافیه، مثلا:\n`mysite.com` یا `www.mysite.com`\n"
+            "(ربات خودش https و www رو هندل می‌کنه)")
+    elif state == "pb_site":
+        context.user_data["adm_state"] = "pb_type"
+        context.user_data["pb_site"] = (text or "").strip()
+        kb = []
+        for ctype, info in pb.CONTENT_TYPES.items():
+            kb.append([InlineKeyboardButton(info["label"], callback_data=f"adm|pbtype|{ctype}")])
+        kb.append([InlineKeyboardButton(i18n.t(lang, "back"), callback_data="adm|plugins")])
+        await update.message.reply_text(
+            "✅ دامنه ذخیره شد. قدم ۳ از ۴: **نوع محتوا** رو انتخاب کن:",
+            reply_markup=InlineKeyboardMarkup(kb))
+    elif state == "pb_pattern":
+        context.user_data.pop("adm_state", None)
+        name = context.user_data.pop("pb_name", "").strip()
+        site = context.user_data.pop("pb_site", "").strip()
+        ctype = context.user_data.get("pb_type", "")
+        pattern = (text or "").strip()
+        context.user_data.pop("pb_type", None)
+        if not name or not site or not ctype or not pattern:
+            await update.message.reply_text("❌ اطلاعات ناقصه. دوباره از «🛠 پلاگین‌ساز» شروع کن.")
+            return
+        status = await update.message.reply_text("🔧 در حال ساخت پلاگین...")
+        result = pb.build_plugin(name, site, ctype, pattern)
+        if not result.get("ok"):
+            await status.edit_text(f"❌ {result.get('message')}")
+            return
+        await status.edit_text(
+            f"✅ **{result['message']}**\n\n"
+            f"📋 خلاصه:\n• نام: `{name}`\n• دامنه: `{site}`\n• نوع: `{ctype}`\n"
+            f"• الگو: `{pattern[:80]}`\n\n"
+            f"حالا یه لینک از `{site}` بفرست تا تستش کنی! 🚀")
     elif state == "userlinks":
         context.user_data.pop("adm_state", None)
         try:
@@ -1429,6 +1490,14 @@ async def _send_plugin_result(update: Update, context, result: dict, lang: str,
                 await context.bot.send_media_group(chat_id=chat_id, media=media)
                 for p in photos:
                     dl.cleanup(p)
+            else:
+                await status_msg.edit_text(i18n.t(lang, "download_failed"))
+        elif typ == "audio":
+            path = result.get("path")
+            if path and os.path.exists(path):
+                await context.bot.send_audio(chat_id=chat_id, audio=open(path, "rb"),
+                                             caption=caption)
+                dl.cleanup(path)
             else:
                 await status_msg.edit_text(i18n.t(lang, "download_failed"))
         elif typ == "text":
