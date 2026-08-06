@@ -1307,6 +1307,8 @@ async def chapter_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if idx < 0 or idx >= len(chapters):
             return
         ch = chapters[idx]
+        # Return to the page this chapter lives on (so the user keeps their place)
+        resume_page = idx // PER_PAGE
         meta = pm.get_plugin(pname)
         if not meta:
             await q.message.edit_text("❌ پلاگین پیدا نشد.")
@@ -1333,7 +1335,7 @@ async def chapter_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     f"یک قسمت دیگه انتخاب کن 👇", reply_markup=None)
             except Exception:
                 pass
-            await _show_chapters_page(update, context, meta, chapters, page=0)
+            await _show_chapters_page(update, context, meta, chapters, page=resume_page)
             return
         # send the PDF, then RE-OPEN the picker (menu stays open for next chapter)
         try:
@@ -1347,7 +1349,7 @@ async def chapter_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 dl.cleanup(path)
         except Exception as e:
             log.warning("chapter pdf send: %s", e)
-        await _show_chapters_page(update, context, meta, chapters, page=0,
+        await _show_chapters_page(update, context, meta, chapters, page=resume_page,
                                   status_msg=q.message)
 
 

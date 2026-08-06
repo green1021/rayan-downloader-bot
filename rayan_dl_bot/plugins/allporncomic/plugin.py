@@ -26,6 +26,8 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 PAGE_PAT = re.compile(r"https://cdn\.allporncomic\.com/wp-content/uploads/WP-manga/data/[^\"']+\.(?:jpg|jpeg|png)")
 CHAPTER_PAT = re.compile(r'<a[^>]*href="([^"]+)"[^>]*>\s*(\d+)\s*\.\s*([^<]+?)</a>')
+# any link matching the chapter URL shape /<n>-<slug>/ (catches special/extra chapters)
+CHAPTER_LINK_PAT = re.compile(r'href="([^"]*porncomic/[^"]*/\d+(?:-\d+)?-[^"/]*/)"')
 
 
 def _fetch(url, timeout=60, binary=False):
@@ -37,21 +39,44 @@ def _fetch(url, timeout=60, binary=False):
 
 def get_chapters(url: str) -> list:
     """Return chapter list [{num, title, url}] for a comic listing page.
-    Chapters are sorted ascending (chapter 1 first)."""
+    Source of truth = chapter links in HTML (all shapes: 1, 3-5 (=3.5), 22-5 (=22.5)).
+    Sorted ascending. Duplicate URLs are dropped."""
     try:
         html = _fetch(url).decode("utf-8", "ignore")
         chaps = []
-        for href, num, title in CHAPTER_PAT.findall(html):
+        seen_urls = set()
+
+        def _add(href, title=None):
+            nonlocal chaps
             if not href.startswith("http"):
-                href = "https://allporncomic.com" + href if href.startswith("/") else url
-            chaps.append({"num": int(num), "title": title.strip(), "url": href})
-        # dedupe by url, keep first
-        seen, uniq = set(), []
-        for c in chaps:
-            if c["url"] not in seen:
-                seen.add(c["url"])
-                uniq.append(c)
-        return sorted(uniq, key=lambda c: c["num"])
+                href = ("https://allporncomic.com" + href) if href.startswith("/") else href
+            if not href or href in seen_urls:
+                return
+            seen_urls.add(href)
+            slug = href.rstrip("/").rsplit("/", 1)[-1]
+            m = re.match(r"(\d+)(?:-(\d+))?-(.+)", slug)
+            if not m:
+                return
+            num = int(m.group(1))
+            frac = m.group(2)
+            if frac:
+                num = float(f"{m.group(1)}.{frac}")
+            if title is None:
+                title = m.group(3).replace("-", " ").title()
+            else:
+                # clean anchor title: "5 . Au Naturel - Bonus - [..]" → "Au Naturel - Bonus"
+                title = re.sub(r"^\s*\d+(?:\.\d+)?\s*\.\s*", "", title).strip()
+                title = re.sub(r"\s*\[[^\]]*\]\s*$", "", title).strip()
+            chaps.append({"num": num, "title": title.strip(), "url": href})
+
+        # pass 1: numbered anchors with their visible titles (nicer names)
+        for href, num, title in CHAPTER_PAT.findall(html):
+            _add(href, title)
+        # pass 2: any chapter-shaped link missed by pass 1 (special/bonus slugs)
+        for href in CHAPTER_LINK_PAT.findall(html):
+            _add(href)
+
+        return sorted(chaps, key=lambda c: c["num"])
     except Exception as e:
         log.error("allporncomic get_chapters: %s", e)
         return []
