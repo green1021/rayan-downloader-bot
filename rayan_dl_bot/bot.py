@@ -8,10 +8,12 @@ import os
 import re
 import sys
 import time
+import json
 import logging
 import asyncio
 import shutil
 import hashlib
+import subprocess
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -507,24 +509,24 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     lang = lang_of(update)
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(i18n.t(lang, "stats") + " آمار", callback_data="adm|stats"),
-         InlineKeyboardButton(i18n.t(lang, "users_btn") + " کاربران", callback_data="adm|users")],
-        [InlineKeyboardButton(i18n.t(lang, "links_btn") + " لینک‌ها", callback_data="adm|links"),
-         InlineKeyboardButton("🔗 کانال‌ها", callback_data="adm|channels")],
-        [InlineKeyboardButton("📤 خروجی کاربر", callback_data="adm|userlinks"),
-         InlineKeyboardButton("💾 دیتابیس", callback_data="adm|db")],
-        [InlineKeyboardButton("👥 ادمین‌ها", callback_data="adm|adminlist"),
-         InlineKeyboardButton("➕ افزودن ادمین", callback_data="adm|addadmin")],
-        [InlineKeyboardButton("📝 متن شروع", callback_data="adm|startmsg"),
-         InlineKeyboardButton("🔄 بازنشانی متن", callback_data="adm|resetmsg")],
-        [InlineKeyboardButton("📊 آمار فنی", callback_data="adm|techstats"),
-         InlineKeyboardButton("🪵 لاگ خطاها", callback_data="adm|logs")],
-        [InlineKeyboardButton("🔌 پلاگین‌ها", callback_data="adm|plugins"),
-         InlineKeyboardButton("⚙️ تنظیمات ربات", callback_data="adm|botsettings")],
-        [InlineKeyboardButton(i18n.t(lang, "broadcast_btn") + " پیام گروهی", callback_data="adm|broadcast")],
-        [InlineKeyboardButton(i18n.t(lang, "ban_btn") + " مسدود", callback_data="adm|ban")],
-        [InlineKeyboardButton(i18n.t(lang, "unban_btn") + " رفع مسدودی", callback_data="adm|unban"),
-         InlineKeyboardButton("➕ کانال", callback_data="adm|addchan")],
+        [InlineKeyboardButton(i18n.t(lang, "adm_stats"), callback_data="adm|stats"),
+         InlineKeyboardButton(i18n.t(lang, "adm_users"), callback_data="adm|users")],
+        [InlineKeyboardButton(i18n.t(lang, "adm_links"), callback_data="adm|links"),
+         InlineKeyboardButton(i18n.t(lang, "adm_channels"), callback_data="adm|channels")],
+        [InlineKeyboardButton(i18n.t(lang, "adm_userlinks"), callback_data="adm|userlinks"),
+         InlineKeyboardButton(i18n.t(lang, "adm_db"), callback_data="adm|db")],
+        [InlineKeyboardButton(i18n.t(lang, "adm_admins"), callback_data="adm|adminlist"),
+         InlineKeyboardButton(i18n.t(lang, "adm_addadmin"), callback_data="adm|addadmin")],
+        [InlineKeyboardButton(i18n.t(lang, "adm_startmsg"), callback_data="adm|startmsg"),
+         InlineKeyboardButton(i18n.t(lang, "adm_resetmsg"), callback_data="adm|resetmsg")],
+        [InlineKeyboardButton(i18n.t(lang, "adm_techstats"), callback_data="adm|techstats"),
+         InlineKeyboardButton(i18n.t(lang, "adm_logs"), callback_data="adm|logs")],
+        [InlineKeyboardButton(i18n.t(lang, "adm_plugins"), callback_data="adm|plugins"),
+         InlineKeyboardButton(i18n.t(lang, "adm_botsettings"), callback_data="adm|botsettings")],
+        [InlineKeyboardButton(i18n.t(lang, "adm_broadcast"), callback_data="adm|broadcast")],
+        [InlineKeyboardButton(i18n.t(lang, "adm_ban"), callback_data="adm|ban")],
+        [InlineKeyboardButton(i18n.t(lang, "adm_unban"), callback_data="adm|unban"),
+         InlineKeyboardButton(i18n.t(lang, "adm_addchan"), callback_data="adm|addchan")],
     ])
     await update.message.reply_text(i18n.t(lang, "admin_menu"), reply_markup=kb)
 
@@ -540,24 +542,24 @@ def admin_back_keyboard(lang: str):
 async def _admin_menu_edit(q, lang: str):
     """Render the admin main menu onto the existing message (edit, not new msg)."""
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(i18n.t(lang, "stats") + " آمار", callback_data="adm|stats"),
-         InlineKeyboardButton(i18n.t(lang, "users_btn") + " کاربران", callback_data="adm|users")],
-        [InlineKeyboardButton(i18n.t(lang, "links_btn") + " لینک‌ها", callback_data="adm|links"),
-         InlineKeyboardButton("🔗 کانال‌ها", callback_data="adm|channels")],
-        [InlineKeyboardButton("📤 خروجی کاربر", callback_data="adm|userlinks"),
-         InlineKeyboardButton("💾 دیتابیس", callback_data="adm|db")],
-        [InlineKeyboardButton("👥 ادمین‌ها", callback_data="adm|adminlist"),
-         InlineKeyboardButton("➕ افزودن ادمین", callback_data="adm|addadmin")],
-        [InlineKeyboardButton("📝 متن شروع", callback_data="adm|startmsg"),
-         InlineKeyboardButton("🔄 بازنشانی متن", callback_data="adm|resetmsg")],
-        [InlineKeyboardButton("📊 آمار فنی", callback_data="adm|techstats"),
-         InlineKeyboardButton("🪵 لاگ خطاها", callback_data="adm|logs")],
-        [InlineKeyboardButton("🔌 پلاگین‌ها", callback_data="adm|plugins"),
-         InlineKeyboardButton("⚙️ تنظیمات ربات", callback_data="adm|botsettings")],
-        [InlineKeyboardButton(i18n.t(lang, "broadcast_btn") + " پیام گروهی", callback_data="adm|broadcast")],
-        [InlineKeyboardButton(i18n.t(lang, "ban_btn") + " مسدود", callback_data="adm|ban")],
-        [InlineKeyboardButton(i18n.t(lang, "unban_btn") + " رفع مسدودی", callback_data="adm|unban"),
-         InlineKeyboardButton("➕ کانال", callback_data="adm|addchan")],
+        [InlineKeyboardButton(i18n.t(lang, "adm_stats"), callback_data="adm|stats"),
+         InlineKeyboardButton(i18n.t(lang, "adm_users"), callback_data="adm|users")],
+        [InlineKeyboardButton(i18n.t(lang, "adm_links"), callback_data="adm|links"),
+         InlineKeyboardButton(i18n.t(lang, "adm_channels"), callback_data="adm|channels")],
+        [InlineKeyboardButton(i18n.t(lang, "adm_userlinks"), callback_data="adm|userlinks"),
+         InlineKeyboardButton(i18n.t(lang, "adm_db"), callback_data="adm|db")],
+        [InlineKeyboardButton(i18n.t(lang, "adm_admins"), callback_data="adm|adminlist"),
+         InlineKeyboardButton(i18n.t(lang, "adm_addadmin"), callback_data="adm|addadmin")],
+        [InlineKeyboardButton(i18n.t(lang, "adm_startmsg"), callback_data="adm|startmsg"),
+         InlineKeyboardButton(i18n.t(lang, "adm_resetmsg"), callback_data="adm|resetmsg")],
+        [InlineKeyboardButton(i18n.t(lang, "adm_techstats"), callback_data="adm|techstats"),
+         InlineKeyboardButton(i18n.t(lang, "adm_logs"), callback_data="adm|logs")],
+        [InlineKeyboardButton(i18n.t(lang, "adm_plugins"), callback_data="adm|plugins"),
+         InlineKeyboardButton(i18n.t(lang, "adm_botsettings"), callback_data="adm|botsettings")],
+        [InlineKeyboardButton(i18n.t(lang, "adm_broadcast"), callback_data="adm|broadcast")],
+        [InlineKeyboardButton(i18n.t(lang, "adm_ban"), callback_data="adm|ban")],
+        [InlineKeyboardButton(i18n.t(lang, "adm_unban"), callback_data="adm|unban"),
+         InlineKeyboardButton(i18n.t(lang, "adm_addchan"), callback_data="adm|addchan")],
     ])
     try:
         await q.message.edit_text(i18n.t(lang, "admin_menu"), reply_markup=kb)
@@ -881,8 +883,8 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             text = "🔌 **پلاگین‌ها**\n\n📭 هیچ پلاگینی نصب نیست.\n\n"
             text += "برای نصب، دکمه «➕ نصب پلاگین» رو بزن و فایل zip یا لینک بفرست.\n"
             text += "یا با «🛠 پلاگین‌ساز» یک پلاگین دستی بساز!"
-            kb = [[InlineKeyboardButton("➕ نصب پلاگین", callback_data="adm|plugin_install")],
-                  [InlineKeyboardButton("🛠 پلاگین‌ساز", callback_data="adm|pbbuild")],
+            kb = [[InlineKeyboardButton(i18n.t(lang, "adm_install_plugin"), callback_data="adm|plugin_install")],
+                  [InlineKeyboardButton(i18n.t(lang, "adm_plugin_builder"), callback_data="adm|pbbuild")],
                   [InlineKeyboardButton(i18n.t(lang, "back"), callback_data="adm|menu"),
                    InlineKeyboardButton(i18n.t(lang, "close"), callback_data="adm|close")]]
             await q.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
@@ -894,8 +896,8 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             lines.append(f"{status} **{p['name']}** v{p.get('version')}")
             lines.append(f"   {p.get('description','')[:60]}")
             kb.append([InlineKeyboardButton(f"🔧 {p['name']} — تنظیمات", callback_data=f"adm|plugin_info|{p['name']}")])
-        kb.append([InlineKeyboardButton("➕ نصب پلاگین", callback_data="adm|plugin_install")])
-        kb.append([InlineKeyboardButton("🛠 پلاگین‌ساز", callback_data="adm|pbbuild")])
+        kb.append([InlineKeyboardButton(i18n.t(lang, "adm_install_plugin"), callback_data="adm|plugin_install")])
+        kb.append([InlineKeyboardButton(i18n.t(lang, "adm_plugin_builder"), callback_data="adm|pbbuild")])
         kb.append([InlineKeyboardButton(i18n.t(lang, "back"), callback_data="adm|menu"),
                    InlineKeyboardButton(i18n.t(lang, "close"), callback_data="adm|close")])
         await q.message.edit_text("\n".join(lines), parse_mode="Markdown",
