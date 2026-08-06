@@ -152,17 +152,83 @@ def _extract_twid(url: str) -> str | None:
 
 
 def get_twitter_full(url: str) -> dict:
-    """Get COMPLETE tweet data via syndication: text, photos, video, quote, thread info.
+    """Get COMPLETE tweet data: text, photos, video, quote, thread info.
+    Primary source: fxtwitter (works without login, full media).
+    Fallback: syndication (older tweets), then yt-dlp.
     Returns dict with 'type': 'video'|'photos'|'text'|'quote'|'error'."""
     twid = _extract_twid(url)
     if not twid:
         # fallback to yt-dlp info
         return get_twitter_info(url)
-    d = _syndication(twid)
-    if not d or not d.get("text"):
-        # fallback to yt-dlp (may still work for videos)
-        return get_twitter_info(url)
 
+    # ── PRIMARY: fxtwitter (full text + full media in new structure) ──
+    fx = _fxtwitter(twid)
+    if fx:
+        return _build_from_fxtwitter(fx, url, twid)
+
+    # ── FALLBACK: syndication (older tweets missing from fxtwitter) ──
+    d = _syndication(twid)
+    if d and d.get("text"):
+        return _build_from_syndication(d, url, twid)
+
+    # ── LAST RESORT: yt-dlp
+    return get_twitter_info(url)
+
+
+def _build_from_fxtwitter(fx: dict, url: str, twid: str) -> dict:
+    """Build result from the NEW fxtwitter API shape."""
+    media = fx.get("media") or {}
+    all_media = media.get("all") or []
+    photos = [m["url"] for m in all_media if m.get("type") == "photo" and m.get("url")]
+    video_urls = [m["url"] for m in all_media if m.get("type") == "video" and m.get("url")]
+    if not video_urls:
+        # videos[] also carries direct urls
+        video_urls = [v.get("url") for v in (media.get("videos") or []) if v.get("url")]
+
+    quoted = None
+    q = fx.get("quote")
+    if q:
+        qau = q.get("author") or {}
+        quoted = {
+            "text": q.get("text", ""),
+            "user_name": qau.get("name", ""),
+            "user_screen": qau.get("screen_name", ""),
+        }
+
+    au = fx.get("author") or {}
+    result = {
+        "twid": twid,
+        "text": fx.get("text", ""),
+        "user_name": au.get("name", ""),
+        "user_screen": au.get("screen_name", ""),
+        "created_at": fx.get("created_at", ""),
+        "favorite_count": fx.get("likes"),
+        "reply_count": fx.get("replies"),
+        "retweet_count": fx.get("retweets"),
+        "lang": fx.get("lang"),
+        "webpage_url": url,
+        "photos": photos,
+        "video_urls": video_urls,
+        "quoted": quoted,
+        "in_reply_to": str(fx.get("replying_to") or "") if fx.get("replying_to") else None,
+        "conversation_id": None,
+        "is_tw": True,
+    }
+
+    # Classify: quote > video > photos > text
+    if quoted:
+        result["type"] = "quote"
+    elif video_urls:
+        result["type"] = "video"
+    elif photos:
+        result["type"] = "photos"
+    else:
+        result["type"] = "text"
+    return result
+
+
+def _build_from_syndication(d: dict, url: str, twid: str) -> dict:
+    """Build result from the OLD syndication shape (fallback path)."""
     result = {
         "twid": twid,
         "text": d.get("text", ""),
@@ -182,38 +248,12 @@ def get_twitter_full(url: str) -> dict:
         "is_tw": True,
     }
 
-    # FULL TEXT: syndication truncates long tweets — try fxtwitter for the complete text
-    fx = _fxtwitter(twid)
-    if fx and fx.get("text"):
-        fx_text = fx["text"]
-        if len(fx_text) > len(result["text"]):
-            result["text"] = fx_text
-            result["favorite_count"] = fx.get("likes") or result.get("favorite_count")
-            result["retweet_count"] = fx.get("retweets") or result.get("retweet_count")
-            # fxtwitter may also carry media/quote info
-            fx_media = fx.get("media") or {}
-            if fx_media.get("all") and not result["photos"]:
-                for m in fx_media["all"]:
-                    if m.get("type") == "photo" and m.get("url"):
-                        result["photos"].append(m["url"])
-            if fx.get("quote") and not result["quoted"]:
-                q = fx["quote"]
-                result["quoted"] = {
-                    "text": q.get("text", ""),
-                    "user_name": q.get("author", {}).get("name", ""),
-                    "user_screen": q.get("author", {}).get("screen_name", ""),
-                }
-            if not result["user_name"] or not result["user_screen"]:
-                au = fx.get("author") or {}
-                result["user_name"] = au.get("name") or result["user_name"]
-                result["user_screen"] = au.get("screen_name") or result["user_screen"]
-
     # Photos
     for m in d.get("mediaDetails", []) or []:
         if m.get("type") == "photo" and m.get("media_url_https"):
             result["photos"].append(m["media_url_https"])
 
-    # Video (prefer best mp4) — syndication uses {type, src} variants
+    # Video (prefer best mp4)
     vid = d.get("video") or {}
     variants = vid.get("variants") or []
     mp4s = [v for v in variants
@@ -222,7 +262,6 @@ def get_twitter_full(url: str) -> dict:
         result["video_urls"] = [v["src"] for v in mp4s]
         result["poster"] = vid.get("poster")
     else:
-        # try mediaDetails video_info (yt-dlp style)
         for m in d.get("mediaDetails") or []:
             vi = m.get("video_info") or {}
             for v in vi.get("variants") or []:
@@ -240,7 +279,6 @@ def get_twitter_full(url: str) -> dict:
             "user_screen": qt.get("user", {}).get("screen_name", ""),
         }
 
-    # Classify
     if result["video_urls"]:
         result["type"] = "video"
     elif result["photos"]:
@@ -281,8 +319,22 @@ def get_twitter_info(url: str) -> dict:
         return {"error": str(e)}
 
 
-def download_twitter(url: str, quality: str, out_path: str) -> bool:
-    """Download a Twitter video with yt-dlp (force syndication API — robust vs rate limits)."""
+def download_twitter(url: str, quality: str, out_path: str, direct_url: str = None) -> bool:
+    """Download a Twitter video.
+    Preferred: direct video.twimg.com URL from fxtwitter (fast, no API).
+    Fallback: yt-dlp (may still work for some tweets)."""
+    # Fast path: direct mp4 from fxtwitter metadata
+    if direct_url:
+        try:
+            r = subprocess.run(
+                ["curl", "-s", "-L", "--max-time", "300", "-A",
+                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "-o", out_path, direct_url],
+                capture_output=True, text=True, timeout=320)
+            if os_path_exists(out_path) and os_path_size(out_path) > 0:
+                return True
+        except Exception as e:
+            log.warning("tw direct download failed, falling back to yt-dlp: %s", e)
+
     fmt = f"bv[height<={quality}]+ba/b[height<={quality}]"
     if quality in ("audio", "best"):
         fmt = "best"

@@ -472,7 +472,17 @@ def download_video(url: str, quality: str, is_audio: bool, out_path: str) -> boo
             return False
 
     if is_twitter(url):
-        return igtw.download_twitter(url, quality, out_path)
+        # Try direct mp4 via fxtwitter metadata first (syndication API is dead)
+        direct = None
+        try:
+            import ig_tw as _tw
+            tw = _tw.get_twitter_full(url)
+            vids = tw.get("video_urls") or []
+            if vids:
+                direct = vids[0]
+        except Exception:
+            pass
+        return igtw.download_twitter(url, quality, out_path, direct_url=direct)
 
     proxy = get_proxy_args(url)
 
