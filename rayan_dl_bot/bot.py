@@ -26,6 +26,7 @@ import db
 import downloader as dl
 import ig_tw as igtw
 import recognizer as recog
+import plugin_manager as pm
 
 # ── Config ────────────────────────────────────────────────────
 def _load_token() -> str:
@@ -494,8 +495,9 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
          InlineKeyboardButton("🔄 بازنشانی متن", callback_data="adm|resetmsg")],
         [InlineKeyboardButton("📊 آمار فنی", callback_data="adm|techstats"),
          InlineKeyboardButton("🪵 لاگ خطاها", callback_data="adm|logs")],
-        [InlineKeyboardButton("⚙️ تنظیمات ربات", callback_data="adm|botsettings"),
-         InlineKeyboardButton(i18n.t(lang, "broadcast_btn") + " پیام گروهی", callback_data="adm|broadcast")],
+        [InlineKeyboardButton("🔌 پلاگین‌ها", callback_data="adm|plugins"),
+         InlineKeyboardButton("⚙️ تنظیمات ربات", callback_data="adm|botsettings")],
+        [InlineKeyboardButton(i18n.t(lang, "broadcast_btn") + " پیام گروهی", callback_data="adm|broadcast")],
         [InlineKeyboardButton(i18n.t(lang, "ban_btn") + " مسدود", callback_data="adm|ban")],
         [InlineKeyboardButton(i18n.t(lang, "unban_btn") + " رفع مسدودی", callback_data="adm|unban"),
          InlineKeyboardButton("➕ کانال", callback_data="adm|addchan")],
@@ -526,8 +528,9 @@ async def _admin_menu_edit(q, lang: str):
          InlineKeyboardButton("🔄 بازنشانی متن", callback_data="adm|resetmsg")],
         [InlineKeyboardButton("📊 آمار فنی", callback_data="adm|techstats"),
          InlineKeyboardButton("🪵 لاگ خطاها", callback_data="adm|logs")],
-        [InlineKeyboardButton("⚙️ تنظیمات ربات", callback_data="adm|botsettings"),
-         InlineKeyboardButton(i18n.t(lang, "broadcast_btn") + " پیام گروهی", callback_data="adm|broadcast")],
+        [InlineKeyboardButton("🔌 پلاگین‌ها", callback_data="adm|plugins"),
+         InlineKeyboardButton("⚙️ تنظیمات ربات", callback_data="adm|botsettings")],
+        [InlineKeyboardButton(i18n.t(lang, "broadcast_btn") + " پیام گروهی", callback_data="adm|broadcast")],
         [InlineKeyboardButton(i18n.t(lang, "ban_btn") + " مسدود", callback_data="adm|ban")],
         [InlineKeyboardButton(i18n.t(lang, "unban_btn") + " رفع مسدودی", callback_data="adm|unban"),
          InlineKeyboardButton("➕ کانال", callback_data="adm|addchan")],
@@ -845,6 +848,110 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data["adm_state"] = "setdl"
         await q.message.edit_text("🔢 عدد ۱ تا ۶ رو بفرست (حداکثر دانلود همزمان):",
                                   reply_markup=admin_back_keyboard(lang))
+    elif action == "plugins":
+        plugins = pm.discover_plugins()
+        if not plugins:
+            text = "🔌 **پلاگین‌ها**\n\n📭 هیچ پلاگینی نصب نیست.\n\n"
+            text += "برای نصب، دکمه «➕ نصب پلاگین» رو بزن و لینک پلاگین (zip یا raw GitHub) رو بفرست."
+            kb = [[InlineKeyboardButton("➕ نصب پلاگین", callback_data="adm|plugin_install")],
+                  [InlineKeyboardButton(i18n.t(lang, "back"), callback_data="adm|menu"),
+                   InlineKeyboardButton(i18n.t(lang, "close"), callback_data="adm|close")]]
+            await q.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+            return
+        lines = ["🔌 **پلاگین‌ها:**\n"]
+        kb = []
+        for p in plugins:
+            status = "🟢" if p.get("enabled") else "🔴"
+            lines.append(f"{status} **{p['name']}** v{p.get('version')}")
+            lines.append(f"   {p.get('description','')[:60]}")
+            kb.append([InlineKeyboardButton(f"🔧 {p['name']} — تنظیمات", callback_data=f"adm|plugin_info|{p['name']}")])
+        kb.append([InlineKeyboardButton("➕ نصب پلاگین", callback_data="adm|plugin_install")])
+        kb.append([InlineKeyboardButton(i18n.t(lang, "back"), callback_data="adm|menu"),
+                   InlineKeyboardButton(i18n.t(lang, "close"), callback_data="adm|close")])
+        await q.message.edit_text("\n".join(lines), parse_mode="Markdown",
+                                  reply_markup=InlineKeyboardMarkup(kb))
+    elif action == "plugin_install":
+        context.user_data["adm_state"] = "plugin_install"
+        await q.message.edit_text(
+            "➕ **نصب پلاگین**\n\n"
+            "لینک پلاگین رو بفرست. فرمت‌های پشتیبانی‌شده:\n"
+            "• فایل **zip** شامل plugin.json + کد\n"
+            "• لینک **raw** از GitHub به plugin.json\n\n"
+            "مثال: `https://raw.githubusercontent.com/user/repo/main/plugin.json`\n\n"
+            "لینک رو بفرست:",
+            parse_mode="Markdown", reply_markup=admin_back_keyboard(lang))
+    elif action == "plugin_info":
+        # parts: adm|plugin_info|<name>
+        if len(parts) >= 3:
+            pname = parts[2]
+            meta = pm.get_plugin(pname)
+            if not meta:
+                await q.message.edit_text("❌ پلاگین پیدا نشد.", reply_markup=admin_back_keyboard(lang))
+                return
+            state = "🟢 فعال" if meta.get("enabled") else "🔴 غیرفعال"
+            cfg = meta.get("config", {})
+            cfg_lines = "\n".join(f"   {k}: {v}" for k, v in cfg.items()) or "   (بدون تنظیمات)"
+            lines = [f"🔌 **{pname}** v{meta.get('version')}",
+                     f"📝 {meta.get('description','')}",
+                     f"🟢 وضعیت: {state}",
+                     f"🌐 سایت‌ها: {', '.join(meta.get('sites', []))}",
+                     f"\n⚙️ تنظیمات:\n{cfg_lines}\n"]
+            kb = []
+            kb.append([InlineKeyboardButton("🔄 فعال/غیرفعال", callback_data=f"adm|plugin_toggle|{pname}")])
+            kb.append([InlineKeyboardButton("✏️ تنظیم مقدار", callback_data=f"adm|plugin_set|{pname}")])
+            kb.append([InlineKeyboardButton("🗑 حذف پلاگین", callback_data=f"adm|plugin_del|{pname}")])
+            kb.append([InlineKeyboardButton(i18n.t(lang, "back"), callback_data="adm|plugins"),
+                       InlineKeyboardButton(i18n.t(lang, "close"), callback_data="adm|close")])
+            await q.message.edit_text("\n".join(lines), parse_mode="Markdown",
+                                      reply_markup=InlineKeyboardMarkup(kb))
+    elif action == "plugin_toggle":
+        if len(parts) >= 3:
+            pname = parts[2]
+            meta = pm.get_plugin(pname)
+            if meta:
+                new_state = not meta.get("enabled")
+                if pm.toggle_plugin(pname, new_state):
+                    await q.message.edit_text(f"✅ پلاگین `{pname}` → {'فعال' if new_state else 'غیرفعال'} شد.",
+                                              parse_mode="Markdown", reply_markup=admin_back_keyboard(lang))
+                else:
+                    await q.message.edit_text("❌ خطا در تغییر وضعیت.", reply_markup=admin_back_keyboard(lang))
+    elif action == "plugin_del":
+        if len(parts) >= 3:
+            pname = parts[2]
+            if pm.remove_plugin(pname):
+                await q.message.edit_text(f"🗑 پلاگین `{pname}` حذف شد.", parse_mode="Markdown",
+                                          reply_markup=admin_back_keyboard(lang))
+            else:
+                await q.message.edit_text("❌ حذف ناموفق.", reply_markup=admin_back_keyboard(lang))
+    elif action == "plugin_set":
+        if len(parts) >= 3:
+            pname = parts[2]
+            meta = pm.get_plugin(pname)
+            if not meta:
+                await q.message.edit_text("❌ پلاگین پیدا نشد.", reply_markup=admin_back_keyboard(lang))
+                return
+            cfg = meta.get("config", {})
+            if not cfg:
+                await q.message.edit_text("❌ این پلاگین تنظیماتی نداره.", reply_markup=admin_back_keyboard(lang))
+                return
+            context.user_data["adm_state"] = "plugin_set"
+            context.user_data["plugin_set_name"] = pname
+            key_btns = []
+            for k in cfg.keys():
+                key_btns.append([InlineKeyboardButton(f"🔧 {k}", callback_data=f"adm|plugin_setkey|{pname}|{k}")])
+            key_btns.append([InlineKeyboardButton(i18n.t(lang, "back"), callback_data=f"adm|plugin_info|{pname}")])
+            await q.message.edit_text(
+                f"✏️ **تنظیمات {pname}**\n\nکدوم کلید رو تغییر بدی؟\n(مقدار فعلی توی منوی قبل هست)",
+                parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(key_btns))
+    elif action == "plugin_setkey":
+        # parts: adm|plugin_setkey|<name>|<key>
+        if len(parts) >= 4:
+            pname, key = parts[2], parts[3]
+            context.user_data["adm_state"] = "plugin_setkey"
+            context.user_data["plugin_set_name"] = pname
+            context.user_data["plugin_set_key"] = key
+            await q.message.edit_text(f"🔧 مقدار جدید برای `{key}` رو بفرست کدوم پلاگین {pname}:",
+                                      parse_mode="Markdown", reply_markup=admin_back_keyboard(lang))
     elif action == "userlinks":
         # Show all users, ask for an ID to export their links
         rows = db.get_top_users(50)
@@ -1047,6 +1154,44 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         else:
             await update.message.reply_text("❌ فقط ۱ تا ۶ مجازه.")
 
+    elif state == "plugin_install":
+        context.user_data.pop("adm_state", None)
+        text = (update.message.text or "").strip().strip("@")
+        if not (text.startswith("http://") or text.startswith("https://")):
+            await update.message.reply_text("❌ لینک معتبر بفرست (با http/https شروع بشه).")
+            return
+        status = await update.message.reply_text("📦 در حال نصب پلاگین...")
+        result = await asyncio.to_thread(pm.install_plugin_from_url, text)
+        if result.get("ok"):
+            await status.edit_text(f"✅ {result['message']}")
+        else:
+            await status.edit_text(f"❌ نصب ناموفق: {result.get('message')}")
+
+    elif state == "plugin_setkey":
+        context.user_data.pop("adm_state", None)
+        pname = context.user_data.pop("plugin_set_name", "")
+        key = context.user_data.pop("plugin_set_key", "")
+        val = (update.message.text or "").strip()
+        if not pname or not key:
+            await update.message.reply_text("❌ اطلاعات پلاگین از دست رفته. دوباره تلاش کن.")
+            return
+        # try convert to number/bool where sensible
+        if val.lower() in ("true", "false"):
+            val = val.lower() == "true"
+        else:
+            try:
+                val = int(val)
+            except ValueError:
+                try:
+                    val = float(val)
+                except ValueError:
+                    pass
+        if pm.set_plugin_config(pname, key, val):
+            await update.message.reply_text(f"✅ تنظیم `{key}` پلاگین `{pname}` = `{val}` شد.",
+                                            parse_mode="Markdown")
+        else:
+            await update.message.reply_text("❌ خطا در ذخیره تنظیمات.")
+
     elif state == "userlinks":
         context.user_data.pop("adm_state", None)
         try:
@@ -1074,6 +1219,64 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_document(document=f, filename=f"links_{uid}.txt",
                                                 caption=f"📄 لینک‌های {name}")
         os.remove(fpath)
+
+
+# ── Plugin result sender ──────────────────────────────────────
+async def _send_plugin_result(update: Update, context, result: dict, lang: str,
+                              status_msg=None) -> None:
+    """Send a plugin's result: PDF / video / photos / text."""
+    chat_id = update.effective_chat.id
+    typ = result.get("type")
+    caption = result.get("text") or result.get("title") or ""
+    try:
+        if status_msg:
+            await status_msg.edit_text(i18n.t(lang, "sending"))
+        else:
+            status_msg = await update.message.reply_text(i18n.t(lang, "sending"))
+    except Exception:
+        pass
+    try:
+        if typ == "pdf" or typ == "document":
+            path = result.get("path")
+            if path and os.path.exists(path):
+                await context.bot.send_document(chat_id=chat_id, document=open(path, "rb"),
+                                                caption=caption, filename=os.path.basename(path))
+                db.record_download(update.effective_user.id, result.get("source_url", ""),
+                                   "plugin", typ, True)
+                dl.cleanup(path)
+            else:
+                await status_msg.edit_text(i18n.t(lang, "download_failed"))
+        elif typ == "video":
+            path = result.get("path")
+            if path and os.path.exists(path):
+                await context.bot.send_video(chat_id=chat_id, video=open(path, "rb"),
+                                             caption=caption, supports_streaming=True)
+                dl.cleanup(path)
+            else:
+                await status_msg.edit_text(i18n.t(lang, "download_failed"))
+        elif typ == "photos":
+            photos = result.get("photos") or []
+            if photos:
+                media = [open(p, "rb") for p in photos]
+                await context.bot.send_media_group(chat_id=chat_id, media=media)
+                for p in photos:
+                    dl.cleanup(p)
+            else:
+                await status_msg.edit_text(i18n.t(lang, "download_failed"))
+        elif typ == "text":
+            await update.message.reply_text(result.get("text", ""), disable_web_page_preview=True)
+        else:
+            await status_msg.edit_text(i18n.t(lang, "download_failed"))
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+    except Exception as e:
+        log.warning("plugin result send: %s", e)
+        try:
+            await status_msg.edit_text(i18n.t(lang, "processing_error").format(err=str(e)[:150]))
+        except Exception:
+            pass
 
 
 # ── Shazam-like song recognition ─────────────────────────────
@@ -1625,6 +1828,27 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     site = dl.detect_site(url)
+
+    # ── PLUGIN ROUTING: a plugin may handle sites the core doesn't support ──
+    plugin_meta = pm.find_plugin_for_url(url)
+    if plugin_meta and site in ("other", "twitter", "instagram", "youtube"):
+        db.record_link(update, url, f"plugin:{plugin_meta['name']}")
+        status_msg = await update.message.reply_text(i18n.t(lang, "checking"))
+        try:
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_document")
+        except Exception:
+            pass
+        result = await asyncio.to_thread(
+            pm.call_plugin, plugin_meta, url,
+            {"workdir": DOWNLOAD_DIR, "lang": lang})
+        if result.get("error"):
+            await status_msg.edit_text(i18n.t(lang, "processing_error").format(err=result["error"][:200]),
+                                       parse_mode="Markdown")
+            return
+        await _send_plugin_result(update, context, result, lang, status_msg)
+        await asyncio.to_thread(enforce_disk_limit)
+        return
+
     db.record_link(update, url, site)
 
     status_msg = await update.message.reply_text(i18n.t(lang, "checking"))

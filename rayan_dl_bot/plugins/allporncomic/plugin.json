@@ -1,0 +1,15 @@
+{
+  "name": "allporncomic",
+  "version": "1.0.0",
+  "description": "Download any comic from allporncomic.com as PDF (extracts all pages from a chapter/comic page)",
+  "sites": [
+    "allporncomic.com",
+    "allporncomics.com"
+  ],
+  "entry": "plugin",
+  "enabled": true,
+  "config": {
+    "max_pages": 300,
+    "timeout": 60
+  }
+}
