@@ -874,11 +874,13 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data["adm_state"] = "plugin_install"
         await q.message.edit_text(
             "➕ **نصب پلاگین**\n\n"
-            "لینک پلاگین رو بفرست. فرمت‌های پشتیبانی‌شده:\n"
-            "• فایل **zip** شامل plugin.json + کد\n"
+            "دو راه داری:\n"
+            "📦 **فایل zip بفرست** (شامل plugin.json + کد) — همین‌جا آپلودش کن\n"
+            "🔗 **یا لینک بفرست**:\n"
+            "• لینک مستقیم به فایل **zip**\n"
             "• لینک **raw** از GitHub به plugin.json\n\n"
-            "مثال: `https://raw.githubusercontent.com/user/repo/main/plugin.json`\n\n"
-            "لینک رو بفرست:",
+            "مثال لینک: `https://raw.githubusercontent.com/user/repo/main/plugin.json`\n\n"
+            "فایل یا لینک رو بفرست:",
             parse_mode="Markdown", reply_markup=admin_back_keyboard(lang))
     elif action == "plugin_info":
         # parts: adm|plugin_info|<name>
@@ -993,6 +995,40 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                                   reply_markup=admin_back_keyboard(lang))
     elif action == "close":
         await q.message.delete()
+
+
+async def plugin_file_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle an uploaded plugin zip file when the admin is in 'plugin_install' state."""
+    if not is_admin(update.effective_user.id):
+        return
+    state = context.user_data.get("adm_state")
+    if state != "plugin_install":
+        return
+    context.user_data.pop("adm_state", None)
+    doc = update.message.document
+    fname = (doc.file_name or "").lower()
+    if not (fname.endswith(".zip")):
+        await update.message.reply_text(
+            "❌ فقط فایل **ZIP** قبول می‌شه (شامل plugin.json + کد پلاگین).\n\n"
+            "یا می‌تونی لینک مستقیم zip یا raw GitHub بدی.")
+        return
+    status = await update.message.reply_text("📦 در حال نصب پلاگین از فایل...")
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        zip_path = os.path.join(DOWNLOAD_DIR, f"plug_{int(time.time())}_{doc.file_name}")
+        await tg_file.download_to_drive(zip_path)
+        result = await asyncio.to_thread(pm.install_plugin_from_file, zip_path)
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+    except Exception as e:
+        log.error("plugin file download: %s", e)
+        result = {"ok": False, "message": f"دانلود فایل ناموفق: {e}"}
+    if result.get("ok"):
+        await status.edit_text(f"✅ {result['message']}")
+    else:
+        await status.edit_text(f"❌ نصب ناموفق: {result.get('message')}")
 
 
 async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2544,6 +2580,8 @@ def main():
         filters.AUDIO | filters.VIDEO | filters.VOICE | filters.VIDEO_NOTE
         | (filters.Document.AUDIO | filters.Document.VIDEO),
         handle_media_file))
+    # Plugin zip upload while in install state (must be BEFORE generic file handlers)
+    app.add_handler(MessageHandler(filters.Document.ALL, plugin_file_cb))
 
     app.add_handler(CallbackQueryHandler(admin_cb, pattern="^adm"))
     app.add_handler(CallbackQueryHandler(set_lang_cb, pattern="^setlang"))

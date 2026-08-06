@@ -184,6 +184,39 @@ def _validate_meta(meta) -> str | None:
     return None
 
 
+def install_plugin_from_file(zip_path: str) -> dict:
+    """Install a plugin from a LOCAL .zip file (uploaded via the admin panel).
+    Returns {ok, message, name?}."""
+    try:
+        if not zipfile.is_zipfile(zip_path):
+            return {"ok": False, "message": "فایل دریافتی یک ZIP معتبر نیست"}
+        tmp = tempfile.mkdtemp(prefix="plugin_install_")
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                names = zf.namelist()
+                manifest_name = next((n for n in names if n.endswith(MANIFEST)), None)
+                if not manifest_name:
+                    return {"ok": False, "message": "zip شامل plugin.json نیست"}
+                zf.extractall(tmp)
+            root = os.path.dirname(os.path.join(tmp, manifest_name))
+            with open(os.path.join(tmp, manifest_name), encoding="utf-8") as f:
+                meta = json.load(f)
+            err = _validate_meta(meta)
+            if err:
+                return {"ok": False, "message": err}
+            name = meta["name"]
+            dest = os.path.join(PLUGINS_DIR, name)
+            if os.path.exists(dest):
+                shutil.rmtree(dest)
+            shutil.copytree(root, dest)
+            return {"ok": True, "name": name, "message": f"پلاگین '{name}' نصب شد"}
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    except Exception as e:
+        log.error("install plugin from file error: %s", e)
+        return {"ok": False, "message": f"install error: {e}"}
+
+
 def install_plugin_from_url(url: str) -> dict:
     """Download a plugin (zip or raw plugin.json+entry from GitHub raw) and install.
     Returns {ok, message, name?}."""
