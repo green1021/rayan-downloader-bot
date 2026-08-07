@@ -444,32 +444,26 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "other": i18n.t(lang, "site_other"),
     }
     for site, url, created in rows:
-        # Show the FULL link as a clickable Markdown link — no truncation.
-        # Only escape chars that actually break Markdown links: parens.
-        # (Telegram does NOT want \-style escapes inside link URLs.)
-        esc = url.replace("\\", "/").replace(")", "%29").replace("(", "%28")
-        esc = esc.replace("]", "%5D")
-        link = f"[{url}]({esc})"
+        # PLAIN RAW URL — no Markdown, no truncation, no escaping.
+        # Telegram auto-links raw URLs; the full text is always shown.
         lines.append(i18n.t(lang, "history_item").format(
-            site=site_names.get(site, site), url=link, time=created[:16]))
+            site=site_names.get(site, site), url=url, time=created[:16]))
     text = "\n".join(lines)
     # Telegram limit ~4096 chars: if over, show fewer items with a note
     if len(text) > 4000:
         lines = lines[:1]
         shown = 0
         for line in rows:
-            esc = line[1].replace("\\", "/").replace(")", "%29").replace("(", "%28").replace("]", "%5D")
-            link = f"[{line[1]}]({esc})"
             item = i18n.t(lang, "history_item").format(
-                site=site_names.get(line[0], line[0]), url=link, time=(line[2] or "")[:16])
+                site=site_names.get(line[0], line[0]), url=line[1], time=(line[2] or "")[:16])
             if len("\n".join(lines + [item])) > 3900:
                 break
             lines.append(item)
             shown += 1
         lines.append(f"\n… و {len(rows) - shown} مورد دیگر")
         text = "\n".join(lines)
-    await update.message.reply_text(text, parse_mode="Markdown",
-                                    disable_web_page_preview=True)
+    # NO parse_mode: raw text keeps URLs fully visible (Markdown can squint long links)
+    await update.message.reply_text(text, disable_web_page_preview=True)
 
 
 # ── Admin panel ───────────────────────────────────────────────
