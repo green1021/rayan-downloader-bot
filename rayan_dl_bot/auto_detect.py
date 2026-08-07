@@ -119,7 +119,8 @@ def _dl_valid(imgs, outdir, prefix="{:04d}.jpg") -> list:
 
 
 def detect(url: str) -> dict:
-    """Analyze a page and return {type, count, samples[], confidence}."""
+    """Analyze a page and return {type, count, samples[], confidence}.
+    Backward-compatible: files still call this; bot.py prefers smart_detect()."""
     try:
         html = fetch_page(url)
     except Exception as e:
@@ -255,3 +256,63 @@ def auto_download(url: str, dtype: str, workdir: str, samples=None) -> dict:
     except Exception as e:
         log.error("auto_download: %s", e)
         return {"error": f"خطا: {e}"}
+
+
+# ── Smart detection (two-stage) ───────────────────────────────
+# Stage 1: yt-dlp probe — it knows 1000+ sites (vimeo, dailymotion, twitch clips,
+#          soundcloud, reddit-hosted, etc.). If it can extract the page, we get
+#          proper quality/formats and can download like a first-class site.
+# Stage 2: heuristic HTML scan (old detect()) for comic/photos/text.
+def smart_detect(url: str, probe_timeout: int = 18) -> dict:
+    """Two-stage detection for unknown sites.
+    Returns the SAME shape as detect() plus, for stage-1 hits, a 'ytdlp' key with
+    {title, uploader, qualities[], sizes{}, duration, webpage_url, extractor}."""
+    import json as _json
+    import subprocess as _sp
+    try:
+        r = _sp.run(
+            ["/root/hermes-workspace/venv/bin/yt-dlp", "-J", "--no-warnings",
+             "--skip-download", "--no-check-certificates", "--socket-timeout", "8",
+             url],
+            capture_output=True, text=True, timeout=probe_timeout)
+    except Exception as e:
+        log.info("ytdlp probe failed: %s", e)
+        return detect(url)
+    if r.returncode != 0 or not r.stdout.strip():
+        return detect(url)
+    try:
+        d = _json.loads(r.stdout)
+    except Exception:
+        return detect(url)
+    # Playlists handled by core; only single videos here.
+    if not d or d.get("_type") == "playlist" or d.get("entries"):
+        return detect(url)
+    formats = d.get("formats") or []
+    heights = sorted({f.get("height") for f in formats if f.get("height")}, reverse=True)
+    heights = [h for h in heights if 144 <= h <= 2160]
+    if not heights:
+        return detect(url)
+    sizes = {}
+    for h in heights:
+        for f in formats:
+            if f.get("height") == h and f.get("filesize"):
+                sizes[str(h)] = f.get("filesize")
+                break
+    return {
+        "type": "video",
+        "source": "ytdlp",
+        "count": len(heights),
+        "samples": [],
+        "confidence": 90,
+        "detail": f"ویدیو از {d.get('extractor_key', 'سایت')} ({len(heights)} کیفیت)",
+        "ytdlp": {
+            "title": (d.get("title") or "ویدیو")[:150],
+            "uploader": (d.get("uploader") or d.get("channel") or "")[:100],
+            "duration": d.get("duration"),
+            "webpage_url": d.get("webpage_url") or url,
+            "extractor": d.get("extractor", ""),
+            "heights": heights,
+            "sizes": sizes,
+            "thumbnail": d.get("thumbnail"),
+        },
+    }

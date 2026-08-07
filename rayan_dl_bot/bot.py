@@ -2324,14 +2324,42 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     db.record_link(update, url, site)
 
-    # ── AUTO-DETECT: unknown site with no plugin — heuristically guess media type ──
+    # ── AUTO-DETECT: unknown site — two-stage smart detection ──
+    auto_info_built = False
     if site == "other":
         status_msg = await update.message.reply_text(i18n.t(lang, "auto_checking"))
         try:
-            detection = await asyncio.to_thread(adetect.detect, url)
+            detection = await asyncio.to_thread(adetect.smart_detect, url)
         except Exception:
             detection = {"type": "error", "error": "analysis failed"}
-        if detection.get("type") in ("comic", "video", "photos", "text"):
+
+        # STAGE-1 HIT: yt-dlp knows this site (vimeo/dailymotion/soundcloud/...) —
+        # build a proper info dict and use the NORMAL download flow (quality menu,
+        # clean caption) instead of the raw auto path.
+        if detection.get("source") == "ytdlp" and detection.get("ytdlp"):
+            yd = detection["ytdlp"]
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            info = {
+                "title": yd.get("title") or "ویدیو",
+                "uploader": yd.get("uploader") or "",
+                "duration": yd.get("duration"),
+                "view_count": None,
+                "like_count": None,
+                "description": "",
+                "webpage_url": yd.get("webpage_url") or url,
+                "qualities": {str(h): None for h in yd.get("heights", [])},
+                "sizes": yd.get("sizes", {}),
+                "extractor": yd.get("extractor", ""),
+            }
+            # Record as auto-downloaded link, then continue to the normal flow below
+            # (quality menu in private / auto-best in groups).
+            db.record_download(update.effective_user.id, url, "other", "auto", True)
+            status_msg = await update.message.reply_text(i18n.t(lang, "checking"))
+            auto_info_built = True
+        elif detection.get("type") in ("comic", "video", "photos", "text"):
             try:
                 await status_msg.edit_text(i18n.t(lang, "auto_support").format(
                     detail=detection.get("detail", detection["type"])))
@@ -2387,7 +2415,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # status message here so all later code can use it.
         status_msg = await update.message.reply_text(i18n.t(lang, "checking"))
 
-    info = dl.get_video_info(url)
+    if not auto_info_built:
+        info = dl.get_video_info(url)
     if info.get("error"):
         err = info["error"][:200]
         # Instagram/Twitter often need login cookies — give a clear message
