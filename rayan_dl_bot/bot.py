@@ -2328,13 +2328,25 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             qtext=qtext)
         await status_msg.delete()
         await update.message.reply_text(msg_text, disable_web_page_preview=True)
-        for photo_url in tw_full.get("photos", [])[:4]:
+        # Send the MAIN tweet photos, then the QUOTED tweet photos (if any)
+        all_photo_urls = (tw_full.get("photos") or []) + (q.get("photos") or [])
+        sent_q = False
+        for photo_url in all_photo_urls[:8]:
             p_path = os.path.join(DOWNLOAD_DIR, f"twq_{uid}_{int(time.time())}.jpg")
             ok_p = await asyncio.to_thread(igtw.download_twitter_photo, photo_url, p_path)
             if ok_p:
                 await context.bot.send_photo(chat_id=uid, photo=open(p_path, "rb"))
+                sent_q = True
                 dl.cleanup(p_path)
-        db.record_download(uid, url, "twitter", "quote", True)
+        # If the quoted tweet has a video, download and send it too
+        for v_url in (q.get("video_urls") or [])[:1]:
+            v_path = os.path.join(DOWNLOAD_DIR, f"twqv_{uid}_{int(time.time())}.mp4")
+            ok_v = await asyncio.to_thread(igtw.download_twitter, url, "best", v_path, v_url)
+            if ok_v and os.path.exists(v_path) and os.path.getsize(v_path) > 0:
+                await context.bot.send_video(chat_id=uid, video=open(v_path, "rb"))
+                dl.cleanup(v_path)
+                sent_q = True
+        db.record_download(uid, url, "twitter", "quote", sent_q)
         await asyncio.to_thread(enforce_disk_limit)
         return
 

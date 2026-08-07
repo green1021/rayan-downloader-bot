@@ -208,10 +208,20 @@ def _build_from_fxtwitter(fx: dict, url: str, twid: str) -> dict:
     q = fx.get("quote")
     if q:
         qau = q.get("author") or {}
+        # The quoted tweet may itself have photos/videos — capture them so we can
+        # download and send them alongside the quote text.
+        qmedia = q.get("media") or {}
+        qall = qmedia.get("all") or []
+        q_photos = [m["url"] for m in qall if m.get("type") == "photo" and m.get("url")]
+        q_videos = [m["url"] for m in qall if m.get("type") == "video" and m.get("url")]
+        if not q_videos:
+            q_videos = [v.get("url") for v in (qmedia.get("videos") or []) if v.get("url")]
         quoted = {
             "text": q.get("text", ""),
             "user_name": qau.get("name", ""),
             "user_screen": qau.get("screen_name", ""),
+            "photos": q_photos,
+            "video_urls": q_videos,
         }
 
     au = fx.get("author") or {}
