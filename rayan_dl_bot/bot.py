@@ -1809,8 +1809,9 @@ async def group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         quality=s["max_quality"] if s["max_quality"] else "∞",
         auto=i18n.t(lang, "group_on") if s["auto_mode"] else i18n.t(lang, "group_off"),
         silent=i18n.t(lang, "group_on") if s["silent"] else i18n.t(lang, "group_off"),
-        media=MEDIA_MODES.get(s.get("media_mode", 2), MEDIA_MODES[2])) +
-        "\n\n🎛 برای انتخاب رسانه‌ها: /setmedia")
+        media=MEDIA_MODES.get(s.get("media_mode", 2), MEDIA_MODES[2]),
+        filter_=s.get("link_filter", "all") or "all") +
+        "\n\n🎛 برای انتخاب رسانه‌ها: /setmedia\n🔍 فیلتر لینک: /setfilter")
 
 
 async def setquality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1940,6 +1941,164 @@ async def setmedia_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         await q.message.edit_text(
             f"✅ حالت رسانه گروه به **{MEDIA_MODES.get(mode, mode)}** تغییر کرد.",
+            parse_mode="Markdown")
+    except Exception:
+        pass
+
+
+# ── Link filter (group): all / core-sites / custom media types ──
+CORE_SITES = ["youtube", "instagram", "twitter", "tiktok"]
+FILTER_TYPES = {
+    "video": "🎬 ویدیو",
+    "photo": "🖼 عکس",
+    "audio": "🎵 صدا",
+    "text": "📝 متن",
+}
+
+
+def _filter_to_media(f: str) -> set:
+    """Parse link_filter value -> set of allowed media types.
+    'all' -> all types; 'core' -> handled by site check, not media; 'custom:...' -> listed types."""
+    if not f or f == "all":
+        return set(FILTER_TYPES.keys())
+    if f.startswith("custom:"):
+        parts = f.split(":", 1)[1].split(",")
+        return {p for p in parts if p in FILTER_TYPES}
+    return set(FILTER_TYPES.keys())
+
+
+def _media_type_of_site(site: str) -> set:
+    """Approximate media types a known site can produce."""
+    m = {
+        "youtube": {"video", "audio"},
+        "instagram": {"video", "photo"},
+        "twitter": {"video", "photo", "text"},
+        "tiktok": {"video"},
+        "pornhub": {"video"},
+        "other": {"video", "photo", "audio", "text"},
+    }
+    return m.get(site, {"video", "photo", "audio", "text"})
+
+
+async def setfilter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Group admin picks a link filter: all links / core sites / custom media types."""
+    chat = update.effective_chat
+    if not chat or chat.type == "private":
+        await update.message.reply_text(i18n.t(lang_of(update), "only_groups"))
+        return
+    lang = lang_of(update)
+    if not await _is_group_admin(update, update.effective_user.id):
+        await update.message.reply_text(i18n.t(lang, "group_admin_only"))
+        return
+    s = db.get_chat_settings(chat.id)
+    cur = s.get("link_filter", "all")
+    kb = [
+        [InlineKeyboardButton(f"{'✅ ' if cur == 'all' else ''}🌐 همه لینک‌ها",
+                              callback_data="setfilter|all")],
+        [InlineKeyboardButton(f"{'✅ ' if cur == 'core' else ''}⭐ فقط سایت‌های کامل",
+                              callback_data="setfilter|core")],
+        [InlineKeyboardButton("🎛 سفارشی (نوع محتوا)", callback_data="setfilter|custom_menu")],
+        [InlineKeyboardButton(i18n.t(lang, "close"), callback_data="setfilter|close")],
+    ]
+    desc = ("🌐 همه لینک‌ها — هر لینکی (یوتیوب، اینستاگرام، سایت‌های ناشناخته، همه)\n"
+            "⭐ فقط سایت‌های کامل — فقط یوتیوب/اینستاگرام/توییتر/تیک‌تاک (پشتیبانی ۱۰۰٪)\n"
+            "🎛 سفارشی — انتخاب نوع: ویدیو/عکس/صدا/متن")
+    await update.message.reply_text(
+        f"🔍 **فیلتر لینک‌های گروه**\n\n{desc}\n\nوضعیت فعلی: **{cur}**",
+        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def setfilter_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    if not q.data or not q.data.startswith("setfilter|"):
+        return
+    val = q.data.split("|", 1)[1]
+    chat = q.message.chat
+    if chat.type == "private":
+        return
+    if val == "close":
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+        return
+    if val == "custom_menu":
+        s = db.get_chat_settings(chat.id)
+        cur = s.get("link_filter", "all")
+        allowed = _filter_to_media(cur)
+        kb = []
+        for t, label in FILTER_TYPES.items():
+            mark = "✅" if t in allowed else "⚪️"
+            kb.append([InlineKeyboardButton(f"{mark} {label}",
+                                            callback_data=f"setfilter|toggle:{t}")])
+        kb.append([InlineKeyboardButton(i18n.t(lang_of(update), "back"), callback_data="setfilter|menu"),
+                   InlineKeyboardButton(i18n.t(lang_of(update), "close"), callback_data="setfilter|close")])
+        try:
+            await q.message.edit_text(
+                f"🎛 **فیلتر سفارشی — نوع محتواها**\n\n"
+                f"انتخاب کن کدوم نوع محتوا گرفته بشه:\n"
+                f"{', '.join(f'{l}' for l in FILTER_TYPES.values())}",
+                parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+        except Exception:
+            pass
+        return
+    if val == "menu":
+        # re-show main filter menu
+        s = db.get_chat_settings(chat.id)
+        cur = s.get("link_filter", "all")
+        kb = [
+            [InlineKeyboardButton(f"{'✅ ' if cur == 'all' else ''}🌐 همه لینک‌ها",
+                                  callback_data="setfilter|all")],
+            [InlineKeyboardButton(f"{'✅ ' if cur == 'core' else ''}⭐ فقط سایت‌های کامل",
+                                  callback_data="setfilter|core")],
+            [InlineKeyboardButton("🎛 سفارشی (نوع محتوا)", callback_data="setfilter|custom_menu")],
+            [InlineKeyboardButton(i18n.t(lang_of(update), "close"), callback_data="setfilter|close")],
+        ]
+        try:
+            await q.message.edit_text(
+                f"🔍 **فیلتر لینک‌های گروه**\n\nوضعیت فعلی: **{cur}**",
+                parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+        except Exception:
+            pass
+        return
+    if val.startswith("toggle:"):
+        t = val.split(":", 1)[1]
+        s = db.get_chat_settings(chat.id)
+        cur = s.get("link_filter", "all")
+        allowed = _filter_to_media(cur)
+        if t in allowed:
+            allowed.discard(t)
+        else:
+            allowed.add(t)
+        if not allowed:
+            allowed = set(FILTER_TYPES.keys())  # never allow zero types
+        db.set_chat_settings(chat.id, link_filter="custom:" + ",".join(sorted(allowed)),
+                             set_by=q.from_user.id)
+        # re-render custom menu
+        kb = []
+        for typ, label in FILTER_TYPES.items():
+            mark = "✅" if typ in allowed else "⚪️"
+            kb.append([InlineKeyboardButton(f"{mark} {label}",
+                                            callback_data=f"setfilter|toggle:{typ}")])
+        kb.append([InlineKeyboardButton(i18n.t(lang_of(update), "back"), callback_data="setfilter|menu"),
+                   InlineKeyboardButton(i18n.t(lang_of(update), "close"), callback_data="setfilter|close")])
+        try:
+            await q.message.edit_text(
+                f"🎛 **فیلتر سفارشی — نوع محتواها**\n\n"
+                f"انتخاب کن کدوم نوع محتوا گرفته بشه:",
+                parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+        except Exception:
+            pass
+        return
+    # all / core
+    db.set_chat_settings(chat.id, link_filter=val, set_by=q.from_user.id)
+    try:
+        await q.message.edit_text(
+            f"✅ فیلتر لینک گروه به **{'همه لینک‌ها' if val == 'all' else 'فقط سایت‌های کامل'}** تغییر کرد.",
             parse_mode="Markdown")
     except Exception:
         pass
@@ -2291,6 +2450,21 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     site = dl.detect_site(url)
 
+    # ── GROUP LINK FILTER: if the group has a filter, just skip disallowed links ──
+    if is_group and site != "other":
+        try:
+            gs_f = db.get_chat_settings(chat.id)
+            lf = gs_f.get("link_filter", "all") or "all"
+            if lf == "core" and site not in CORE_SITES:
+                return
+            if lf.startswith("custom:"):
+                allowed_types = _filter_to_media(lf)
+                produced = _media_type_of_site(site)
+                if not (allowed_types & produced):
+                    return
+        except Exception:
+            pass
+
     # ── PLUGIN ROUTING: a plugin may handle sites the core doesn't support ──
     plugin_meta = pm.find_plugin_for_url(url)
     if plugin_meta and site in ("other", "twitter", "instagram", "youtube"):
@@ -2337,6 +2511,22 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # build a proper info dict and use the NORMAL download flow (quality menu,
         # clean caption) instead of the raw auto path.
         if detection.get("source") == "ytdlp" and detection.get("ytdlp"):
+            # Respect group custom filter: if the group only allows e.g. photos and
+            # this is a video, skip silently.
+            if is_group:
+                try:
+                    gs_f = db.get_chat_settings(chat.id)
+                    lf = gs_f.get("link_filter", "all") or "all"
+                    if lf.startswith("custom:"):
+                        allowed_types = _filter_to_media(lf)
+                        if "video" not in allowed_types:
+                            try:
+                                await status_msg.delete()
+                            except Exception:
+                                pass
+                            return
+                except Exception:
+                    pass
             yd = detection["ytdlp"]
             try:
                 await status_msg.delete()
@@ -2360,6 +2550,22 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             status_msg = await update.message.reply_text(i18n.t(lang, "checking"))
             auto_info_built = True
         elif detection.get("type") in ("comic", "video", "photos", "text"):
+            # Respect group custom filter for heuristic content types.
+            if is_group:
+                try:
+                    gs_f = db.get_chat_settings(chat.id)
+                    lf = gs_f.get("link_filter", "all") or "all"
+                    if lf.startswith("custom:"):
+                        allowed_types = _filter_to_media(lf)
+                        m_type = {"comic": "photo", "video": "video", "photos": "photo", "text": "text"}.get(detection["type"], "text")
+                        if m_type not in allowed_types:
+                            try:
+                                await status_msg.delete()
+                            except Exception:
+                                pass
+                            return
+                except Exception:
+                    pass
             try:
                 await status_msg.edit_text(i18n.t(lang, "auto_support").format(
                     detail=detection.get("detail", detection["type"])))
@@ -2959,6 +3165,7 @@ def main():
     app.add_handler(CommandHandler("groupsettings", group_settings))
     app.add_handler(CommandHandler("setquality", setquality))
     app.add_handler(CommandHandler("setmedia", setmedia))
+    app.add_handler(CommandHandler("setfilter", setfilter))
     app.add_handler(CommandHandler("autodl", autodl))
     app.add_handler(CommandHandler("silent", silent))
     app.add_handler(CommandHandler("commandonly", commandonly))
@@ -2986,6 +3193,7 @@ def main():
     app.add_handler(CallbackQueryHandler(force_join_check_cb, pattern="^fjcheck$"))
     app.add_handler(CallbackQueryHandler(search_cb, pattern="^srch"))
     app.add_handler(CallbackQueryHandler(setmedia_cb, pattern="^setmedia"))
+    app.add_handler(CallbackQueryHandler(setfilter_cb, pattern="^setfilter"))
     app.add_handler(CallbackQueryHandler(startmsg_translate_cb, pattern="^smt"))
     app.add_handler(CallbackQueryHandler(chapter_cb, pattern="^pl(dl|pg|noop|close)"))
     app.add_handler(CallbackQueryHandler(more_qualities, pattern="^more"))

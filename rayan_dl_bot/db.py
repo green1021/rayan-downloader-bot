@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS chat_settings (
     silent INTEGER DEFAULT 0,
     command_only INTEGER DEFAULT 0,
     media_mode INTEGER DEFAULT 2,
+    link_filter TEXT DEFAULT 'all',
     set_by INTEGER
 );
 CREATE TABLE IF NOT EXISTS user_settings (
@@ -125,6 +126,8 @@ def init_db():
             conn.execute("ALTER TABLE chat_settings ADD COLUMN command_only INTEGER DEFAULT 0")
         if "media_mode" not in cols:
             conn.execute("ALTER TABLE chat_settings ADD COLUMN media_mode INTEGER DEFAULT 2")
+        if "link_filter" not in cols:
+            conn.execute("ALTER TABLE chat_settings ADD COLUMN link_filter TEXT DEFAULT 'all'")
         fcols = {r[1] for r in conn.execute("PRAGMA table_info(force_channels)")}
         if "chat_id" not in fcols:
             conn.execute("ALTER TABLE force_channels ADD COLUMN chat_id INTEGER")
@@ -302,17 +305,17 @@ def get_chat_settings(chat_id: int):
     try:
         conn = _conn()
         cur = conn.cursor()
-        cur.execute("SELECT max_quality, auto_mode, silent, command_only, media_mode FROM chat_settings WHERE chat_id = ?", (chat_id,))
+        cur.execute("SELECT max_quality, auto_mode, silent, command_only, media_mode, link_filter FROM chat_settings WHERE chat_id = ?", (chat_id,))
         row = cur.fetchone()
         conn.close()
         if row:
-            return {"max_quality": row[0], "auto_mode": row[1], "silent": row[2], "command_only": row[3], "media_mode": row[4]}
+            return {"max_quality": row[0], "auto_mode": row[1], "silent": row[2], "command_only": row[3], "media_mode": row[4], "link_filter": row[5]}
     except Exception as e:
         log.error("get_chat_settings: %s", e)
-    return {"max_quality": 1080, "auto_mode": 1, "silent": 0, "command_only": 0, "media_mode": 2}
+    return {"max_quality": 1080, "auto_mode": 1, "silent": 0, "command_only": 0, "media_mode": 2, "link_filter": "all"}
 
 
-def set_chat_settings(chat_id: int, max_quality=None, auto_mode=None, silent=None, command_only=None, media_mode=None, set_by=0):
+def set_chat_settings(chat_id: int, max_quality=None, auto_mode=None, silent=None, command_only=None, media_mode=None, link_filter=None, set_by=0):
     try:
         conn = _conn()
         cur = conn.cursor()
@@ -330,19 +333,22 @@ def set_chat_settings(chat_id: int, max_quality=None, auto_mode=None, silent=Non
                 sets.append("command_only=?"); vals.append(command_only)
             if media_mode is not None:
                 sets.append("media_mode=?"); vals.append(media_mode)
+            if link_filter is not None:
+                sets.append("link_filter=?"); vals.append(link_filter)
             sets.append("set_by=?"); vals.append(set_by)
             vals.append(chat_id)
             # safety: column names are built only from literals above
-            assert all(s.split("=")[0] in {"max_quality", "auto_mode", "silent", "command_only", "media_mode", "set_by"} for s in sets)
+            assert all(s.split("=")[0] in {"max_quality", "auto_mode", "silent", "command_only", "media_mode", "link_filter", "set_by"} for s in sets)
             conn.execute(f"UPDATE chat_settings SET {', '.join(sets)} WHERE chat_id=?", vals)
         else:
             conn.execute(
-                "INSERT INTO chat_settings (chat_id, max_quality, auto_mode, silent, command_only, media_mode, set_by) VALUES (?,?,?,?,?,?,?)",
+                "INSERT INTO chat_settings (chat_id, max_quality, auto_mode, silent, command_only, media_mode, link_filter, set_by) VALUES (?,?,?,?,?,?,?,?)",
                 (chat_id, max_quality if max_quality is not None else 1080,
                  auto_mode if auto_mode is not None else 1,
                  silent if silent is not None else 0,
                  command_only if command_only is not None else 0,
-                 media_mode if media_mode is not None else 2, set_by))
+                 media_mode if media_mode is not None else 2,
+                 link_filter if link_filter is not None else 'all', set_by))
         conn.commit()
         conn.close()
     except Exception as e:
