@@ -9,6 +9,7 @@ downloader.py — Core download engine for Rayan Downloader Bot
 import os
 import re
 import json
+import time
 import logging
 import subprocess
 import importlib.util
@@ -74,10 +75,22 @@ def resolve_short_url(url: str) -> str:
             capture_output=True, text=True, timeout=20)
         final = (r.stdout or "").strip()
         if final and final != url and ("tiktok.com" in final or "twitter.com" in final or "x.com" in final):
-            return final
+            return fix_tiktok_url(final)
     except Exception:
         pass
-    return url
+    return fix_tiktok_url(url)
+
+
+def fix_tiktok_url(url: str) -> str:
+    """TikTok's yt-dlp extractor ONLY works when the URL carries a 'web app' marker
+    (?_r=1 or ?is_from_webapp=1). Plain shared links (full www.tiktok.com/@user/video/ID)
+    fail with 'Unable to extract universal data' — add the marker."""
+    if "tiktok.com" not in url:
+        return url
+    if "_r=1" in url or "is_from_webapp" in url:
+        return url
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}_r=1"
 
 
 def detect_site(url: str) -> str:
@@ -273,10 +286,22 @@ def get_video_info(url: str) -> dict:
     # -N 8: concurrent fragment downloads; --no-check-certificates for speed on some hosts
     cmd = [YTDLP, *JS_RUNTIME, *proxy, "-J", "--no-warnings", "--skip-download",
            "--no-check-certificates", url]
+    # TikTok's API rate-limits aggressively: retry a few times with a small backoff
+    attempts = 4 if is_tiktok(url) else 1
+    last_err = ""
+    for attempt in range(attempts):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if r.returncode == 0:
+                break
+            last_err = (r.stderr or r.stdout)[-300:]
+        except Exception as e:
+            last_err = str(e)
+        if attempt < attempts - 1:
+            time.sleep(2 + attempt * 3)
+    else:
+        return {"error": last_err}
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if r.returncode != 0:
-            return {"error": (r.stderr or r.stdout)[-300:]}
         d = json.loads(r.stdout)
 
         # Playlist detection
@@ -572,14 +597,26 @@ def download_video(url: str, quality: str, is_audio: bool, out_path: str) -> boo
                "--no-playlist",
                "-o", out_path, "--no-warnings", url]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
-        ok = os.path.exists(out_path) and os.path.getsize(out_path) > 0
-        if not ok:
-            # yt-dlp may append .mp4/.mp3 if out_path has no proper ext
-            for cand in (out_path + ".mp4", out_path + ".mp3", out_path + ".mkv", out_path + ".webm"):
-                if os.path.exists(cand) and os.path.getsize(cand) > 0:
-                    ok = True
-                    break
+        # TikTok rate-limits: retry the whole download a few times
+        attempts = 4 if is_tiktok(url) else 1
+        for attempt in range(attempts):
+            # clean partial file between attempts
+            if attempt > 0:
+                dl.cleanup(out_path)
+                for cand in (out_path + ".mp4", out_path + ".mp3", out_path + ".mkv", out_path + ".webm"):
+                    dl.cleanup(cand)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+            ok = os.path.exists(out_path) and os.path.getsize(out_path) > 0
+            if not ok:
+                # yt-dlp may append .mp4/.mp3 if out_path has no proper ext
+                for cand in (out_path + ".mp4", out_path + ".mp3", out_path + ".mkv", out_path + ".webm"):
+                    if os.path.exists(cand) and os.path.getsize(cand) > 0:
+                        ok = True
+                        break
+            if ok:
+                break
+            if attempt < attempts - 1:
+                time.sleep(2 + attempt * 3)
         return ok
     except Exception as e:
         log.error("download error: %s", e)
