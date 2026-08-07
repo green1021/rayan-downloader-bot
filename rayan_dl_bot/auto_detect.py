@@ -14,7 +14,9 @@ It's heuristic by design: for unknown sites there are no guarantees, so the bot
 warns the user that support is automatic and may be buggy.
 """
 import logging
+import os
 import re
+import time as _time
 import urllib.parse
 import urllib.request
 
@@ -45,6 +47,25 @@ def fetch_page(url: str, timeout: int = 25) -> str:
         return resp.read().decode("utf-8", "ignore")
 
 
+def extract_text(url: str, limit: int = 3800) -> str:
+    """Extract clean page text (fallback when media extraction fails)."""
+    import html as _html
+    try:
+        html = fetch_page(url)
+    except Exception:
+        return ""
+    text = re.sub(r"<script.*?</script>", " ", html, flags=re.DOTALL)
+    text = re.sub(r"<style.*?</style>", " ", text, flags=re.DOTALL)
+    text = _html.unescape(re.sub(r"<[^>]+>", " ", text))
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+    # escape markdown-unsafe chars so edit_text doesn't break
+    esc = (str(text).replace("\\", "\\\\").replace("_", "\\_")
+           .replace("*", "\\*").replace("[", "\\[").replace("`", "\\`"))
+    return esc[:limit]
+
+
 def _resolve(page_url: str, m: str) -> str:
     if m.startswith("http"):
         return m
@@ -64,6 +85,37 @@ def _img_count(html: str) -> list:
             seen.add(u)
             out.append(u)
     return out
+
+
+def _valid_image(p: str) -> bool:
+    """Return True if the file is a decodable image (not an HTML error page etc.)."""
+    try:
+        from PIL import Image
+        with Image.open(p) as im:
+            im.verify()
+        return True
+    except Exception:
+        return False
+
+
+def _dl_valid(imgs, outdir, prefix="{:04d}.jpg") -> list:
+    """Download images sequentially; keep only decodable image files."""
+    os.makedirs(outdir, exist_ok=True)
+    paths = []
+    for i, u in enumerate(imgs, 1):
+        p = os.path.join(outdir, prefix.format(i))
+        try:
+            _dl_img(u, p)
+            if _valid_image(p):
+                paths.append(p)
+            else:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        except Exception:
+            pass
+    return sorted(paths)
 
 
 def detect(url: str) -> dict:
@@ -133,17 +185,7 @@ def auto_download(url: str, dtype: str, workdir: str, samples=None) -> dict:
             if not imgs:
                 return {"error": "عکسی پیدا نشد"}
             outdir = os.path.join(workdir, f"ad_{int(_time.time())}")
-            os.makedirs(outdir, exist_ok=True)
-            paths = []
-            # sequential download: reliable for unknown/weak sites
-            for i, u in enumerate(imgs, 1):
-                p = os.path.join(outdir, f"{i:04d}.jpg")
-                try:
-                    _dl_img(u, p)
-                    paths.append(p)
-                except Exception:
-                    continue
-            paths = sorted([p for p in paths if p])
+            paths = _dl_valid(imgs, outdir)
             if not paths:
                 return {"error": "دانلود عکس‌ها ناموفق بود"}
             import img2pdf
@@ -196,15 +238,7 @@ def auto_download(url: str, dtype: str, workdir: str, samples=None) -> dict:
             if not imgs:
                 return {"error": "عکسی پیدا نشد"}
             outdir = os.path.join(workdir, f"ad_{int(_time.time())}")
-            os.makedirs(outdir, exist_ok=True)
-            photos = []
-            for i, u in enumerate(imgs, 1):
-                p = os.path.join(outdir, f"{i:03d}.jpg")
-                try:
-                    _dl_img(u, p)
-                    photos.append(p)
-                except Exception:
-                    pass
+            photos = _dl_valid(imgs, outdir, "{:03d}.jpg")
             if not photos:
                 return {"error": "دانلود عکس‌ها ناموفق بود"}
             return {"type": "photos", "photos": photos, "text": "🖼 عکس‌ها", "auto": True}

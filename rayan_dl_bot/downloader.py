@@ -96,6 +96,8 @@ def fix_tiktok_url(url: str) -> str:
 def detect_site(url: str) -> str:
     if is_pornhub(url):
         return "pornhub"
+    if is_tor_site(url):
+        return "pornhub"
     if is_instagram(url):
         return "instagram"
     if is_twitter(url):

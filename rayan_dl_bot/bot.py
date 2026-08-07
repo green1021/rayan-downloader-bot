@@ -1623,7 +1623,8 @@ async def _send_plugin_result(update: Update, context, result: dict, lang: str,
         elif typ == "photos":
             photos = result.get("photos") or []
             if photos:
-                media = [open(p, "rb") for p in photos]
+                from telegram import InputMediaPhoto
+                media = [InputMediaPhoto(open(p, "rb")) for p in photos]
                 await context.bot.send_media_group(chat_id=chat_id, media=media)
                 for p in photos:
                     dl.cleanup(p)
@@ -2345,6 +2346,18 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 adetect.auto_download, url, detection["type"], DOWNLOAD_DIR,
                 detection.get("samples"))
             if result.get("error"):
+                # Fallback: image-heavy pages often have interesting text.
+                # If media extraction failed, try sending page text instead of erroring.
+                fb = await asyncio.to_thread(adetect.extract_text, url)
+                if fb:
+                    try:
+                        await status_msg.edit_text(
+                            f"🧠 **پشتیبانی خودکار** — عکس‌ها قابل استخراج نبودن، متن صفحه:\n\n{fb}",
+                            parse_mode="Markdown", disable_web_page_preview=True)
+                    except Exception:
+                        pass
+                    db.record_download(update.effective_user.id, url, "other", "auto-text", True)
+                    return
                 try:
                     await status_msg.edit_text(
                         i18n.t(lang, "auto_failed").format(err=result["error"][:200]),
