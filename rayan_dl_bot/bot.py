@@ -1723,6 +1723,18 @@ async def handle_media_file(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     # (only recognize voice in private chat where it's a deliberate music request).
     if update.message.voice and update.effective_chat.type != "private":
         return
+    # In GROUPS, video files/notes are usually casual shares — don't try to recognize
+    # music from them (private chat still recognizes video).
+    if update.effective_chat.type != "private" and (update.message.video or update.message.video_note):
+        return
+    # Group media_mode: 0 = nothing, 1 = links only — files are ignored entirely.
+    if update.effective_chat.type != "private":
+        try:
+            gs = db.get_chat_settings(update.effective_chat.id)
+            if gs.get("media_mode", 2) < 2:
+                return
+        except Exception:
+            pass
     msg = update.message
     file_obj = (msg.audio or msg.video or msg.voice or msg.document
                 or (msg.video_note))
@@ -1795,7 +1807,9 @@ async def group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(i18n.t(lang, "group_settings").format(
         quality=s["max_quality"] if s["max_quality"] else "∞",
         auto=i18n.t(lang, "group_on") if s["auto_mode"] else i18n.t(lang, "group_off"),
-        silent=i18n.t(lang, "group_on") if s["silent"] else i18n.t(lang, "group_off")))
+        silent=i18n.t(lang, "group_on") if s["silent"] else i18n.t(lang, "group_off"),
+        media=MEDIA_MODES.get(s.get("media_mode", 2), MEDIA_MODES[2])) +
+        "\n\n🎛 برای انتخاب رسانه‌ها: /setmedia")
 
 
 async def setquality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1859,6 +1873,75 @@ async def silent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db.set_chat_settings(chat.id, silent=1 if on else 0, set_by=update.effective_user.id)
     await update.message.reply_text(i18n.t(lang, "silent_done").format(
         state=i18n.t(lang, "group_on") if on else i18n.t(lang, "group_off")))
+
+
+# ── Group media-mode settings ─────────────────────────────────
+MEDIA_MODES = {
+    0: "🚫 هیچ",
+    1: "🔗 فقط لینک",
+    2: "🎬 لینک + فایل‌ها",
+}
+
+async def setmedia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Group admin picks which media the bot handles in this group:
+    0 = nothing, 1 = links only, 2 = links + files (default)."""
+    chat = update.effective_chat
+    if not chat or chat.type == "private":
+        await update.message.reply_text(i18n.t(lang_of(update), "only_groups"))
+        return
+    lang = lang_of(update)
+    if not await _is_group_admin(update, update.effective_user.id):
+        await update.message.reply_text(i18n.t(lang, "group_admin_only"))
+        return
+    s = db.get_chat_settings(chat.id)
+    current = s.get("media_mode", 2)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{'✅ ' if current == 1 else ''}🔗 فقط لینک",
+                              callback_data=f"setmedia|1")],
+        [InlineKeyboardButton(f"{'✅ ' if current == 2 else ''}🎬 لینک + فایل",
+                              callback_data=f"setmedia|2")],
+        [InlineKeyboardButton(f"{'✅ ' if current == 0 else ''}🚫 هیچ",
+                              callback_data=f"setmedia|0")],
+        [InlineKeyboardButton(i18n.t(lang, "close"), callback_data="setmedia|close")],
+    ])
+    await update.message.reply_text(
+        "🎛 **رسانه‌هایی که ربات در این گروه هندل می‌کنه:**\n\n"
+        "🔗 فقط لینک — فقط لینک‌ها دانلود می‌شن (عکس/ویدیو/ویس بی‌صدا رد می‌شن)\n"
+        "🎬 لینک + فایل — لینک‌ها دانلود می‌شن و فایل‌های صوتی تشخیص آهنگ می‌شن\n"
+        "🚫 هیچ — ربات فقط به کامندها جواب می‌ده\n\n"
+        "وضعیت فعلی: **" + MEDIA_MODES.get(current, "🎬 لینک + فایل‌ها") + "**",
+        parse_mode="Markdown", reply_markup=kb)
+
+
+async def setmedia_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    if not q.data or not q.data.startswith("setmedia|"):
+        return
+    val = q.data.split("|", 1)[1]
+    if val == "close":
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+        return
+    chat = q.message.chat
+    if chat.type == "private":
+        return
+    try:
+        mode = int(val)
+    except ValueError:
+        return
+    db.set_chat_settings(chat.id, media_mode=mode, set_by=q.from_user.id)
+    try:
+        await q.message.edit_text(
+            f"✅ حالت رسانه گروه به **{MEDIA_MODES.get(mode, mode)}** تغییر کرد.",
+            parse_mode="Markdown")
+    except Exception:
+        pass
 
 
 # ── Per-user settings ─────────────────────────────────────────
@@ -2833,6 +2916,7 @@ def main():
     app.add_handler(CommandHandler("grouphelp", group_help))
     app.add_handler(CommandHandler("groupsettings", group_settings))
     app.add_handler(CommandHandler("setquality", setquality))
+    app.add_handler(CommandHandler("setmedia", setmedia))
     app.add_handler(CommandHandler("autodl", autodl))
     app.add_handler(CommandHandler("silent", silent))
     app.add_handler(CommandHandler("commandonly", commandonly))
@@ -2859,6 +2943,7 @@ def main():
     app.add_handler(CallbackQueryHandler(set_def_q_cb, pattern="^setdefq"))
     app.add_handler(CallbackQueryHandler(force_join_check_cb, pattern="^fjcheck$"))
     app.add_handler(CallbackQueryHandler(search_cb, pattern="^srch"))
+    app.add_handler(CallbackQueryHandler(setmedia_cb, pattern="^setmedia"))
     app.add_handler(CallbackQueryHandler(startmsg_translate_cb, pattern="^smt"))
     app.add_handler(CallbackQueryHandler(chapter_cb, pattern="^pl(dl|pg|noop|close)"))
     app.add_handler(CallbackQueryHandler(more_qualities, pattern="^more"))
