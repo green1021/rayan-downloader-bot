@@ -531,10 +531,11 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(i18n.t(lang, "admin_menu"), reply_markup=kb)
 
 
-def admin_back_keyboard(lang: str):
-    """Keyboard with a back button for admin sub-menus."""
+def admin_back_keyboard(lang: str, to: str = "adm|menu"):
+    """Keyboard with a back button for admin sub-menus.
+    'to' lets sub-menus return to their REAL previous menu instead of the main one."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(i18n.t(lang, "back"), callback_data="adm|menu"),
+        [InlineKeyboardButton(i18n.t(lang, "back"), callback_data=to),
          InlineKeyboardButton(i18n.t(lang, "close"), callback_data="adm|close")]
     ])
 
@@ -912,8 +913,8 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "• لینک مستقیم به فایل **zip**\n"
             "• لینک **raw** از GitHub به plugin.json\n\n"
             "مثال لینک: `https://raw.githubusercontent.com/user/repo/main/plugin.json`\n\n"
-            "فایل یا لینک رو بفرست:",
-            parse_mode="Markdown", reply_markup=admin_back_keyboard(lang))
+            f"فایل یا لینک رو بفرست:",
+            parse_mode="Markdown", reply_markup=admin_back_keyboard(lang, "adm|plugins"))
     elif action == "plugin_info":
         # parts: adm|plugin_info|<name>
         if len(parts) >= 3:
@@ -949,17 +950,20 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 new_state = not meta.get("enabled")
                 if pm.toggle_plugin(pname, new_state):
                     await q.message.edit_text(f"✅ پلاگین `{pname}` → {'فعال' if new_state else 'غیرفعال'} شد.",
-                                              parse_mode="Markdown", reply_markup=admin_back_keyboard(lang))
+                                              parse_mode="Markdown",
+                                              reply_markup=admin_back_keyboard(lang, f"adm|plugin_info|{pname}"))
                 else:
-                    await q.message.edit_text("❌ خطا در تغییر وضعیت.", reply_markup=admin_back_keyboard(lang))
+                    await q.message.edit_text("❌ خطا در تغییر وضعیت.",
+                                              reply_markup=admin_back_keyboard(lang, f"adm|plugin_info|{pname}"))
     elif action == "plugin_del":
         if len(parts) >= 3:
             pname = parts[2]
             if pm.remove_plugin(pname):
                 await q.message.edit_text(f"🗑 پلاگین `{pname}` حذف شد.", parse_mode="Markdown",
-                                          reply_markup=admin_back_keyboard(lang))
+                                          reply_markup=admin_back_keyboard(lang, "adm|plugins"))
             else:
-                await q.message.edit_text("❌ حذف ناموفق.", reply_markup=admin_back_keyboard(lang))
+                await q.message.edit_text("❌ حذف ناموفق.",
+                                          reply_markup=admin_back_keyboard(lang, "adm|plugins"))
     elif action == "plugin_set":
         if len(parts) >= 3:
             pname = parts[2]
@@ -1017,7 +1021,8 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             context.user_data["plugin_set_name"] = pname
             context.user_data["plugin_set_key"] = key
             await q.message.edit_text(f"🔧 مقدار جدید برای `{key}` رو بفرست کدوم پلاگین {pname}:",
-                                      parse_mode="Markdown", reply_markup=admin_back_keyboard(lang))
+                                      parse_mode="Markdown",
+                                      reply_markup=admin_back_keyboard(lang, f"adm|plugin_set|{pname}"))
     elif action == "pbbuild":
         context.user_data["adm_state"] = "pb_name"
         await q.message.edit_text(
@@ -1025,7 +1030,7 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "قدم ۱ از ۴: اسم پلاگین رو بنویس.\n"
             "فقط حروف انگلیسی، عدد، `-` یا `_` (۲ تا ۴۰ کاراکتر).\n\n"
             "مثال: `mysitecomics`",
-            parse_mode="Markdown", reply_markup=admin_back_keyboard(lang))
+            parse_mode="Markdown", reply_markup=admin_back_keyboard(lang, "adm|plugins"))
         return
     elif action == "pbauto":
         context.user_data["adm_state"] = "pb_auto_url"
@@ -1033,7 +1038,7 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "🔎 **تشخیص خودکار**\n\n"
             "یک **لینک نمونه** از سایتت بفرست تا خودم صفحه رو تحلیل کنم و\n"
             "نوع محتوا (کامیک/ویدیو/عکس) + الگوی regex رو پیشنهاد بدم.\n\n"
-            "لینک رو بفرست:", reply_markup=admin_back_keyboard(lang))
+            "لینک رو بفرست:", reply_markup=admin_back_keyboard(lang, "adm|plugins"))
         return
     elif action == "pbtype":
         # parts: adm|pbtype|<ctype>
@@ -1045,7 +1050,7 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await q.message.edit_text(
                 f"🛠 **{info.get('label', ctype)}**\n\n{info.get('prompt', '')}\n\n"
                 f"الگوی **regex** رو بفرست:",
-                parse_mode="Markdown", reply_markup=admin_back_keyboard(lang))
+                parse_mode="Markdown", reply_markup=admin_back_keyboard(lang, "adm|plugins"))
     elif action == "userlinks":
         # Show all users, ask for an ID to export their links
         rows = db.get_top_users(50)
@@ -1719,6 +1724,10 @@ async def handle_media_file(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     # GIFs have no music — in groups people send them for fun; ignore animations entirely.
     if update.message.animation:
+        return
+    # In GROUPS, voice messages are usually casual chat — ignore them entirely
+    # (only recognize voice in private chat where it's a deliberate music request).
+    if update.message.voice and update.effective_chat.type != "private":
         return
     msg = update.message
     file_obj = (msg.audio or msg.video or msg.voice or msg.document
