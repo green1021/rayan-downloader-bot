@@ -207,9 +207,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     lang = lang_of(update)
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(i18n.t(lang, "help_btn") + " راهنما", callback_data="help"),
-         InlineKeyboardButton(i18n.t(lang, "history_btn") + " تاریخچه", callback_data="history")],
-        [InlineKeyboardButton("🌍 " + i18n.t(lang, "choose_site"), callback_data="lang")],
+        [InlineKeyboardButton(i18n.t(lang, "help_btn"), callback_data="help"),
+         InlineKeyboardButton(i18n.t(lang, "history_btn"), callback_data="history")],
+        [InlineKeyboardButton(i18n.t(lang, "choose_site"), callback_data="lang")],
     ])
     await update.message.reply_text(i18n.t(lang, "start"), parse_mode="Markdown",
                                     disable_web_page_preview=True, reply_markup=kb)
