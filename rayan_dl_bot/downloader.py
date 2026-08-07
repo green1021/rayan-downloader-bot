@@ -196,7 +196,7 @@ def make_caption(info: dict, lang: str = "fa") -> str:
     if info.get("size_str"):
         lines.append(f"💾 **{'حجم' if lang == 'fa' else 'Size'}:** {info['size_str']}")
     if info.get("description"):
-        desc = _esc_md(info["description"].strip()[:200])
+        desc = _esc_md(info["description"].strip()[:500])
         if desc:
             lines.append(f"\n📝 {desc}")
     lines.append(f"\n🔗 [{'مشاهده در سایت' if lang == 'fa' else 'View source'}]({info.get('webpage_url', '')})")
@@ -237,9 +237,9 @@ def get_video_info(url: str) -> dict:
             return full
         if full.get("type") == "video":
             # Video tweet: expose qualities for the normal flow
-            heights = sorted({int(v.get("height") or 0) for v in []})  # no heights from syndication
+            screen = full.get("user_screen") or ""
             return {
-                "title": full.get("text", "")[:120] or "Tweet video",
+                "title": f"🐦 Tweet by @{screen}" if screen else "Tweet video",
                 "uploader": f"{full.get('user_name')} @{full.get('user_screen')}",
                 "duration": None,
                 "view_count": None,
@@ -253,8 +253,9 @@ def get_video_info(url: str) -> dict:
                 "tw_full": full,
             }
         # Photos / text / quote tweets
+        screen = full.get("user_screen") or ""
         return {
-            "title": full.get("text", "")[:120] or "Tweet",
+            "title": f"🐦 Tweet by @{screen}" if screen else "Tweet",
             "uploader": f"{full.get('user_name')} @{full.get('user_screen')}",
             "webpage_url": url,
             "qualities": {},
