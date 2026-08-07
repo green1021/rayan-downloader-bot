@@ -65,6 +65,21 @@ def clean_instagram_url(url: str) -> str:
     return url
 
 
+def resolve_short_url(url: str) -> str:
+    """Follow redirects for short links (vt.tiktok.com, t.co, etc.) so yt-dlp/extractors
+    get the REAL URL. TikTok's mobile short links often break its own extractor."""
+    try:
+        r = subprocess.run(
+            ["curl", "-s", "-L", "-o", "/dev/null", "-w", "%{url_effective}", "--max-time", "15", url],
+            capture_output=True, text=True, timeout=20)
+        final = (r.stdout or "").strip()
+        if final and final != url and ("tiktok.com" in final or "twitter.com" in final or "x.com" in final):
+            return final
+    except Exception:
+        pass
+    return url
+
+
 def detect_site(url: str) -> str:
     if is_pornhub(url):
         return "pornhub"
@@ -150,14 +165,26 @@ def human_size(size) -> str:
     return f"{size:.1f}PB"
 
 
+def _esc_md(text: str) -> str:
+    """Escape Telegram Markdown special chars in user/tweet content so a tweet
+    containing *, _, [, etc. can't break the caption formatting."""
+    if text is None:
+        return ""
+    return (str(text).replace("\\", "\\\\")
+            .replace("_", "\\_").replace("*", "\\*")
+            .replace("[", "\\[").replace("`", "\\`"))
+
+
 def make_caption(info: dict, lang: str = "fa") -> str:
-    """Build a rich caption. Uses simple emoji labels per language."""
-    title = info.get("title") or "بدون عنوان"
+    """Build a rich caption. Uses simple emoji labels per language.
+    User-provided content (title/uploader/description) is Markdown-escaped so it
+    can never break the formatting."""
+    title = _esc_md(info.get("title") or "بدون عنوان")
     lines = [f"🎬 **{title[:150]}**\n"]
     if info.get("uploader"):
-        lines.append(f"👤 **{'آپلودر' if lang == 'fa' else 'Uploader'}:** {info['uploader']}")
+        lines.append(f"👤 **{'آپلودر' if lang == 'fa' else 'Uploader'}:** {_esc_md(info['uploader'])}")
     if info.get("upload_date"):
-        lines.append(f"📅 **{'تاریخ' if lang == 'fa' else 'Date'}:** {info['upload_date']}")
+        lines.append(f"📅 **{'تاریخ' if lang == 'fa' else 'Date'}:** {_esc_md(info['upload_date'])}")
     if info.get("duration"):
         lines.append(f"⏱ **{'مدت' if lang == 'fa' else 'Duration'}:** {format_duration(info['duration'])}")
     if info.get("view_count") is not None:
@@ -169,7 +196,7 @@ def make_caption(info: dict, lang: str = "fa") -> str:
     if info.get("size_str"):
         lines.append(f"💾 **{'حجم' if lang == 'fa' else 'Size'}:** {info['size_str']}")
     if info.get("description"):
-        desc = info["description"].strip()[:200]
+        desc = _esc_md(info["description"].strip()[:200])
         if desc:
             lines.append(f"\n📝 {desc}")
     lines.append(f"\n🔗 [{'مشاهده در سایت' if lang == 'fa' else 'View source'}]({info.get('webpage_url', '')})")
@@ -236,6 +263,10 @@ def get_video_info(url: str) -> dict:
             "tw_type": full.get("type", "text"),
             "tw_full": full,
         }
+
+    # TikTok short links (vt.tiktok.com) break its extractor — resolve to real URL first
+    if is_tiktok(url):
+        url = resolve_short_url(url)
 
     proxy = get_proxy_args(url)
     # -N 8: concurrent fragment downloads; --no-check-certificates for speed on some hosts
@@ -515,6 +546,10 @@ def download_video(url: str, quality: str, is_audio: bool, out_path: str) -> boo
         except Exception:
             pass
         return igtw.download_twitter(url, quality, out_path, direct_url=direct)
+
+    # TikTok short links (vt.tiktok.com) break its extractor — resolve to real URL first
+    if is_tiktok(url):
+        url = resolve_short_url(url)
 
     proxy = get_proxy_args(url)
 

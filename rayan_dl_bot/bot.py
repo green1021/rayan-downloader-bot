@@ -2403,11 +2403,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Quote tweet: show both tweets cleanly FIRST (most informative)
     if is_tw and tw_type == "quote" and tw_full.get("quoted"):
         q = tw_full["quoted"]
-        text = (tw_full.get("text") or "")[:400]
-        qtext = (q.get("text") or "")[:400]
+        text = dl._esc_md((tw_full.get("text") or "")[:400])
+        qtext = dl._esc_md((q.get("text") or "")[:400])
         msg_text = i18n.t(lang, "tw_quote_only").format(
-            name=tw_full.get("user_name") or "", screen=tw_full.get("user_screen") or "",
-            text=text, qname=q.get("user_name") or "", qscreen=q.get("user_screen") or "",
+            name=dl._esc_md(tw_full.get("user_name") or ""), screen=dl._esc_md(tw_full.get("user_screen") or ""),
+            text=text, qname=dl._esc_md(q.get("user_name") or ""), qscreen=dl._esc_md(q.get("user_screen") or ""),
             qtext=qtext)
         await status_msg.delete()
         await update.message.reply_text(msg_text, disable_web_page_preview=True)
@@ -2439,8 +2439,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if thread.get("tweets") and len(thread["tweets"]) > 1:
             await status_msg.edit_text(i18n.t(lang, "tw_thread_header").format(count=len(thread["tweets"])))
             for i, t in enumerate(thread["tweets"], 1):
-                text = (t.get("text") or "")[:500]
-                header = i18n.t(lang, "tw_thread_item").format(n=i, name=t.get("user_name") or "", text=text)
+                text = dl._esc_md((t.get("text") or "")[:500])
+                header = i18n.t(lang, "tw_thread_item").format(n=i, name=dl._esc_md(t.get("user_name") or ""), text=text)
                 await update.message.reply_text(header, disable_web_page_preview=True)
                 # Send photos for each tweet in the thread
                 for photo_url in t.get("photos", [])[:4]:
@@ -2462,8 +2462,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if tw_type == "photos" and tw_full.get("photos"):
             await status_msg.edit_text(i18n.t(lang, "tw_photos_sending").format(count=len(tw_full["photos"])))
             header = i18n.t(lang, "tw_tweet_header").format(
-                name=tw_full.get("user_name") or "", screen=tw_full.get("user_screen") or "",
-                text=(tw_full.get("text") or "")[:400],
+                name=dl._esc_md(tw_full.get("user_name") or ""), screen=dl._esc_md(tw_full.get("user_screen") or ""),
+                text=dl._esc_md((tw_full.get("text") or "")[:400]),
                 likes=tw_full.get("favorite_count") or 0, rts=tw_full.get("retweet_count") or 0)
             sent_first = False
             for photo_url in tw_full["photos"][:10]:
@@ -2488,7 +2488,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         # Plain text tweet — send FULL text (Telegram limit ~4000 chars)
-        full_text = (tw_full.get("text") or "").strip()
+        full_text = dl._esc_md((tw_full.get("text") or "").strip())
         msg_text = i18n.t(lang, "tw_no_media").format(text=full_text[:3800])
         try:
             await status_msg.edit_text(msg_text, disable_web_page_preview=True)
@@ -2546,7 +2546,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             # pick the highest available quality that is <= max_q
             candidates = [h for h in heights if h <= max_q]
             chosen = candidates[0] if candidates else max(heights)
-            await status_msg.edit_text(i18n.t(lang, "dl_in_group").format(title=info.get("title", "")[:80]),
+            await status_msg.edit_text(i18n.t(lang, "dl_in_group").format(title=dl._esc_md(info.get("title", "")[:80])),
                                        parse_mode="Markdown")
             out_path = os.path.join(DOWNLOAD_DIR, f"grp_{chat.id}_{int(time.time())}")
             dl.cleanup(out_path)
