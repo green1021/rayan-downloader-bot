@@ -145,9 +145,28 @@ def _fxtwitter(twid) -> dict | None:
         return None
 
 
+def _resolve_short_url(url: str) -> str:
+    """Follow redirects for twitter short links (t.co, tinyurl, etc.) to get the real tweet URL."""
+    try:
+        r = subprocess.run(
+            ["curl", "-s", "-L", "-o", "/dev/null", "-w", "%{url_effective}", "--max-time", "15", url],
+            capture_output=True, text=True, timeout=20)
+        final = (r.stdout or "").strip()
+        if final and "status" in final and final != url:
+            return final
+    except Exception:
+        pass
+    return url
+
+
 def _extract_twid(url: str) -> str | None:
-    """Extract numeric tweet ID from a twitter/x URL."""
+    """Extract numeric tweet ID from a twitter/x URL. Also resolves t.co short links."""
     m = re.search(r'/(\d{15,20})(?:/|\?|$)', url)
+    if m:
+        return m.group(1)
+    # short link (t.co / bit.ly) — resolve to the real tweet
+    resolved = _resolve_short_url(url)
+    m = re.search(r'/(\d{15,20})(?:/|\?|$)', resolved)
     return m.group(1) if m else None
 
 
