@@ -2283,6 +2283,10 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception:
             pass
         status_msg = await update.message.reply_text(i18n.t(lang, "checking"))
+    else:
+        # Normal path for known sites (twitter/instagram/youtube/etc.): build the
+        # status message here so all later code can use it.
+        status_msg = await update.message.reply_text(i18n.t(lang, "checking"))
 
     info = dl.get_video_info(url)
     if info.get("error"):
