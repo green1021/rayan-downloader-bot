@@ -4,8 +4,11 @@ i18n — Multi-language support for Rayan Downloader Bot
 Languages: fa (default), en, ar, tr, ru, de, es, fr, hi, zh, pt
 """
 import json
+import logging
 import urllib.parse
 import urllib.request
+
+log = logging.getLogger("rayan-dl")
 
 # Merge extra languages (tr/ru/de/es/...) into LANGUAGES
 try:
@@ -390,7 +393,8 @@ def t(lang: str, key: str, **kwargs) -> str:
         if kwargs:
             try:
                 return text.format(**kwargs)
-            except Exception:
+            except Exception as e:
+                log.warning("i18n override format failed lang=%s key=%s: %s", lang, key, e)
                 return text
         return text
     text = (LANGUAGES.get(lang, {}).get(key)
@@ -400,8 +404,8 @@ def t(lang: str, key: str, **kwargs) -> str:
     if kwargs:
         try:
             text = text.format(**kwargs)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("i18n format failed lang=%s key=%s: %s", lang, key, e)
     return text
 
 

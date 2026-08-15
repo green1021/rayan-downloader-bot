@@ -215,7 +215,12 @@ def make_caption(info: dict, lang: str = "fa") -> str:
         if desc:
             lines.append(f"\n📝 {desc}")
     lines.append(f"\n🔗 [{'مشاهده در سایت' if lang == 'fa' else 'View source'}]({info.get('webpage_url', '')})")
-    return "\n".join(lines)
+    caption = "\n".join(lines)
+    # Telegram hard limit: 4096 chars per caption/message — never exceed it.
+    # Cut at a newline boundary so markdown/links are not split mid-token.
+    if len(caption) > 4000:
+        caption = caption[:4000].rsplit("\n", 1)[0]
+    return caption
 
 
 # ── Info ──────────────────────────────────────────────────────

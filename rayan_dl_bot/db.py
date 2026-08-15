@@ -221,37 +221,41 @@ def is_banned(user_id: int) -> bool:
 
 
 def ban_user(user_id: int) -> bool:
+    conn = None
     try:
         conn = _conn()
         cur = conn.cursor()
         cur.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
         if not cur.fetchone():
-            conn.close()
             return False
         conn.execute("UPDATE users SET banned = 1 WHERE user_id = ?", (user_id,))
         conn.commit()
-        conn.close()
         return True
     except Exception as e:
         log.error("ban_user: %s", e)
         return False
+    finally:
+        if conn:
+            conn.close()
 
 
 def unban_user(user_id: int) -> bool:
+    conn = None
     try:
         conn = _conn()
         cur = conn.cursor()
         cur.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
         if not cur.fetchone():
-            conn.close()
             return False
         conn.execute("UPDATE users SET banned = 0 WHERE user_id = ?", (user_id,))
         conn.commit()
-        conn.close()
         return True
     except Exception as e:
         log.error("unban_user: %s", e)
         return False
+    finally:
+        if conn:
+            conn.close()
 
 
 def record_link(update, url: str, site: str, title: str = ""):
@@ -526,23 +530,25 @@ def get_force_channels():
 
 def add_force_channel(username: str, title: str = "", chat_id=None, added_by: int = 0):
     """Add a force channel. Returns (ok, reason)."""
+    conn = None
     try:
         conn = _conn()
         cur = conn.cursor()
         cur.execute("SELECT id FROM force_channels WHERE channel_username = ?", (username,))
         if cur.fetchone():
-            conn.close()
             return False, "exists"
         now = datetime.utcnow().isoformat()
         cur.execute(
             "INSERT INTO force_channels (channel_username, channel_title, chat_id, added_by, created_at) VALUES (?,?,?,?,?)",
             (username, title, chat_id, added_by, now))
         conn.commit()
-        conn.close()
         return True, "added"
     except Exception as e:
         log.error("add_force_channel: %s", e)
         return False, str(e)
+    finally:
+        if conn:
+            conn.close()
 
 
 def remove_force_channel(username: str):
@@ -619,21 +625,23 @@ def get_db_admins():
 
 def add_admin(user_id: int, added_by: int) -> bool:
     """Add an admin. Returns True if newly added."""
+    conn = None
     try:
         conn = _conn()
         cur = conn.cursor()
         cur.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,))
         if cur.fetchone():
-            conn.close()
             return False
         now = datetime.utcnow().isoformat()
         cur.execute("INSERT INTO admins (user_id, added_by, created_at) VALUES (?,?,?)", (user_id, added_by, now))
         conn.commit()
-        conn.close()
         return True
     except Exception as e:
         log.error("add_admin: %s", e)
         return False
+    finally:
+        if conn:
+            conn.close()
 
 
 def remove_admin(user_id: int) -> bool:

@@ -104,7 +104,8 @@ asyncio.run(main())
     code = code.replace("WARP_PROXY_PLACEHOLDER", json.dumps(WARP_PROXY))
     code = code.replace("AUDIO_PATH_PLACEHOLDER", json.dumps(audio_path))
     try:
-        r = subprocess.run([VENV311, "-c", code], capture_output=True, text=True, timeout=90)
+        # Blocking subprocess (up to 90s) — run in a thread so the event loop stays free
+        r = await asyncio.to_thread(subprocess.run, [VENV311, "-c", code], capture_output=True, text=True, timeout=90)
         out = r.stdout.strip()
         if out.startswith("{") and out.endswith("}"):
             return json.loads(out)
@@ -177,11 +178,11 @@ async def recognize_audio(audio_path: str, cache=True) -> dict:
             _db_cache_set(fhash, out)
         return out
 
-    # 2) AcoustID fallback
-    fp = _fpcalc(audio_path)
+    # 2) AcoustID fallback (fpcalc + lookup are blocking subprocesses — run in threads)
+    fp = await asyncio.to_thread(_fpcalc, audio_path)
     if fp:
         duration, fingerprint = fp
-        recs = _acoustid_lookup(duration, fingerprint)
+        recs = await asyncio.to_thread(_acoustid_lookup, duration, fingerprint)
         if recs:
             out = {"matched": True, "source": "acoustid",
                    "title": recs[0]["title"], "artist": recs[0]["artist"]}

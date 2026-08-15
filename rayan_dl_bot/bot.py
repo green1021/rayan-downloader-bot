@@ -14,6 +14,7 @@ import asyncio
 import shutil
 import hashlib
 import subprocess
+import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -1096,6 +1097,9 @@ async def plugin_file_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if state != "plugin_install":
         return
     context.user_data.pop("adm_state", None)
+    # Guard: this handler may fire for edited/channel updates without a message/document
+    if not update.message or not update.message.document:
+        return
     doc = update.message.document
     fname = (doc.file_name or "").lower()
     if not (fname.endswith(".zip")):
@@ -1124,6 +1128,10 @@ async def plugin_file_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle broadcast/ban/unban text input from admin."""
+    # Guard: this handler can be reached from handle_link on edited/channel updates,
+    # and from the TEXT&COMMAND MessageHandler — both may lack a real message.
+    if not update.message or not update.message.text:
+        return
     if not is_admin(update.effective_user.id):
         return
     state = context.user_data.get("adm_state")
@@ -1712,6 +1720,9 @@ async def shazam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def handle_media_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Recognize the song from an audio/video file the user sends."""
+    # Guard: edited/channel updates can reach this handler without a message
+    if not update.message or not update.effective_chat:
+        return
     uid = update.effective_user.id
     lang = lang_of(update)
     if db.is_banned(uid):
@@ -1756,7 +1767,7 @@ async def handle_media_file(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     # Convert to mono wav for fingerprinting
     wav = local_path + ".wav"
-    if not recog.to_mono_wav(local_path, wav):
+    if not await asyncio.to_thread(recog.to_mono_wav, local_path, wav):
         await status.edit_text(i18n.t(lang, "shazam_error").format(err="ffmpeg convert failed"))
         dl.cleanup(local_path)
         return
@@ -1792,6 +1803,8 @@ async def _is_group_admin(update: Update, user_id: int) -> bool:
 
 
 async def group_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
     text = i18n.t(lang_of(update), "group_help")
     # Add a clear privacy-mode note
     text += i18n.t(lang_of(update), "group_privacy_note")
@@ -1799,6 +1812,8 @@ async def group_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
     chat = update.effective_chat
     if not chat or chat.type == "private":
         await update.message.reply_text(i18n.t(lang_of(update), "only_groups"))
@@ -1815,6 +1830,8 @@ async def group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def setquality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
     chat = update.effective_chat
     if not chat or chat.type == "private":
         await update.message.reply_text(i18n.t(lang_of(update), "only_groups"))
@@ -1840,6 +1857,8 @@ async def setquality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def autodl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
     chat = update.effective_chat
     if not chat or chat.type == "private":
         await update.message.reply_text(i18n.t(lang_of(update), "only_groups"))
@@ -1859,6 +1878,8 @@ async def autodl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def silent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
     chat = update.effective_chat
     if not chat or chat.type == "private":
         await update.message.reply_text(i18n.t(lang_of(update), "only_groups"))
@@ -1887,6 +1908,8 @@ MEDIA_MODES = {
 async def setmedia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Group admin picks which media the bot handles in this group:
     0 = nothing, 1 = links only, 2 = links + files (default)."""
+    if not update.message:
+        return
     chat = update.effective_chat
     if not chat or chat.type == "private":
         await update.message.reply_text(i18n.t(lang_of(update), "only_groups"))
@@ -1982,6 +2005,8 @@ def _media_type_of_site(site: str) -> set:
 
 async def setfilter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Group admin picks a link filter: all links / core sites / custom media types."""
+    if not update.message:
+        return
     chat = update.effective_chat
     if not chat or chat.type == "private":
         await update.message.reply_text(i18n.t(lang_of(update), "only_groups"))
@@ -2149,6 +2174,8 @@ async def set_def_q_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def commandonly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
     chat = update.effective_chat
     if not chat or chat.type == "private":
         await update.message.reply_text(i18n.t(lang_of(update), "only_groups"))
@@ -2403,6 +2430,11 @@ async def channels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 # ── Main link handler ─────────────────────────────────────────
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Guard: this handler is registered on filters.TEXT which also fires for
+    # edited messages / channel posts / service messages (update.message is None
+    # there) — ignore them silently instead of crashing with AttributeError.
+    if not update.message or not update.message.text:
+        return
     db.record_user(update)
     uid = update.effective_user.id
     lang = lang_of(update)
@@ -2796,7 +2828,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             chosen = candidates[0] if candidates else max(heights)
             await status_msg.edit_text(i18n.t(lang, "dl_in_group").format(title=dl._esc_md(info.get("title", "")[:80])),
                                        parse_mode="Markdown")
-            out_path = os.path.join(DOWNLOAD_DIR, f"grp_{chat.id}_{int(time.time())}")
+            out_path = os.path.join(DOWNLOAD_DIR, f"grp_{chat.id}_{uuid.uuid4().hex[:8]}")
             dl.cleanup(out_path)
             ok = await _limited_download(url, str(chosen), False, out_path)
             out_path = resolve_out_path(out_path)
@@ -2863,7 +2895,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await status_msg.edit_text(i18n.t(lang, "downloading").format(title=info.get("title", "")[:80], quality=f"{best}p"),
                                parse_mode="Markdown")
 
-    out_path = os.path.join(DOWNLOAD_DIR, f"dl_{uid}_{best}.mp4")
+    out_path = os.path.join(DOWNLOAD_DIR, f"dl_{uid}_{dl_id}_{best}.mp4")
     dl.cleanup(out_path)
 
     ok = await _limited_download(url, str(best), False, out_path)
@@ -3032,17 +3064,24 @@ async def more_qualities(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await q.answer()
     except Exception:
         pass
-    parts = q.data.split("|")
+    parts = q.data.split("|") if q.data else []
     if len(parts) < 2 or parts[0] != "more":
         return
     dl_id = parts[1]
     lang = lang_of(update)
     keyboard = context.user_data.get(f"more_{dl_id}", [])
-    if keyboard:
-        await q.message.reply_text(i18n.t(lang, "choose_quality"),
-                                   reply_markup=InlineKeyboardMarkup(keyboard))
-    else:
-        await q.message.reply_text(i18n.t(lang, "link_expired"))
+    try:
+        if keyboard:
+            await q.message.reply_text(i18n.t(lang, "choose_quality"),
+                                       reply_markup=InlineKeyboardMarkup(keyboard))
+        else:
+            await q.message.reply_text(i18n.t(lang, "link_expired"))
+    except Exception:
+        # Message may have been deleted or the bot restarted — don't crash the loop
+        try:
+            await q.answer(i18n.t(lang, "link_expired"), show_alert=True)
+        except Exception:
+            pass
 
 
 # ── Error handler ─────────────────────────────────────────────
@@ -3052,7 +3091,10 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if update and update.effective_message:
             # Only notify for real failures, not transient network blips
             err = str(context.error)
-            if "RemoteProtocolError" in err or "ConnectTimeout" in err or "ReadTimeout" in err:
+            net_errors = ("RemoteProtocolError", "ConnectTimeout", "ReadTimeout",
+                          "NetworkError", "TimedOut", "ConnectError", "ReadError",
+                          "httpx.TimeoutException", "httpx.ConnectError", "httpx.ReadError")
+            if any(k in err for k in net_errors):
                 await update.effective_message.reply_text("⚠️ خطای موقتی شبکه. دوباره تلاش کن.")
             else:
                 await update.effective_message.reply_text("⚠️ خطای غیرمنتظره‌ای رخ داد. دوباره تلاش کن.")
