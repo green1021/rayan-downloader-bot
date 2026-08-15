@@ -2698,7 +2698,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             p_path = os.path.join(DOWNLOAD_DIR, f"twq_{uid}_{int(time.time())}.jpg")
             ok_p = await asyncio.to_thread(igtw.download_twitter_photo, photo_url, p_path)
             if ok_p:
-                await context.bot.send_photo(chat_id=uid, photo=open(p_path, "rb"))
+                await context.bot.send_photo(chat_id=update.effective_chat.id, photo=open(p_path, "rb"))
                 sent_q = True
                 dl.cleanup(p_path)
         # If the quoted tweet has a video, download and send it too
@@ -2706,7 +2706,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             v_path = os.path.join(DOWNLOAD_DIR, f"twqv_{uid}_{int(time.time())}.mp4")
             ok_v = await asyncio.to_thread(igtw.download_twitter, url, "best", v_path, v_url)
             if ok_v and os.path.exists(v_path) and os.path.getsize(v_path) > 0:
-                await context.bot.send_video(chat_id=uid, video=open(v_path, "rb"))
+                await context.bot.send_video(chat_id=update.effective_chat.id, video=open(v_path, "rb"))
                 dl.cleanup(v_path)
                 sent_q = True
         db.record_download(uid, url, "twitter", "quote", sent_q)
@@ -2727,7 +2727,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     p_path = os.path.join(DOWNLOAD_DIR, f"twth_{uid}_{i}_{int(time.time())}.jpg")
                     ok_p = await asyncio.to_thread(igtw.download_twitter_photo, photo_url, p_path)
                     if ok_p:
-                        await context.bot.send_photo(chat_id=uid, photo=open(p_path, "rb"))
+                        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=open(p_path, "rb"))
                         dl.cleanup(p_path)
             db.record_download(uid, url, "twitter", "thread", True)
             try:
@@ -2751,10 +2751,10 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 ok_p = await asyncio.to_thread(igtw.download_twitter_photo, photo_url, p_path)
                 if ok_p:
                     if not sent_first:
-                        await context.bot.send_photo(chat_id=uid, photo=open(p_path, "rb"), caption=header)
+                        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=open(p_path, "rb"), caption=header)
                         sent_first = True
                     else:
-                        await context.bot.send_photo(chat_id=uid, photo=open(p_path, "rb"))
+                        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=open(p_path, "rb"))
                     dl.cleanup(p_path)
             if not sent_first:
                 await status_msg.edit_text(i18n.t(lang, "tw_no_media").format(text=(tw_full.get("text") or "")[:400]))
@@ -2791,7 +2791,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 fpath = os.path.join(out_dir, fname)
                 if os.path.getsize(fpath) > MAX_FILE_SIZE_MB * 1024 * 1024:
                     continue
-                await context.bot.send_video(chat_id=uid, video=open(fpath, "rb"), supports_streaming=True)
+                await context.bot.send_video(chat_id=update.effective_chat.id, video=open(fpath, "rb"), supports_streaming=True)
                 sent_any = True
         shutil.rmtree(out_dir, ignore_errors=True)
         if sent_any:
