@@ -1,5 +1,5 @@
 python-telegram-bot>=21.0
-yt-dlp>=2024.0
+yt-dlp>=2026.8.19
 
 # Music recognition (Shazam-like) — requires a Python 3.11 venv named venv311
 # (shazamio-core's Rust build + pydub don't work on Python 3.14+).
@@ -7,3 +7,6 @@ yt-dlp>=2024.0
 #   venv311/bin/pip install shazamio aiohttp-socks
 # Requires: ffmpeg, ffprobe, fpcalc (libchromaprint-tools), and a WARP SOCKS5
 # proxy on 127.0.0.1:40000 (Shazam blocks datacenter IPs; WARP routes around it).
+#
+# IMPORTANT: keep yt-dlp fresh — YouTube breaks old versions regularly.
+#   pip install -U yt-dlp

@@ -2,7 +2,28 @@
 
 All notable changes to the Rayan Downloader Bot.
 
+## [1.1.0] - 2026-08-22
+
+### Added
+- **Download queue** with live position feedback and per-server concurrency tuning
+- 💬 **YouTube subtitles**: quality-menu button appears only when subs exist; sends `.srt` (manual tracks preferred, auto-captions fallback)
+- ♻️ **Telegram CDN cache**: stores `file_id` after first send — identical requests re-send instantly from Telegram's CDN (zero bandwidth/disk)
+- 🎵 **Song recognition overhaul**: fixed a critical quoting bug that had silently broken all Shazam lookups; multi-offset fingerprinting (0/30/60s), loudness normalization, score-based AcoustID selection
+- **Aparat/Namasha plugin** (bundled): public JSON API, qualities up to 1080p, live-tested downloads
+- **Personalized `/start`**: greets users by name + lifetime download stats
+- **Group overhaul**: welcome message on bot add, media file-cache in groups, per-chat anti-flood pacing
+- `smart_detect`: browser-UA retry pass for stubborn sites, shared yt-dlp binary config
+
+### Security
+- Plugin installs: SSRF guard (https-only, public hosts), Zip-Slip protection, 30 MB / 200-entry caps, 90 s per-call timeout, module caching
+- Site routing now matches parsed hostnames instead of raw substring tests (`notinstagram.com` no longer misroutes)
+
+### Fixed
+- Shazam recognition was completely broken since v1.0.0 (code-generation quoting bug) — every lookup failed silently
+- Fake semaphore bug: concurrency limit in the download queue had no effect
+
 ## [1.0.0] - 2026-08-05
+
 ### Added
 - Initial release
 - Multi-language support (fa/en default full; tr/ru/de/es via extra packs)
@@ -17,19 +38,3 @@ All notable changes to the Rayan Downloader Bot.
 - Fast concurrent downloads (yt-dlp `-N 8`), MP3 conversion, playlists
 - Local Bot API server support (2GB uploads)
 - First-run language prompt (English default)
-
-### Fixed
-- Twitter long-tweet truncation (fxtwitter full-text fallback)
-- Force-join "permanent pass" bug (confirmation expiry + always re-check checkable channels)
-- Admin panel back-button navigation error
-
-## [1.1.0] - 2026-08-05
-### Changed
-- Package renamed `rayan_dl_bot_v3` -> `rayan_dl_bot` (no version suffix); entry `rayan_dl_bot_main.py`
-- Removed all version-suffix references from user-facing texts
-- Register slash-command menu via set_my_commands (private + admin scope) — commands now appear when typing '/'
-- `group_help` shows privacy-mode guidance (add bot as group admin)
-
-### Performance
-- Global download concurrency cap (asyncio.Semaphore(2)) — prevents CPU/RAM spikes on concurrent downloads
-- yt-dlp runs as subprocess only (not imported as module) — keeps RSS ~49MB, idle CPU <1%
