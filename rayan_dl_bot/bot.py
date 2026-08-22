@@ -3182,15 +3182,18 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     keyboard.append([InlineKeyboardButton(i18n.t(lang, "mp3_only"), callback_data=f"dl|{dl_id}|audio")])
     keyboard.append([InlineKeyboardButton("🎵 تشخیص آهنگ", callback_data=f"dl|{dl_id}|shazam")])
 
-    # Subtitle button ONLY when the video actually has subtitles (fast check, cached per dl_id)
+    # Subtitle button ONLY when the video actually has subtitles.
+    # FAST: read from the info dict we ALREADY have (no second yt-dlp call — saves ~10s).
     sub_langs = None
     if site == "youtube":
         try:
-            subs_info = await asyncio.to_thread(dl.list_available_subs, url)
-            if subs_info:
-                langs = subs_info.get("manual") or []
-                pref = [x for x in ("en", "fa", "de", "es", "fr", "ar") if x in langs]
-                sub_langs = pref[0] if pref else (langs[0] if langs else ("en" if subs_info.get("auto") else None))
+            manual_langs = list((info.get("subtitles") or {}).keys())
+            manual_langs = [x for x in manual_langs if not x.endswith("-orig")]
+            has_auto = bool(info.get("automatic_captions"))
+            pref = [x for x in ("en", "fa", "de", "es", "fr", "ar") if x in manual_langs]
+            sub_langs = (pref[0] if pref else
+                         (manual_langs[0] if manual_langs else
+                          ("en" if has_auto else None)))
         except Exception as e:
             log.warning("subs probe: %s", e)
         if sub_langs:
@@ -3413,10 +3416,14 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if not (srt and os.path.exists(srt)):
             await q.message.reply_text(i18n.t(lang, "download_failed"))
             return
-        # remember title for file naming
+        # remember title + quality for file naming and downloads
         info_d = context.user_data.get(f"dl_{dl_id}") or {}
         vtitle = ((info_d.get("info") or {}).get("title") or "video")[:60].strip()
-        safe_title = re.sub(r"[^\\w\\s()-]", "", vtitle) or "video"
+        safe_title = re.sub(r"[^\w\s()-]", "", vtitle) or "video"
+        hs_heights = info_d.get("heights") or []
+        # hardsub decodes the WHOLE video in RAM — cap at 720p on this 2GB box
+        hs_q = int(hs_heights[0]) if hs_heights else 720
+        hs_quality = str(min(hs_q, 720))
 
         # translation into UI language happens at the end for every mode
         async def _send_srt_and_translation():
@@ -3456,7 +3463,8 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 "🎬 در حال ساخت نسخه‌ی سافت‌ساب (MKV با تراک زیرنویس)... چند دقیقه طول میکشه")
             mkv = await asyncio.to_thread(
                 dl.download_video_with_subs, sub_url, sublang,
-                os.path.join(DOWNLOAD_DIR, f"ss_{uid}_{dl_id}.mkv"), None)
+                os.path.join(DOWNLOAD_DIR, f"ss_{uid}_{dl_id}.mkv"),
+                int(hs_quality) if str(hs_quality).isdigit() else None)
             try:
                 await msg2.delete()
             except Exception:
@@ -3481,7 +3489,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             msg3 = await q.message.reply_text(
                 "🔥 در حال دانلود ویدیو و حک کردن زیرنویس... (بسته به طول ویدیو ممکنه کمی طول بکشه)")
             base_vid = os.path.join(DOWNLOAD_DIR, f"hs_{uid}_{dl_id}")
-            vid_ok = await _limited_download(sub_url, "best", False, base_vid + ".mp4")
+            vid_ok = await _limited_download(sub_url, hs_quality, False, base_vid + ".mp4")
             src_v = resolve_out_path(base_vid + ".mp4")
             if not (vid_ok and src_v and os.path.exists(src_v)):
                 try:

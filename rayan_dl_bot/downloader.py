@@ -702,12 +702,12 @@ def download_video_with_subs(url: str, lang: str, out_path: str,
     d = os.path.dirname(out_path) or "."
     stem = os.path.join(d, f"subbed_{int(time.time())}")
     proxy = get_proxy_args(url)
-    vf = f"bestvideo[height<={height}]+bestaudio/best" if height else "bv*+ba/b"
-    fmt = ["-f", vf, "-S", "ext"] if "+" in vf else ["-f", vf]
+    vf = (f"bestvideo[height<={height}]+bestaudio/best"
+          if height else "bestvideo+bestaudio/best")
     cmd = [YTDLP, *JS_RUNTIME, *proxy,
-           "--embed-subs", "--sub-langs", f"{lang}.*:{lang}",
+           "--embed-subs", "--write-subs", "--sub-langs", lang,
            "--merge-output-format", "mkv",
-           *fmt, "--no-playlist", "--no-check-certificates",
+           "-f", vf, "--no-playlist", "--no-check-certificates",
            "-o", stem, url]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
@@ -730,12 +730,15 @@ def burn_subtitles(video_path: str, srt_path: str, out_path: str) -> str | None:
     Slow (re-encodes video). Returns out_path or None."""
     try:
         safe = srt_path.replace("'", "\\'")
+        # 2GB-RAM guard: cap decoder threads so AV1/1080p sources can't OOM-kill us
         c = subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error", "-i", video_path,
+            ["ffmpeg", "-y", "-loglevel", "error",
+             "-threads", "2", "-i", video_path,
              "-vf", f"subtitles={safe}:force_style='FontName=Vazirmatn,FontSize=22,"
                     f"PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
                     f"Outline=2,MarginV=25'",
              "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+             "-threads", "2",
              "-c:a", "copy", out_path],
             capture_output=True, text=True, timeout=3600)
         if c.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 10000:
