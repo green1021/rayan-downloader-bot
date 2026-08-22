@@ -2440,6 +2440,57 @@ async def channels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("\n".join(lines))
 
 
+async def _send_album(context, chat_id: int, media: list, caption: str = None) -> None:
+    """Send a mixed video/photo list as ONE Telegram album (Twitter-carousel style).
+    media: list of ("video"|"photo", abs_path). Caption goes on the first item.
+    Falls back to individual sends if the group send fails."""
+    if not media:
+        return
+    from telegram import InputMediaPhoto, InputMediaVideo
+    grouped = False
+    try:
+        items = []
+        for i, (kind, path) in enumerate(media[:10]):
+            fh = open(path, "rb")
+            cap_args = {}
+            if i == 0 and caption:
+                cap_args = {"caption": caption, "parse_mode": "Markdown"}
+            if kind == "video":
+                items.append(InputMediaVideo(fh, supports_streaming=True, **cap_args))
+            else:
+                items.append(InputMediaPhoto(fh, **cap_args))
+        if len(items) > 1:
+            await context.bot.send_media_group(chat_id=chat_id, media=items)
+            grouped = True
+        elif len(items) == 1:
+            # single item — plain send (media groups require >=2)
+            kind, path = media[0]
+            if kind == "video":
+                await context.bot.send_video(chat_id=chat_id, video=open(path, "rb"),
+                                             caption=caption, parse_mode="Markdown" if caption else None,
+                                             supports_streaming=True)
+            else:
+                await context.bot.send_photo(chat_id=chat_id, photo=open(path, "rb"),
+                                             caption=caption, parse_mode="Markdown" if caption else None)
+            grouped = True
+    except Exception as e:
+        log.warning("album send failed (%s), falling back to singles", e)
+        grouped = False
+    if not grouped:
+        # Fallback: send individually with caption on the first
+        for i, (kind, path) in enumerate(media[:10]):
+            cap = caption if i == 0 else None
+            try:
+                if kind == "video":
+                    await context.bot.send_video(chat_id=chat_id, video=open(path, "rb"), caption=cap,
+                                                 parse_mode="Markdown" if cap else None, supports_streaming=True)
+                else:
+                    await context.bot.send_photo(chat_id=chat_id, photo=open(path, "rb"), caption=cap,
+                                                 parse_mode="Markdown" if cap else None)
+            except Exception as e:
+                log.warning("single media fallback failed: %s", e)
+
+
 # ── Main link handler ─────────────────────────────────────────
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Guard: this handler is registered on filters.TEXT which also fires for
@@ -2701,47 +2752,59 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             name=dl._esc_md(tw_full.get("user_name") or ""), screen=dl._esc_md(tw_full.get("user_screen") or ""),
             text=text, qname=dl._esc_md(q.get("user_name") or ""), qscreen=dl._esc_md(q.get("user_screen") or ""),
             qtext=qtext)
+        # Twitter-style layout: author+text message, then ONE album with ALL main media
+        # (videos+photos interleaved like the tweet's carousel), then quoted media as its own block.
         await status_msg.delete()
-        await update.message.reply_text(msg_text, disable_web_page_preview=True)
-        # Send MAIN tweet videos first (multi-video tweets were silently dropped before)
-        sent_any_media = False
-        main_videos = (tw_full.get("video_urls") or [])[:4]
-        for i, v_url in enumerate(main_videos):
+
+        # ── Download main media first (so we can group into one album) ──
+        main_media = []  # list of ("video"|"photo", path)
+        for i, v_url in enumerate((tw_full.get("video_urls") or [])[:4]):
             v_path = os.path.join(DOWNLOAD_DIR, f"twq_{uid}_{i}_{int(time.time())}.mp4")
             ok_v = await asyncio.to_thread(igtw.download_twitter, url, "best", v_path, v_url)
             if ok_v and os.path.exists(v_path) and os.path.getsize(v_path) > 0:
-                # Caption: main tweet text on the FIRST video only
-                cap = f"🐦 **{dl._esc_md(tw_full.get('user_name') or '')}** (@{dl._esc_md(tw_full.get('user_screen') or '')}):\n\n{text}" if i == 0 else None
-                try:
-                    await context.bot.send_video(chat_id=update.effective_chat.id, video=open(v_path, "rb"),
-                                                 caption=cap, parse_mode="Markdown", supports_streaming=True)
-                except Exception:
-                    await context.bot.send_video(chat_id=update.effective_chat.id, video=open(v_path, "rb"),
-                                                 supports_streaming=True)
-                sent_any_media = True
-            dl.cleanup(v_path)
-        # Send the MAIN tweet photos, then the QUOTED tweet photos
-        all_photo_urls = (tw_full.get("photos") or []) + (q.get("photos") or [])
-        for i, photo_url in enumerate(all_photo_urls[:8]):
-            p_path = os.path.join(DOWNLOAD_DIR, f"twq_{uid}_{i}_{int(time.time())}.jpg")
+                main_media.append(("video", v_path))
+        for i, photo_url in enumerate((tw_full.get("photos") or [])[:8]):
+            p_path = os.path.join(DOWNLOAD_DIR, f"twqp_{uid}_{i}_{int(time.time())}.jpg")
             ok_p = await asyncio.to_thread(igtw.download_twitter_photo, photo_url, p_path)
-            if ok_p:
-                await context.bot.send_photo(chat_id=update.effective_chat.id, photo=open(p_path, "rb"))
+            if ok_p and os.path.exists(p_path) and os.path.getsize(p_path) > 0:
+                main_media.append(("photo", p_path))
+
+        sent_any_media = False
+        if main_media:
+            main_cap = i18n.t(lang, "tw_tweet_header").format(
+                name=dl._esc_md(tw_full.get("user_name") or ""), screen=dl._esc_md(tw_full.get("user_screen") or ""),
+                text=text, likes=tw_full.get("favorite_count") or 0, rts=tw_full.get("retweet_count") or 0)
+            await update.message.reply_text(msg_text, disable_web_page_preview=True)
+            try:
+                await _send_album(context, update.effective_chat.id, main_media, main_cap)
                 sent_any_media = True
-            dl.cleanup(p_path)
-        # Quoted tweet video(s), captioned with the quoted text
+            except Exception as e:
+                log.warning("quote album failed, falling back to singles: %s", e)
+        else:
+            await update.message.reply_text(msg_text, disable_web_page_preview=True)
+
+        # ── Quoted tweet media as its own album (Twitter shows it attached below) ──
+        quoted_media = []
         for j, v_url in enumerate((q.get("video_urls") or [])[:1]):
             v_path = os.path.join(DOWNLOAD_DIR, f"twqv_{uid}_{j}_{int(time.time())}.mp4")
             ok_v = await asyncio.to_thread(igtw.download_twitter, url, "best", v_path, v_url)
             if ok_v and os.path.exists(v_path) and os.path.getsize(v_path) > 0:
-                cap = f"💬 **{dl._esc_md(q.get('user_name') or '')}** (@{dl._esc_md(q.get('user_screen') or '')}):\n\n{qtext}"
-                try:
-                    await context.bot.send_video(chat_id=update.effective_chat.id, video=open(v_path, "rb"),
-                                                 caption=cap, parse_mode="Markdown", supports_streaming=True)
-                except Exception:
-                    await context.bot.send_video(chat_id=update.effective_chat.id, video=open(v_path, "rb"))
+                quoted_media.append(("video", v_path))
+        for j, photo_url in enumerate((q.get("photos") or [])[:8]):
+            p_path = os.path.join(DOWNLOAD_DIR, f"twqf_{uid}_{j}_{int(time.time())}.jpg")
+            ok_p = await asyncio.to_thread(igtw.download_twitter_photo, photo_url, p_path)
+            if ok_p and os.path.exists(p_path) and os.path.getsize(p_path) > 0:
+                quoted_media.append(("photo", p_path))
+        if quoted_media:
+            q_cap = i18n.t(lang, "tw_quote_header").format(
+                name=dl._esc_md(q.get("user_name") or ""), screen=dl._esc_md(q.get("user_screen") or ""), text=qtext)
+            try:
+                await _send_album(context, update.effective_chat.id, quoted_media, q_cap)
                 sent_any_media = True
-            dl.cleanup(v_path)
+            except Exception as e:
+                log.warning("quoted album failed: %s", e)
+        for _, p in main_media + quoted_media:
+            dl.cleanup(p)
         db.record_download(uid, url, "twitter", "quote", sent_any_media)
         await asyncio.to_thread(enforce_disk_limit)
         return
@@ -2755,13 +2818,22 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 text = dl._esc_md((t.get("text") or "")[:500])
                 header = i18n.t(lang, "tw_thread_item").format(n=i, name=dl._esc_md(t.get("user_name") or ""), text=text)
                 await update.message.reply_text(header, disable_web_page_preview=True)
-                # Send photos for each tweet in the thread
-                for photo_url in t.get("photos", [])[:4]:
-                    p_path = os.path.join(DOWNLOAD_DIR, f"twth_{uid}_{i}_{int(time.time())}.jpg")
+                # Send photos for each tweet in the thread as ONE album
+                th_photos = []
+                for j, photo_url in enumerate(t.get("photos", [])[:4]):
+                    p_path = os.path.join(DOWNLOAD_DIR, f"twth_{uid}_{i}_{j}_{int(time.time())}.jpg")
                     ok_p = await asyncio.to_thread(igtw.download_twitter_photo, photo_url, p_path)
-                    if ok_p:
-                        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=open(p_path, "rb"))
-                        dl.cleanup(p_path)
+                    if ok_p and os.path.exists(p_path) and os.path.getsize(p_path) > 0:
+                        th_photos.append(("photo", p_path))
+                if len(th_photos) > 1:
+                    try:
+                        await _send_album(context, update.effective_chat.id, th_photos)
+                    except Exception as e:
+                        log.warning("thread album failed: %s", e)
+                elif th_photos:
+                    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=open(th_photos[0][1], "rb"))
+                for _, p in th_photos:
+                    dl.cleanup(p)
             db.record_download(uid, url, "twitter", "thread", True)
             try:
                 await status_msg.delete()
@@ -2778,20 +2850,21 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 name=dl._esc_md(tw_full.get("user_name") or ""), screen=dl._esc_md(tw_full.get("user_screen") or ""),
                 text=dl._esc_md((tw_full.get("text") or "")[:400]),
                 likes=tw_full.get("favorite_count") or 0, rts=tw_full.get("retweet_count") or 0)
-            sent_first = False
-            for photo_url in tw_full["photos"][:10]:
-                p_path = os.path.join(DOWNLOAD_DIR, f"twp_{uid}_{int(time.time())}.jpg")
+            photo_paths = []
+            for i, photo_url in enumerate(tw_full["photos"][:10]):
+                p_path = os.path.join(DOWNLOAD_DIR, f"twp_{uid}_{i}_{int(time.time())}.jpg")
                 ok_p = await asyncio.to_thread(igtw.download_twitter_photo, photo_url, p_path)
-                if ok_p:
-                    if not sent_first:
-                        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=open(p_path, "rb"), caption=header)
-                        sent_first = True
-                    else:
-                        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=open(p_path, "rb"))
-                    dl.cleanup(p_path)
-            if not sent_first:
+                if ok_p and os.path.exists(p_path) and os.path.getsize(p_path) > 0:
+                    photo_paths.append(("photo", p_path))
+            if not photo_paths:
                 await status_msg.edit_text(i18n.t(lang, "tw_no_media").format(text=(tw_full.get("text") or "")[:400]))
             else:
+                try:
+                    await _send_album(context, update.effective_chat.id, photo_paths, header)
+                except Exception as e:
+                    log.warning("photos album failed: %s", e)
+                for _, p in photo_paths:
+                    dl.cleanup(p)
                 db.record_download(uid, url, "twitter", "photos", True)
                 try:
                     await status_msg.delete()
