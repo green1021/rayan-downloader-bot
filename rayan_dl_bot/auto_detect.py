@@ -25,11 +25,16 @@ log = logging.getLogger("rayan-dl")
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 
-# image URL patterns (absolute or relative)
+# image URL patterns — src attributes only (href= links are navigation, not content)
 IMG_PAT = re.compile(
-    r'(?:src|data-src|data-original|href)=["\']([^"\']+\.(?:jpg|jpeg|png|webp|avif))["\']',
+    r'(?:src|data-src|data-original)=["\']([^"\']+\.(?:jpg|jpeg|png|webp|avif))["\']',
     re.IGNORECASE)
+# video URLs must appear in a media context (video/source tag or common player attrs)
 VIDEO_PAT = re.compile(
+    r'(?:(?:<video[^>]*|<source[^>]*|data-video[-a-z]*|file:)[^\w])?["\']([^"\']+\.(?:mp4|m3u8|webm|mov))["\']',
+    re.IGNORECASE)
+# standalone fallback (any quoted video URL) — lower confidence only
+VIDEO_ANY_PAT = re.compile(
     r'["\']([^"\']+\.(?:mp4|m3u8|webm|mov))["\']', re.IGNORECASE)
 # comic/manga reader markers (many sequential pages)
 READER_PAT = re.compile(
@@ -129,7 +134,10 @@ def detect(url: str) -> dict:
         return {"type": "error", "error": "empty page", "count": 0, "confidence": 0}
 
     imgs = _img_count(html)
-    videos = list(dict.fromkeys(VIDEO_PAT.findall(html)))
+    # strip <script> before video scanning — JSON-LD/ad blobs cause false positives
+    html_noscript = re.sub(r"<script.*?</script>", " ", html, flags=re.DOTALL)
+    videos = list(dict.fromkeys(VIDEO_PAT.findall(html_noscript)))
+    vids_weak = list(dict.fromkeys(VIDEO_ANY_PAT.findall(html_noscript)))
     text_len = len(re.sub(r"<[^>]+>", " ", re.sub(r"<script.*?</script>", " ", html, flags=re.DOTALL)).strip())
     reader_hint = bool(READER_PAT.search(html))
 
@@ -143,7 +151,9 @@ def detect(url: str) -> dict:
     if reader_hint and n_imgs >= 8:
         return {"type": "comic", "count": n_imgs, "samples": imgs[:3],
                 "confidence": 85, "detail": f"{n_imgs} صفحه کمیک پیدا شد"}
-    if n_imgs >= 8:
+    # comic WITHOUT reader marker is risky (news galleries) — only call it comic
+    # when there are no videos AND images dominate; else treat as photos
+    if n_imgs >= 8 and not vids_weak:
         return {"type": "comic", "count": n_imgs, "samples": imgs[:3],
                 "confidence": 65, "detail": f"{n_imgs} عکس متوالی (شبیه کمیک)"}
     if 1 < n_imgs < 8:
@@ -152,6 +162,10 @@ def detect(url: str) -> dict:
     if n_vids > 0:
         return {"type": "video", "count": n_vids, "samples": videos[:3],
                 "confidence": 60, "detail": f"{n_vids} ویدیو پیدا شد"}
+    # weak evidence: stray mp4 strings in scripts — low confidence guess
+    if vids_weak:
+        return {"type": "video", "count": len(vids_weak), "samples": vids_weak[:3],
+                "confidence": 40, "detail": f"{len(vids_weak)} لینک ویدیوی احتمالی"}
     if text_len > 400:
         return {"type": "text", "count": text_len, "samples": [],
                 "confidence": 55, "detail": f"محتوای متنی ({text_len} کاراکتر)"}
@@ -270,11 +284,23 @@ def smart_detect(url: str, probe_timeout: int = 18) -> dict:
     import json as _json
     import subprocess as _sp
     try:
+        from downloader import YTDLP as _YTDLP, JS_RUNTIME as _JSR
+    except ImportError:  # standalone/testing
+        _YTDLP, _JSR = "/usr/local/bin/yt-dlp", []
+    try:
         r = _sp.run(
-            ["/root/hermes-workspace/venv/bin/yt-dlp", "-J", "--no-warnings",
+            [_YTDLP, *_JSR, "-J", "--no-warnings",
              "--skip-download", "--no-check-certificates", "--socket-timeout", "8",
-             url],
+             "--js-runtimes", "node:/usr/bin/node", url],
             capture_output=True, text=True, timeout=probe_timeout)
+        if r.returncode != 0 or not (r.stdout or "").strip():
+            # RETRY with generic extractor forced + referer (some sites need it)
+            r = _sp.run(
+                [_YTDLP, *_JSR, "-J", "--no-warnings",
+                 "--skip-download", "--no-check-certificates", "--socket-timeout", "8",
+                 "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+                 url],
+                capture_output=True, text=True, timeout=probe_timeout)
     except Exception as e:
         log.info("ytdlp probe failed: %s", e)
         return detect(url)

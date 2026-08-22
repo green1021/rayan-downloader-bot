@@ -28,6 +28,7 @@ import i18n
 import db
 import linkcache
 import dlqueue
+import cdncache
 import downloader as dl
 import ig_tw as igtw
 import recognizer as recog
@@ -85,6 +86,24 @@ def _sem_value() -> int:
         return max(1, min(v, 6))  # sane bounds
     except Exception:
         return 2
+
+
+_chat_rate = {}
+
+
+def chat_rate_limited(chat_id: int, seconds: int = 5) -> bool:
+    """Per-CHAT cooldown for groups: prevents one busy group from flooding
+    the queue when many members paste links at once. 1 download / 5s / chat."""
+    now = time.time()
+    last = _chat_rate.get(chat_id, 0)
+    if now - last < seconds:
+        return True
+    _chat_rate[chat_id] = now
+    if len(_chat_rate) > 200:
+        cutoff = now - 600
+        for cid in [c for c, ts in _chat_rate.items() if ts < cutoff]:
+            del _chat_rate[cid]
+    return False
 
 
 def rate_limited(user_id: int, seconds: int = 8) -> bool:
@@ -235,12 +254,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     lang = lang_of(update)
+    # Personalized greeting: name + lifetime stats + fresh feature hints
+    name = (update.effective_user.first_name or "").strip()
+    n_dl = db.count_user_downloads(update.effective_user.id)
+    base = i18n.t(lang, "start")
+    if name:
+        hi = f"سلام {name}! 👋\n\n" if lang == "fa" else f"Hey {name}! 👋\n\n"
+        base = hi + base
+    if n_dl > 0:
+        stats_line = (f"📊 تا الان **{n_dl}** دانلود با من انجام دادی — قهرمان! 🏆\n\n"
+                      if lang == "fa" else
+                      f"📊 You've made **{n_dl}** downloads with me — legend! 🏆\n\n")
+        base = base + stats_line
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(i18n.t(lang, "help_btn"), callback_data="help"),
          InlineKeyboardButton(i18n.t(lang, "history_btn"), callback_data="history")],
         [InlineKeyboardButton(i18n.t(lang, "choose_site"), callback_data="lang")],
     ])
-    await update.message.reply_text(i18n.t(lang, "start"), parse_mode="Markdown",
+    await update.message.reply_text(base, parse_mode="Markdown",
                                     disable_web_page_preview=True, reply_markup=kb)
 
 
@@ -1860,6 +1891,35 @@ async def group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "\n\n🎛 برای انتخاب رسانه‌ها: /setmedia\n🔍 فیلتر لینک: /setfilter")
 
 
+async def group_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bot added to a new group → friendly intro for admins/members."""
+    msg = update.message or update.effective_message
+    if not msg or not msg.new_chat_members:
+        return
+    me = await context.bot.get_me()
+    if not any(m.id == me.id for m in msg.new_chat_members):
+        return
+    text = (
+        "👋 **سلام! من رایان دانلودر هستم** 🎬\n\n"
+        "هر لینکی تو گروه بفرستید براتون دانلود می‌کنم:\n"
+        "🔹 یوتیوب • اینستاگرام • توییتر • تیک‌تاک • آپارات و ده‌ها سایت دیگه\n"
+        "🎵 MP3 • 💬 زیرنویس یوتیوب • 🔎 تشخیص آهنگ\n\n"
+        "⚙️ **تنظیمات گروه (فقط ادمین‌ها):**\n"
+        "/groupsettings — وضعیت تنظیمات\n"
+        "/setquality — حداکثر کیفیت\n"
+        "/setmedia — نوع رسانه‌های مجاز\n"
+        "/setfilter — فیلتر لینک‌ها\n"
+        "/autodl — دانلود خودکار روشن/خاموش\n"
+        "/silent — حالت بی‌صدا\n"
+        "/commandonly — فقط با دستور دانلود کنه\n\n"
+        "💡 همین الان یه لینک بفرستید تا شروع کنیم!"
+    )
+    try:
+        await msg.reply_text(text, parse_mode="Markdown", disable_web_page_preview=True)
+    except Exception as e:
+        log.warning("group_welcome: %s", e)
+
+
 async def setquality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
@@ -2570,14 +2630,18 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if rate_limited(uid):
         await update.message.reply_text(i18n.t(lang, "rate_limit"))
         return
+    # Group-wide pacing (private chats unaffected)
+    if is_group and chat_rate_limited(chat.id):
+        return  # silently skip — no spam in the group
 
     site = dl.detect_site(url)
 
     # ── DUPLICATE LINK CACHE: same link within 30 min → instant re-serve ──
     cached = linkcache.get(url)
-    if cached and not is_group:
+    # text cache only for private chats; media (file) cache also serves groups
+    if cached and (not is_group or cached.get("type") == "media"):
         ctype = cached.get("type")
-        if ctype == "text":
+        if ctype == "text" and not is_group:
             await update.message.reply_text(cached.get("text", ""), disable_web_page_preview=True,
                                             parse_mode=cached.get("parse_mode") or "Markdown")
             db.record_download(uid, url, site, "cached", True)
@@ -3104,6 +3168,22 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     keyboard.append([InlineKeyboardButton(i18n.t(lang, "mp3_only"), callback_data=f"dl|{dl_id}|audio")])
     keyboard.append([InlineKeyboardButton("🎵 تشخیص آهنگ", callback_data=f"dl|{dl_id}|shazam")])
 
+    # Subtitle button ONLY when the video actually has subtitles (fast check, cached per dl_id)
+    sub_langs = None
+    if site == "youtube":
+        try:
+            subs_info = await asyncio.to_thread(dl.list_available_subs, url)
+            if subs_info:
+                langs = subs_info.get("manual") or []
+                pref = [x for x in ("en", "fa", "de", "es", "fr", "ar") if x in langs]
+                sub_langs = pref[0] if pref else (langs[0] if langs else ("en" if subs_info.get("auto") else None))
+        except Exception as e:
+            log.warning("subs probe: %s", e)
+        if sub_langs:
+            keyboard.insert(1, [InlineKeyboardButton(i18n.t(lang, "subs_available"),
+                                                     callback_data=f"sub|{dl_id}|{sub_langs}")])
+            context.user_data[f"suburl_{dl_id}"] = url
+
     await status_msg.edit_text(i18n.t(lang, "downloading").format(title=info.get("title", "")[:80], quality=f"{best}p"),
                                parse_mode="Markdown")
 
@@ -3120,6 +3200,26 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 parse_mode="Markdown")
         except Exception:
             pass
+
+    # ── TELEGRAM CDN CACHE: same URL+quality sent before → instant re-send, no download ──
+    cdn = cdncache.get(f"{url}|{best}")
+    if cdn and cdn.get("kind") == "video":
+        try:
+            await context.bot.send_video(
+                chat_id=update.effective_chat.id,
+                video=cdn["file_id"],
+                caption=cdn.get("caption") or caption,
+                parse_mode="Markdown" if (cdn.get("caption") or caption) else None,
+                supports_streaming=True,
+            )
+            db.record_download(uid, url, site, f"{best} (cdn)", True)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            return
+        except Exception as e:
+            log.info("cdn re-send failed, downloading fresh: %s", str(e)[:80])
 
     ok = await _limited_download(url, str(best), False, out_path)
     out_path = resolve_out_path(out_path)
@@ -3180,6 +3280,16 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if sent:
         await status_msg.delete()
         context.user_data[f"more_{dl_id}"] = keyboard
+        # Save Telegram file_id → future requests of the same URL re-send instantly from TG CDN
+        try:
+            tg_id = getattr(sent, "video", None) or sent
+            fid = getattr(tg_id, "file_id", None)
+            if fid:
+                cdncache.put(f"{url}|{best}", fid, "video", caption)
+                # free the local copy — no longer needed (CDN has it)
+                dl.cleanup(out_path)
+        except Exception as e:
+            log.debug("cdncache put: %s", e)
 
     await asyncio.to_thread(enforce_disk_limit)
 
@@ -3227,6 +3337,35 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     parts = data.split("|")
+    if len(parts) >= 3 and parts[0] == "sub":
+        # ── Subtitle download callback: sub|<dl_id>|<lang> ──
+        dl_id, sublang = parts[1], parts[2]
+        sub_url = context.user_data.get(f"suburl_{dl_id}")
+        if not sub_url:
+            await q.answer()
+            await q.message.reply_text(i18n.t(lang, "link_expired"))
+            return
+        try:
+            await q.answer(i18n.t(lang, "subs_sending").format(lang=sublang))
+        except Exception:
+            pass
+        status_s = await q.message.reply_text(i18n.t(lang, "subs_sending").format(lang=sublang))
+        srt = await asyncio.to_thread(dl.download_subtitle, sub_url, sublang,
+                                      os.path.join(DOWNLOAD_DIR, f"sub_{uid}_{dl_id}.srt"))
+        try:
+            await status_s.delete()
+        except Exception:
+            pass
+        if srt and os.path.exists(srt):
+            with open(srt, "rb") as fh:
+                await q.message.reply_document(document=fh,
+                                               filename=f"subtitles_{sublang}.srt")
+            dl.cleanup(srt)
+            db.record_download(uid, sub_url, "youtube", f"subs:{sublang}", True)
+        else:
+            await q.message.reply_text(i18n.t(lang, "download_failed"))
+        return
+
     if len(parts) < 3 or parts[0] != "dl":
         return
 
@@ -3441,6 +3580,8 @@ async def _register_commands(app) -> None:
 
 def main():
     db.init_db()
+    cdncache.install_db_helpers()
+    cdncache.ensure_table()
     app = ApplicationBuilder().token(BOT_TOKEN).base_url("http://127.0.0.1:8081/bot").build()
 
     app.add_handler(CommandHandler("start", start))
@@ -3468,6 +3609,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     app.add_handler(MessageHandler(filters.TEXT & filters.COMMAND, admin_input))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_bot_added))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, group_welcome))
     # Shazam: recognize song from audio/video files
     app.add_handler(MessageHandler(
         filters.AUDIO | filters.VIDEO | filters.VOICE | filters.VIDEO_NOTE

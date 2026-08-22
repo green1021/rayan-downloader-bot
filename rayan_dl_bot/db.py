@@ -399,6 +399,19 @@ def set_user_settings(user_id: int, default_quality=None, default_audio=None):
         log.error("set_user_settings: %s", e)
 
 
+def count_user_downloads(user_id: int) -> int:
+    """Total successful downloads for a user."""
+    try:
+        c = _conn()
+        row = c.execute(
+            "SELECT COUNT(*) FROM downloads WHERE user_id = ? AND success = 1",
+            (user_id,)).fetchone()
+        c.close()
+        return row[0] if row else 0
+    except Exception:
+        return 0
+
+
 def record_download(user_id: int, url: str, site: str, quality: str, success: bool):
     try:
         now = datetime.utcnow().isoformat()
