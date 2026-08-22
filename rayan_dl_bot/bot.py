@@ -2703,25 +2703,46 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             qtext=qtext)
         await status_msg.delete()
         await update.message.reply_text(msg_text, disable_web_page_preview=True)
-        # Send the MAIN tweet photos, then the QUOTED tweet photos (if any)
+        # Send MAIN tweet videos first (multi-video tweets were silently dropped before)
+        sent_any_media = False
+        main_videos = (tw_full.get("video_urls") or [])[:4]
+        for i, v_url in enumerate(main_videos):
+            v_path = os.path.join(DOWNLOAD_DIR, f"twq_{uid}_{i}_{int(time.time())}.mp4")
+            ok_v = await asyncio.to_thread(igtw.download_twitter, url, "best", v_path, v_url)
+            if ok_v and os.path.exists(v_path) and os.path.getsize(v_path) > 0:
+                # Caption: main tweet text on the FIRST video only
+                cap = f"🐦 **{dl._esc_md(tw_full.get('user_name') or '')}** (@{dl._esc_md(tw_full.get('user_screen') or '')}):\n\n{text}" if i == 0 else None
+                try:
+                    await context.bot.send_video(chat_id=update.effective_chat.id, video=open(v_path, "rb"),
+                                                 caption=cap, parse_mode="Markdown", supports_streaming=True)
+                except Exception:
+                    await context.bot.send_video(chat_id=update.effective_chat.id, video=open(v_path, "rb"),
+                                                 supports_streaming=True)
+                sent_any_media = True
+            dl.cleanup(v_path)
+        # Send the MAIN tweet photos, then the QUOTED tweet photos
         all_photo_urls = (tw_full.get("photos") or []) + (q.get("photos") or [])
-        sent_q = False
-        for photo_url in all_photo_urls[:8]:
-            p_path = os.path.join(DOWNLOAD_DIR, f"twq_{uid}_{int(time.time())}.jpg")
+        for i, photo_url in enumerate(all_photo_urls[:8]):
+            p_path = os.path.join(DOWNLOAD_DIR, f"twq_{uid}_{i}_{int(time.time())}.jpg")
             ok_p = await asyncio.to_thread(igtw.download_twitter_photo, photo_url, p_path)
             if ok_p:
                 await context.bot.send_photo(chat_id=update.effective_chat.id, photo=open(p_path, "rb"))
-                sent_q = True
-                dl.cleanup(p_path)
-        # If the quoted tweet has a video, download and send it too
-        for v_url in (q.get("video_urls") or [])[:1]:
-            v_path = os.path.join(DOWNLOAD_DIR, f"twqv_{uid}_{int(time.time())}.mp4")
+                sent_any_media = True
+            dl.cleanup(p_path)
+        # Quoted tweet video(s), captioned with the quoted text
+        for j, v_url in enumerate((q.get("video_urls") or [])[:1]):
+            v_path = os.path.join(DOWNLOAD_DIR, f"twqv_{uid}_{j}_{int(time.time())}.mp4")
             ok_v = await asyncio.to_thread(igtw.download_twitter, url, "best", v_path, v_url)
             if ok_v and os.path.exists(v_path) and os.path.getsize(v_path) > 0:
-                await context.bot.send_video(chat_id=update.effective_chat.id, video=open(v_path, "rb"))
-                dl.cleanup(v_path)
-                sent_q = True
-        db.record_download(uid, url, "twitter", "quote", sent_q)
+                cap = f"💬 **{dl._esc_md(q.get('user_name') or '')}** (@{dl._esc_md(q.get('user_screen') or '')}):\n\n{qtext}"
+                try:
+                    await context.bot.send_video(chat_id=update.effective_chat.id, video=open(v_path, "rb"),
+                                                 caption=cap, parse_mode="Markdown", supports_streaming=True)
+                except Exception:
+                    await context.bot.send_video(chat_id=update.effective_chat.id, video=open(v_path, "rb"))
+                sent_any_media = True
+            dl.cleanup(v_path)
+        db.record_download(uid, url, "twitter", "quote", sent_any_media)
         await asyncio.to_thread(enforce_disk_limit)
         return
 
