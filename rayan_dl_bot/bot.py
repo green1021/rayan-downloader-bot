@@ -26,6 +26,7 @@ from telegram.ext import (
 
 import i18n
 import db
+import linkcache
 import downloader as dl
 import ig_tw as igtw
 import recognizer as recog
@@ -154,6 +155,29 @@ def enforce_disk_limit():
                 pass
     except Exception as e:
         log.error("Disk enforce error: %s", e)
+
+
+async def _fetch_thumb(info: dict, url: str) -> str | None:
+    """Download the thumbnail from info['thumbnail'] to a local jpg. Returns path or None.
+    Thumbnails make videos show a real preview in Telegram's chat list & player."""
+    try:
+        thumb_url = info.get("thumbnail")
+        if not thumb_url:
+            return None
+        tpath = os.path.join(DOWNLOAD_DIR, f"thumb_{hashlib.md5(url.encode()).hexdigest()[:10]}.jpg")
+        if os.path.exists(tpath) and os.path.getsize(tpath) > 0:
+            return tpath  # cached thumb
+        def _dl():
+            r = subprocess.run(
+                ["curl", "-s", "-L", "--max-time", "25", "-A",
+                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "-o", tpath, thumb_url],
+                capture_output=True, text=True, timeout=30)
+            return os.path.exists(tpath) and os.path.getsize(tpath) > 1000
+        ok = await asyncio.to_thread(_dl)
+        return tpath if ok else None
+    except Exception as e:
+        log.warning("thumbnail fetch: %s", e)
+        return None
 
 
 def resolve_out_path(out_path: str) -> str:
@@ -2545,6 +2569,35 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     site = dl.detect_site(url)
 
+    # ── DUPLICATE LINK CACHE: same link within 30 min → instant re-serve ──
+    cached = linkcache.get(url)
+    if cached and not is_group:
+        ctype = cached.get("type")
+        if ctype == "text":
+            await update.message.reply_text(cached.get("text", ""), disable_web_page_preview=True,
+                                            parse_mode=cached.get("parse_mode") or "Markdown")
+            db.record_download(uid, url, site, "cached", True)
+            return
+        if ctype == "media" and cached.get("file_key"):
+            fpath = context.bot_data.get(f"cachefile_{cached['file_key']}")
+            if fpath and os.path.exists(fpath):
+                cap = cached.get("caption")
+                try:
+                    if cached.get("kind") == "photo":
+                        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=open(fpath, "rb"),
+                                                     caption=cap, parse_mode="Markdown" if cap else None)
+                    else:
+                        await context.bot.send_video(chat_id=update.effective_chat.id, video=open(fpath, "rb"),
+                                                     caption=cap, parse_mode="Markdown" if cap else None,
+                                                     supports_streaming=True)
+                    db.record_download(uid, url, site, "cached", True)
+                    return
+                except Exception:
+                    pass  # stale file — fall through to normal processing
+            else:
+                with linkcache._lock:
+                    linkcache._cache.pop(linkcache._norm(url), None)
+
     # ── GROUP LINK FILTER: if the group has a filter, just skip disallowed links ──
     if is_group and site != "other":
         try:
@@ -2559,6 +2612,48 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     return
         except Exception:
             pass
+
+    # ── INSTAGRAM CAROUSEL: multi-photo/video posts → one album ──
+    if site == "instagram":
+        try:
+            car = await asyncio.to_thread(igtw.extract_ig_carousel, url)
+        except Exception:
+            car = {"carousel": False}
+        if car.get("carousel"):
+            items = car.get("items") or []
+            status_msg = await update.message.reply_text(
+                i18n.t(lang, "downloading").format(title=f"Instagram carousel ({car.get('count')} media)", quality=""))
+            album = []
+            for i, (kind, m_url) in enumerate(items[:10]):
+                ext = "mp4" if kind == "video" else "jpg"
+                p = os.path.join(DOWNLOAD_DIR, f"igc_{uid}_{i}_{int(time.time())}.{ext}")
+                def _dl_ig(u=m_url, o=p):
+                    rr = subprocess.run(["curl", "-s", "-L", "--max-time", "120", "-A",
+                                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "-o", o, u],
+                                        capture_output=True, text=True, timeout=130)
+                    return os.path.exists(o) and os.path.getsize(o) > 5000
+                ok_m = await asyncio.to_thread(_dl_ig)
+                if ok_m:
+                    album.append((kind, p))
+            if album:
+                cap = f"📸 **Instagram** — {len(album)} media"
+                try:
+                    await _send_album(context, update.effective_chat.id, album, cap)
+                except Exception as e:
+                    log.warning("ig carousel album: %s", e)
+                for _, p in album:
+                    dl.cleanup(p)
+                db.record_download(uid, url, "instagram", f"carousel:{len(album)}", True)
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+                await asyncio.to_thread(enforce_disk_limit)
+                return
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
 
     # ── PLUGIN ROUTING: a plugin may handle sites the core doesn't support ──
     plugin_meta = pm.find_plugin_for_url(url)
@@ -2954,13 +3049,20 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             info2["quality"] = chosen
             info2["size_str"] = dl.human_size(os.path.getsize(out_path))
             caption = dl.make_caption(info2, lang) if not gs["silent"] else None
-            sent = await context.bot.send_video(
-                chat_id=chat.id,
-                video=open(out_path, "rb"),
-                caption=caption,
-                parse_mode="Markdown",
-                supports_streaming=True,
-            )
+            thumb_path = await _fetch_thumb(info, url)
+            thumb_fh = open(thumb_path, "rb") if thumb_path else None
+            try:
+                sent = await context.bot.send_video(
+                    chat_id=chat.id,
+                    video=open(out_path, "rb"),
+                    caption=caption,
+                    parse_mode="Markdown",
+                    supports_streaming=True,
+                    thumbnail=thumb_fh,
+                )
+            finally:
+                if thumb_fh:
+                    thumb_fh.close()
             db.record_download(uid, url, site, str(chosen), True)
             dl.cleanup(out_path)
             try:
@@ -3023,18 +3125,42 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     info2["size_str"] = dl.human_size(os.path.getsize(out_path))
     caption = dl.make_caption(info2, lang)
 
-    sent = await context.bot.send_video(
-        chat_id=update.effective_chat.id,
-        video=open(out_path, "rb"),
-        caption=caption,
-        parse_mode="Markdown",
-        supports_streaming=True,
-        reply_markup=InlineKeyboardMarkup(keyboard + [
-            [InlineKeyboardButton(i18n.t(lang, "more_qualities"), callback_data=f"more|{dl_id}")]
-        ]),
-    )
+    thumb_path = await _fetch_thumb(info, url)
+    thumb_fh = open(thumb_path, "rb") if thumb_path else None
+    is_gif = bool((info.get("tw_full") or {}).get("is_gif")) and len(heights) <= 1
+    try:
+        if is_gif:
+            # Twitter GIF = silent looping mp4 → send as ANIMATION (loops in Telegram)
+            sent = await context.bot.send_animation(
+                chat_id=update.effective_chat.id,
+                animation=open(out_path, "rb"),
+                caption=caption,
+                parse_mode="Markdown",
+                thumbnail=thumb_fh,
+            )
+        else:
+            sent = await context.bot.send_video(
+                chat_id=update.effective_chat.id,
+                video=open(out_path, "rb"),
+                caption=caption,
+                parse_mode="Markdown",
+                supports_streaming=True,
+                thumbnail=thumb_fh,
+                reply_markup=InlineKeyboardMarkup(keyboard + [
+                    [InlineKeyboardButton(i18n.t(lang, "more_qualities"), callback_data=f"more|{dl_id}")]
+                ]),
+            )
+    finally:
+        if thumb_fh:
+            thumb_fh.close()
     db.record_download(uid, url, site, str(best), True)
-    dl.cleanup(out_path)
+    # Cache for duplicate-link re-serve (register the existing file; skip the cleanup below)
+    if sent and not is_group:
+        fkey = uuid.uuid4().hex[:8]
+        context.bot_data[f"cachefile_{fkey}"] = out_path
+        linkcache.put(url, {"type": "media", "kind": "video", "file_key": fkey, "caption": caption})
+    else:
+        dl.cleanup(out_path)
 
     if sent:
         await status_msg.delete()

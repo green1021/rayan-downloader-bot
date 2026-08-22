@@ -73,13 +73,62 @@ def extract_ig_video_url(post_url: str) -> str | None:
                 break
             url = decoded
         # Trim trailing junk
-        url = re.sub(r'[\\"\'}\s]+$', "", url)
+        url = re.sub(r'[\\\"\'}\s]+$', "", url)
         if not url.startswith("https://"):
             return None
         return url
     except Exception as e:
         log.error("ig extract error: %s", e)
         return None
+
+
+def extract_ig_carousel(post_url: str) -> dict:
+    """Detect an Instagram carousel (multi-media) post via its embed page.
+
+    Returns {"carousel": True, "items": [("video"|"photo", url), ...], "count": N}
+    or {"carousel": False} when the post is single-media (normal flow handles it).
+    The embed HTML embeds an escaped-JSON graph object containing every child's
+    display_url (image) / video_url, so we unescape and scan it."""
+    embed_url = post_url.rstrip("/") + "/embed/"
+    try:
+        r = subprocess.run(
+            ["curl", "-s", "-L", "--max-time", "25", "-A", IG_UA, embed_url],
+            capture_output=True, text=True, timeout=30,
+        )
+        html = r.stdout or ""
+        if not html:
+            return {"carousel": False}
+        # Unescape the layered JSON escapes to a flat string we can regex over
+        flat = html.replace("\\\\/", "/").replace('\\u0026', '&')
+        # Each child block: \"is_video\":true/false ... followed by display_url / video_url
+        items = []
+        seen = set()
+        # videos first (they also have display_url as poster — mark and skip those)
+        video_spans = [(m.start(), m.end()) for m in re.finditer(r'\\\\"is_video\\\\":true', flat)]
+        for s, _ in video_spans:
+            chunk = flat[s:s+4000]
+            vm = re.search(r'\\\\"video_url\\\\":\\\\"(https://[^\\\\"]+\\.mp4[^\\\\"]*)', chunk)
+            if vm and vm.group(1) not in seen:
+                vu = vm.group(1).replace("\\\\u0026", "&")
+                items.append(("video", vu))
+                seen.add(vm.group(1))
+        # photos: display_urls not already claimed by a video poster
+        for pm in re.finditer(r'\\\\"display_url\\\\":\\\\"(https://[^\\\\"]+)', flat):
+            raw = pm.group(1)
+            if raw in seen:
+                continue
+            u = raw.replace("\\\\u0026", "&")
+            if "/t51." not in u and "cdninstagram" not in u:
+                continue
+            if u.endswith((".jpg", ".webp")) or ".jpg" in u:
+                items.append(("photo", u))
+                seen.add(raw)
+        if len(items) <= 1:
+            return {"carousel": False}
+        return {"carousel": True, "items": items[:10], "count": len(items)}
+    except Exception as e:
+        log.warning("ig carousel probe: %s", e)
+        return {"carousel": False}
 
 
 def download_instagram(url: str, out_path: str) -> bool:
@@ -199,10 +248,14 @@ def _build_from_fxtwitter(fx: dict, url: str, twid: str) -> dict:
     media = fx.get("media") or {}
     all_media = media.get("all") or []
     photos = [m["url"] for m in all_media if m.get("type") == "photo" and m.get("url")]
+    # Twitter "GIFs" are silent looping mp4s — fxtwitter reports type "gif".
+    # Treat them as videos (mp4) so they download and send as looping animations.
+    gif_urls = [m["url"] for m in all_media if m.get("type") == "gif" and m.get("url")]
     video_urls = [m["url"] for m in all_media if m.get("type") == "video" and m.get("url")]
     if not video_urls:
         # videos[] also carries direct urls
         video_urls = [v.get("url") for v in (media.get("videos") or []) if v.get("url")]
+    video_urls = (video_urls or []) + (gif_urls or [])
 
     quoted = None
     q = fx.get("quote")
@@ -253,6 +306,9 @@ def _build_from_fxtwitter(fx: dict, url: str, twid: str) -> dict:
         result["type"] = "photos"
     else:
         result["type"] = "text"
+    # GIF flag: all media items were gifs (silent loopers) → bot sends as ANIMATION
+    if gif_urls and not [m for m in all_media if m.get("type") == "video"]:
+        result["is_gif"] = True
     return result
 
 
