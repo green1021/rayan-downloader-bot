@@ -654,6 +654,123 @@ def download_video(url: str, quality: str, is_audio: bool, out_path: str) -> boo
         return False
 
 
+def list_available_subs(url: str) -> dict | None:
+    """Check if a video has manual or auto-generated subtitles.
+    Returns {"manual": [langs], "auto": bool} or None on failure/timeout."""
+    proxy = get_proxy_args(url)
+    try:
+        r = subprocess.run(
+            [YTDLP, *JS_RUNTIME, *proxy, "--list-subs", "--skip-download",
+             "--no-warnings", "--no-check-certificates", url],
+            capture_output=True, text=True, timeout=45)
+        out = r.stdout or ""
+        if not out or "has no subtitles" in out.lower():
+            return None
+        manual, auto = [], False
+        section = None
+        for ln in out.splitlines():
+            l = ln.strip()
+            if "Available subtitles" in l:
+                section = "manual"
+                continue
+            if "Available automatic captions" in l:
+                section = "auto"
+                auto = True
+                continue
+            if l.startswith("Language") or not l or l.startswith("["):
+                continue
+            code = l.split()[0] if l.split() else ""
+            if not code or "-" not in code and len(code) > 5:
+                continue
+            if section == "manual" and code:
+                manual.append(code)
+            elif section == "auto":
+                auto = True
+        return {"manual": manual[:20], "auto": auto}
+    except Exception as e:
+        log.warning("list_subs: %s", e)
+        return None
+
+
+def download_video_with_subs(url: str, lang: str, out_path: str,
+                             height: int | None = None) -> str | None:
+    """Download a video with the subtitle track EMBEDDED (soft subs).
+
+    Uses MKV container so the subtitle stream survives and external players
+    (VLC / MX Player / Infuse) can toggle it. Returns path or None."""
+    import glob as _glob
+    d = os.path.dirname(out_path) or "."
+    stem = os.path.join(d, f"subbed_{int(time.time())}")
+    proxy = get_proxy_args(url)
+    vf = f"bestvideo[height<={height}]+bestaudio/best" if height else "bv*+ba/b"
+    fmt = ["-f", vf, "-S", "ext"] if "+" in vf else ["-f", vf]
+    cmd = [YTDLP, *JS_RUNTIME, *proxy,
+           "--embed-subs", "--sub-langs", f"{lang}.*:{lang}",
+           "--merge-output-format", "mkv",
+           *fmt, "--no-playlist", "--no-check-certificates",
+           "-o", stem, url]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        for cand in sorted(_glob.glob(stem + "*.mkv")):
+            if os.path.getsize(cand) > 10000:
+                return cand
+        # fallback: whatever got produced
+        for ext in ("*.mp4", "*.webm", "*.mkv"):
+            g = _glob.glob(os.path.join(d, stem + "*" + ext.lstrip("*")))
+            if g and os.path.getsize(g[0]) > 10000:
+                return g[0]
+        return None
+    except Exception as e:
+        log.error("download_video_with_subs: %s", e)
+        return None
+
+
+def burn_subtitles(video_path: str, srt_path: str, out_path: str) -> str | None:
+    """HARD-SUB: render the subtitle track onto the video (burn-in) via libass.
+    Slow (re-encodes video). Returns out_path or None."""
+    try:
+        safe = srt_path.replace("'", "\\'")
+        c = subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", video_path,
+             "-vf", f"subtitles={safe}:force_style='FontName=Vazirmatn,FontSize=22,"
+                    f"PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
+                    f"Outline=2,MarginV=25'",
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+             "-c:a", "copy", out_path],
+            capture_output=True, text=True, timeout=3600)
+        if c.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 10000:
+            return out_path
+        log.error("burn_subtitles rc=%s %s", c.returncode, (c.stderr or "")[:200])
+        return None
+    except Exception as e:
+        log.error("burn_subtitles: %s", e)
+        return None
+
+
+def download_subtitle(url: str, lang: str, out_path: str) -> str | None:
+    """Download one subtitle track as .srt (auto-generated allowed).
+    Returns the path of the .srt file or None."""
+    import glob
+    d = os.path.dirname(out_path) or "."
+    stem = f"sub_{int(time.time())}"
+    proxy = get_proxy_args(url)
+    try:
+        r = subprocess.run(
+            [YTDLP, *JS_RUNTIME, *proxy, "--write-subs", "--write-auto-subs",
+             "--sub-langs", lang, "--sub-format", "srt/vtt/best", "--skip-download",
+             "--no-warnings", "--no-check-certificates",
+             "-o", os.path.join(d, stem), url],
+            capture_output=True, text=True, timeout=90)
+        # yt-dlp names it <stem>.<lang>.srt (or .vtt)
+        for f in sorted(glob.glob(os.path.join(d, stem + "*.srt"))) or \
+                 sorted(glob.glob(os.path.join(d, stem + "*.vtt"))):
+            return f
+        return None
+    except Exception as e:
+        log.error("download_subtitle: %s", e)
+        return None
+
+
 def download_playlist(url: str, out_dir: str) -> int:
     """Download a whole playlist. Returns number of files downloaded."""
     proxy = get_proxy_args(url)

@@ -3364,8 +3364,36 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     parts = data.split("|")
     if len(parts) >= 3 and parts[0] == "sub":
-        # ── Subtitle download callback: sub|<dl_id>|<lang> ──
+        # ── Subtitle flow step 1: ask WHICH kind the user wants ──
         dl_id, sublang = parts[1], parts[2]
+        sub_url = context.user_data.get(f"suburl_{dl_id}")
+        if not sub_url:
+            await q.answer()
+            await q.message.reply_text(i18n.t(lang, "link_expired"))
+            return
+        context.user_data[f"suburl_{dl_id}"] = sub_url  # keep for submode callbacks
+        kb_sub = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔥 زیرنویس چسبیده (هاردساب)",
+                                  callback_data=f"submode|{dl_id}|{sublang}|hard")],
+            [InlineKeyboardButton("🎬 زیرنویس جداشدنی (سافت ساب)",
+                                  callback_data=f"submode|{dl_id}|{sublang}|soft")],
+            [InlineKeyboardButton("📄 فقط فایل زیرنویس",
+                                  callback_data=f"submode|{dl_id}|{sublang}|srt")],
+            [InlineKeyboardButton("❓ فرقشون چیه؟",
+                                  callback_data=f"subhelp|{dl_id}")],
+        ])
+        await q.answer()
+        await q.answer()
+        await q.message.reply_text(
+            "💬 چی میخوای؟\n\n"
+            "🔥 **هاردساب:** زیرنویس روی خود ویدیو حک میشه (همیشه معلومه، تو هر پلیری)\n"
+            "🎬 **سافت ساب:** ویدیو به صورت فایل با تراک زیرنویس جدا — تو پلیرهایی مثل VLC خاموش/روشن میشه\n"
+            "📄 **فایل زیرنویس:** فقط srt جدا میاد",
+            parse_mode="Markdown", reply_markup=kb_sub)
+        return
+    if len(parts) >= 4 and parts[0] == "submode":
+        # ── Subtitle flow step 2: execute the chosen mode ──
+        _, dl_id, sublang, mode = parts
         sub_url = context.user_data.get(f"suburl_{dl_id}")
         if not sub_url:
             await q.answer()
@@ -3382,19 +3410,24 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await status_s.delete()
         except Exception:
             pass
-        if srt and os.path.exists(srt):
+        if not (srt and os.path.exists(srt)):
+            await q.message.reply_text(i18n.t(lang, "download_failed"))
+            return
+        # remember title for file naming
+        info_d = context.user_data.get(f"dl_{dl_id}") or {}
+        vtitle = ((info_d.get("info") or {}).get("title") or "video")[:60].strip()
+        safe_title = re.sub(r"[^\\w\\s()-]", "", vtitle) or "video"
+
+        # translation into UI language happens at the end for every mode
+        async def _send_srt_and_translation():
             with open(srt, "rb") as fh:
                 await q.message.reply_document(document=fh,
-                                               filename=f"subtitles_{sublang}.srt")
+                                               filename=f"{safe_title} [{sublang}].srt")
             db.record_download(uid, sub_url, "youtube", f"subs:{sublang}", True)
-            # ── Auto translation into the user's interface language ──
-            # Skip entirely when the subtitle already IS that language
-            # (e.g. English video + English UI → no pointless en→en pass).
             target = lang if sublang != lang else None
             if target:
                 try:
-                    tmsg = await q.message.reply_text(
-                        i18n.t(lang, "subs_translating"))
+                    tmsg = await q.message.reply_text(i18n.t(lang, "subs_translating"))
                     tr_path = srt.replace(".srt", f"_{target}.srt")
                     ok_tr = await asyncio.to_thread(
                         subtitle_translate.translate_srt_file,
@@ -3404,19 +3437,97 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     except Exception:
                         pass
                     if ok_tr and os.path.exists(tr_path):
+                        tr_name = f"{safe_title} [{target}].srt"
                         with open(tr_path, "rb") as fh:
-                            await q.message.reply_document(
-                                document=fh, filename=f"subtitles_{target}.srt")
+                            await q.message.reply_document(document=fh, filename=tr_name)
                         db.record_download(uid, sub_url, "youtube",
                                            f"subs:{target}-translated", True)
                         dl.cleanup(tr_path)
                 except Exception as e:
                     log.warning("subtitle translate: %s", e)
-            dl.cleanup(srt)
-        else:
-            await q.message.reply_text(i18n.t(lang, "download_failed"))
-        return
 
+        if mode == "srt":
+            await _send_srt_and_translation()
+            dl.cleanup(srt)
+            return
+
+        if mode == "soft":
+            msg2 = await q.message.reply_text(
+                "🎬 در حال ساخت نسخه‌ی سافت‌ساب (MKV با تراک زیرنویس)... چند دقیقه طول میکشه")
+            mkv = await asyncio.to_thread(
+                dl.download_video_with_subs, sub_url, sublang,
+                os.path.join(DOWNLOAD_DIR, f"ss_{uid}_{dl_id}.mkv"), None)
+            try:
+                await msg2.delete()
+            except Exception:
+                pass
+            if mkv and os.path.exists(mkv):
+                doc_name = f"{safe_title} [سافت ساب {sublang.upper()}].mkv"
+                with open(mkv, "rb") as fh:
+                    await q.message.reply_document(
+                        document=fh, filename=doc_name,
+                        caption=f"🎬 **{vtitle}**\n💬 زیرنویس {sublang} داخل فایل — تو VLC/MX Player میتونی خاموش/رونش کنی",
+                        parse_mode="Markdown")
+                db.record_download(uid, sub_url, "youtube", f"subs-embedded:{sublang}", True)
+                dl.cleanup(mkv)
+            else:
+                await q.message.reply_text(i18n.t(lang, "download_failed"))
+            await _send_srt_and_translation()
+            dl.cleanup(srt)
+            return
+
+        if mode == "hard":
+            # need a video file first — reuse CDN cache if we have it? simpler: fresh download
+            msg3 = await q.message.reply_text(
+                "🔥 در حال دانلود ویدیو و حک کردن زیرنویس... (بسته به طول ویدیو ممکنه کمی طول بکشه)")
+            base_vid = os.path.join(DOWNLOAD_DIR, f"hs_{uid}_{dl_id}")
+            vid_ok = await _limited_download(sub_url, "best", False, base_vid + ".mp4")
+            src_v = resolve_out_path(base_vid + ".mp4")
+            if not (vid_ok and src_v and os.path.exists(src_v)):
+                try:
+                    await msg3.delete()
+                except Exception:
+                    pass
+                await q.message.reply_text(i18n.t(lang, "download_failed"))
+                dl.cleanup(srt)
+                return
+            hard_out = base_vid + "_hard.mp4"
+            ok_burn = await asyncio.to_thread(
+                dl.burn_subtitles, src_v, srt, hard_out)
+            dl.cleanup(src_v)
+            try:
+                await msg3.delete()
+            except Exception:
+                pass
+            if ok_burn and os.path.exists(hard_out):
+                doc_name = f"{safe_title} [هاردساب {sublang.upper()}].mp4"
+                with open(hard_out, "rb") as fh:
+                    await q.message.reply_document(
+                        document=fh, filename=doc_name,
+                        caption=f"🔥 **{vtitle}**\n💬 زیرنویس {sublang} روی تصویر حک شده",
+                        parse_mode="Markdown")
+                db.record_download(uid, sub_url, "youtube", f"hardsub:{sublang}", True)
+                dl.cleanup(hard_out)
+            else:
+                await q.message.reply_text(i18n.t(lang, "download_failed"))
+            await _send_srt_and_translation()
+            dl.cleanup(srt)
+            return
+
+    if len(parts) >= 2 and parts[0] == "subhelp":
+        await q.answer()
+        await q.message.reply_text(
+            "❓ **فرق هاردساب و سافت ساب**\n\n"
+            "🔥 **هاردساب (Hardsub)**\n"
+            "زیرنویس مستقیم روی تصویر ویدیو حک میشه — مثل فیلمایی که زیرنویس‌شون چسبیده.\n"
+            "✅ تو هر پلیری و حتی استریم تلگرام معلومه\n"
+            "❌ دیگه نمیشه خاموشش کرد\n\n"
+            "🎬 **سافت ساب (Softsub)**\n"
+            "ویدیو به صورت فایل MKV با یه تراک زیرنویس جداگانه داخلش فرستاده میشه.\n"
+            "✅ تو پلیرهایی مثل VLC و MX Player میتونی خاموش/روشنش کنی یا زبان عوض کنی\n"
+            "❌ تلگرام خودش پخشش نمیکنه — باید دانلودش کنی و با اون پلیرها باز کنی\n\n"
+            "📄 فقط فایل: همون srt جداگانه — خودت به پلیرت میدی.")
+        return
     if len(parts) < 3 or parts[0] != "dl":
         return
 
