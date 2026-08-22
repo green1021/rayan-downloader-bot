@@ -29,6 +29,7 @@ import db
 import linkcache
 import dlqueue
 import cdncache
+import subtitle_translate
 import downloader as dl
 import ig_tw as igtw
 import recognizer as recog
@@ -190,12 +191,25 @@ async def _fetch_thumb(info: dict, url: str) -> str | None:
         tpath = os.path.join(DOWNLOAD_DIR, f"thumb_{hashlib.md5(url.encode()).hexdigest()[:10]}.jpg")
         if os.path.exists(tpath) and os.path.getsize(tpath) > 0:
             return tpath  # cached thumb
+        raw = tpath + ".raw"
         def _dl():
             r = subprocess.run(
                 ["curl", "-s", "-L", "--max-time", "25", "-A",
-                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "-o", tpath, thumb_url],
+                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "-o", raw, thumb_url],
                 capture_output=True, text=True, timeout=30)
-            return os.path.exists(tpath) and os.path.getsize(tpath) > 1000
+            if not (os.path.exists(raw) and os.path.getsize(raw) > 1000):
+                return False
+            # Telegram send_video thumbnails MUST be JPEG — many sites serve WebP/PNG.
+            # Always transcode to true JPEG (fast, tiny files).
+            c = subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", raw,
+                 "-frames:v", "1", "-q:v", "3", tpath],
+                capture_output=True, text=True, timeout=30)
+            try:
+                os.remove(raw)
+            except Exception:
+                pass
+            return c.returncode == 0 and os.path.exists(tpath) and os.path.getsize(tpath) > 1000
         ok = await asyncio.to_thread(_dl)
         return tpath if ok else None
     except Exception as e:
@@ -3180,8 +3194,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception as e:
             log.warning("subs probe: %s", e)
         if sub_langs:
-            keyboard.insert(1, [InlineKeyboardButton(i18n.t(lang, "subs_available"),
-                                                     callback_data=f"sub|{dl_id}|{sub_langs}")])
+            # bottom-most button; label hints at Persian translation
+            lbl = (i18n.t(lang, "subs_available") if lang != "fa"
+                   else "💬 زیرنویس + ترجمه فارسی")
+            keyboard.append([InlineKeyboardButton(lbl,
+                             callback_data=f"sub|{dl_id}|{sub_langs}")])
             context.user_data[f"suburl_{dl_id}"] = url
 
     await status_msg.edit_text(i18n.t(lang, "downloading").format(title=info.get("title", "")[:80], quality=f"{best}p"),
@@ -3360,8 +3377,30 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             with open(srt, "rb") as fh:
                 await q.message.reply_document(document=fh,
                                                filename=f"subtitles_{sublang}.srt")
-            dl.cleanup(srt)
             db.record_download(uid, sub_url, "youtube", f"subs:{sublang}", True)
+            # ── Auto Persian translation (skip if track already Farsi) ──
+            target = "fa" if sublang != "fa" else None
+            if target:
+                try:
+                    tmsg = await q.message.reply_text("🌍 در حال ترجمه زیرنویس به فارسی...")
+                    fa_path = srt.replace(".srt", "_fa.srt")
+                    ok_tr = await asyncio.to_thread(
+                        subtitle_translate.translate_srt_file,
+                        srt, fa_path, target, sublang)
+                    try:
+                        await tmsg.delete()
+                    except Exception:
+                        pass
+                    if ok_tr and os.path.exists(fa_path):
+                        with open(fa_path, "rb") as fh:
+                            await q.message.reply_document(
+                                document=fh, filename=f"زیرنویس_فارسی.srt")
+                        db.record_download(uid, sub_url, "youtube",
+                                           f"subs:fa-translated", True)
+                        dl.cleanup(fa_path)
+                except Exception as e:
+                    log.warning("subtitle translate: %s", e)
+            dl.cleanup(srt)
         else:
             await q.message.reply_text(i18n.t(lang, "download_failed"))
         return
