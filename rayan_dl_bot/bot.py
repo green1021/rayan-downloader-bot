@@ -3187,9 +3187,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     sub_langs = None
     if site == "youtube":
         try:
-            manual_langs = list((info.get("subtitles") or {}).keys())
+            manual_langs = list(info.get("subtitles") or [])
             manual_langs = [x for x in manual_langs if not x.endswith("-orig")]
-            has_auto = bool(info.get("automatic_captions"))
+            has_auto = bool(info.get("auto_captions"))
             pref = [x for x in ("en", "fa", "de", "es", "fr", "ar") if x in manual_langs]
             sub_langs = (pref[0] if pref else
                          (manual_langs[0] if manual_langs else
@@ -3375,9 +3375,8 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await q.message.reply_text(i18n.t(lang, "link_expired"))
             return
         context.user_data[f"suburl_{dl_id}"] = sub_url  # keep for submode callbacks
+        # hardsub temporarily disabled — AV1 decode OOM-kills on this 2GB box
         kb_sub = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔥 زیرنویس چسبیده (هاردساب)",
-                                  callback_data=f"submode|{dl_id}|{sublang}|hard")],
             [InlineKeyboardButton("🎬 زیرنویس جداشدنی (سافت ساب)",
                                   callback_data=f"submode|{dl_id}|{sublang}|soft")],
             [InlineKeyboardButton("📄 فقط فایل زیرنویس",
@@ -3485,6 +3484,9 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
 
         if mode == "hard":
+            await q.message.reply_text(
+                "🔥 هاردساب موقتاً غیرفعاله (سرور رم کم داره). از سافت ساب استفاده کن 🎬")
+            return
             # need a video file first — reuse CDN cache if we have it? simpler: fresh download
             msg3 = await q.message.reply_text(
                 "🔥 در حال دانلود ویدیو و حک کردن زیرنویس... (بسته به طول ویدیو ممکنه کمی طول بکشه)")

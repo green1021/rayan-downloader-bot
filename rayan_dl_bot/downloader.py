@@ -380,6 +380,9 @@ def get_video_info(url: str) -> dict:
             "qualities": {str(h): None for h in heights},
             "sizes": sizes,
             "is_yt": "youtube.com" in url or "youtu.be" in url,
+            # subtitle availability — read once here, bot reuses it (no second probe)
+            "subtitles": list((d.get("subtitles") or {}).keys()),
+            "auto_captions": bool(d.get("automatic_captions")),
         }
     except Exception as e:
         return {"error": str(e)}
