@@ -1714,6 +1714,9 @@ async def _send_shazam_result(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def shazam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Guard: commands can fire on edited updates where update.message is None
+    if not update.message:
+        return
     db.record_user(update)
     await update.message.reply_text(i18n.t(lang_of(update), "shazam_cmd"))
 
@@ -2196,6 +2199,9 @@ async def commandonly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def ytdl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Explicit /ytdl <url> — U2DLBot pattern for groups."""
+    # Guard: edited/channel updates reach handlers without update.message
+    if not update.message:
+        return
     args = context.args
     if not args:
         await update.message.reply_text(i18n.t(lang_of(update), "ytdl_usage"))
@@ -2370,6 +2376,8 @@ async def force_join_check_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
     if not is_admin(update.effective_user.id):
         await update.message.reply_text(i18n.t(lang_of(update), "not_admin"))
         return
@@ -2397,6 +2405,8 @@ async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
     if not is_admin(update.effective_user.id):
         await update.message.reply_text(i18n.t(lang_of(update), "not_admin"))
         return
@@ -2413,6 +2423,8 @@ async def removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def channels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
     if not is_admin(update.effective_user.id):
         await update.message.reply_text(i18n.t(lang_of(update), "not_admin"))
         return
