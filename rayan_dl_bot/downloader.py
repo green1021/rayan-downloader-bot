@@ -49,17 +49,41 @@ TWITTER = ["twitter.com", "x.com"]
 TIKTOK = "tiktok.com"
 
 
-def is_pornhub(url): return any(s in url for s in PORNHUB_SITES)
-def is_tor_site(url): return any(s in url for s in TOR_SITES)
-def is_instagram(url): return INSTAGRAM in url
-def is_twitter(url): return any(s in url for s in TWITTER)
-def is_tiktok(url): return TIKTOK in url
+def _hostname(url: str) -> str:
+    """Extract lowercase hostname from a URL (None-safe)."""
+    try:
+        from urllib.parse import urlparse
+        h = (urlparse(url).hostname or "").lower()
+        return h[4:] if h.startswith("www.") else h
+    except Exception:
+        return ""
+
+
+def _host_matches(url: str, domains) -> bool:
+    """True if the URL's hostname is exactly one of domains or a subdomain of one.
+    Hostname-only matching prevents misclassification like notinstagram.com or
+    evil.com/?url=instagram.com hijacking the instagram extractor."""
+    h = _hostname(url)
+    if not h:
+        return False
+    for d in domains:
+        d = d.lower()
+        if h == d or h.endswith("." + d):
+            return True
+    return False
+
+
+def is_pornhub(url): return _host_matches(url, PORNHUB_SITES)
+def is_tor_site(url): return _host_matches(url, TOR_SITES)
+def is_instagram(url): return _host_matches(url, [INSTAGRAM])
+def is_twitter(url): return _host_matches(url, TWITTER)
+def is_tiktok(url): return _host_matches(url, [TIKTOK])
 
 
 def clean_instagram_url(url: str) -> str:
     """Instagram links with '?igsh=...' (or any query) often fail the embed
     workaround — strip the query string so the reel/post downloads without login."""
-    if INSTAGRAM not in url:
+    if not is_instagram(url):
         return url
     if "?" in url:
         return url.split("?", 1)[0]

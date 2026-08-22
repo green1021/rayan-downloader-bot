@@ -1,0 +1,15 @@
+{
+  "name": "aparat",
+  "version": "1.0.0",
+  "description": "دانلود ویدیو از آپارات و نماشا (کیفیت‌های مختلف)",
+  "sites": [
+    "aparat.com",
+    "namasha.com",
+    "aparatkids.com"
+  ],
+  "entry": "plugin",
+  "enabled": true,
+  "config": {
+    "timeout": 60
+  }
+}

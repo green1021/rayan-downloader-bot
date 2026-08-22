@@ -40,12 +40,45 @@ MANIFEST = "plugin.json"
 ALLOWED_ENTRY_EXTS = (".py",)
 
 # ── Loading ───────────────────────────────────────────────────
+_module_cache = {}  # path -> (mtime, module)
+
+
 def _load_module_from_file(path, modname):
+    """Load (and CACHE) a plugin module. Cache is invalidated when file mtime
+    changes, so plugin updates hot-reload while steady-state calls skip the
+    expensive re-exec of module code."""
     import importlib.util
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = 0
+    cached = _module_cache.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
     spec = importlib.util.spec_from_file_location(modname, path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    _module_cache[path] = (mtime, mod)
     return mod
+
+
+_plugin_pool = None  # shared executor for timeout-bounded plugin calls
+
+
+def call_with_timeout(fn, timeout_s: float, *args, **kwargs):
+    """Run a blocking plugin function in a worker thread with a HARD timeout.
+    On timeout raises TimeoutError; the stray thread dies with the process eventually
+    but the caller (bot) is never blocked forever."""
+    global _plugin_pool
+    import concurrent.futures
+    if _plugin_pool is None:
+        _plugin_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="rayan-plugin")
+    fut = _plugin_pool.submit(fn, *args, **kwargs)
+    return fut.result(timeout=timeout_s)
+
+
+DEFAULT_PLUGIN_TIMEOUT = 90  # seconds — covers slow sites without hanging forever
 
 
 def discover_plugins():
@@ -76,8 +109,22 @@ def discover_plugins():
 
 
 def _site_match(site_rule, url):
-    """Match a site rule (domain or substring) against a URL."""
-    return site_rule and site_rule.lower() in url.lower()
+    """Match a site rule against a URL by HOSTNAME (exact or subdomain suffix).
+    Falls back to substring only when the rule isn't a valid domain (opt-in legacy)."""
+    if not site_rule:
+        return False
+    rule = str(site_rule).lower().strip()
+    try:
+        from urllib.parse import urlparse
+        h = (urlparse(url).hostname or "").lower()
+        if h.startswith("www."):
+            h = h[4:]
+        if h and (h == rule or h.endswith("." + rule)):
+            return True
+    except Exception:
+        pass
+    # legacy substring fallback for non-domain rules (e.g. "tiktok/wildcard")
+    return rule in url.lower()
 
 
 def find_plugin_for_url(url):
@@ -106,7 +153,7 @@ def plugin_entry_path(meta):
 
 
 def call_plugin(meta, url, config=None):
-    """Invoke a plugin's handle(). Returns result dict or error dict."""
+    """Invoke a plugin's handle() with a HARD timeout. Returns result dict or error dict."""
     entry = plugin_entry_path(meta)
     if not os.path.isfile(entry):
         return {"error": f"plugin entry missing: {os.path.basename(entry)}"}
@@ -120,7 +167,11 @@ def call_plugin(meta, url, config=None):
         plugin = mod.Plugin()
         if not hasattr(plugin, "handle"):
             return {"error": "plugin has no handle() method"}
-        return plugin.handle(url, cfg)
+        timeout = float(meta.get("timeout", DEFAULT_PLUGIN_TIMEOUT))
+        return call_with_timeout(plugin.handle, timeout, url, cfg)
+    except TimeoutError:
+        log.error("plugin %s TIMEOUT after %ss", meta.get("name"), meta.get("timeout", DEFAULT_PLUGIN_TIMEOUT))
+        return {"error": "پلاگین بیش از حد طول کشید (timeout)"}
     except Exception as e:
         log.error("plugin %s error: %s", meta.get("name"), e)
         return {"error": f"plugin error: {e}"}
@@ -188,6 +239,57 @@ def call_plugin_download_chapter(meta, chapter_url, config=None):
 
 
 # ── Install / remove ──────────────────────────────────────────
+MAX_ZIP_UNCOMPRESSED = 30 * 1024 * 1024  # 30 MB total extracted
+MAX_ZIP_ENTRIES = 200
+
+
+def _validate_install_url(url: str) -> str | None:
+    """SSRF guard for admin-supplied install URLs. Returns error or None if OK.
+    Only https:// to public hosts; blocks file://, ftp://, private IPs, localhost."""
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(url)
+        if u.scheme not in ("https",):
+            return "فقط URL با پروتکل https مجاز است"
+        host = (u.hostname or "").lower()
+        if not host:
+            return "URL بدون hostname"
+        if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1") or host.endswith(".local"):
+            return "دانلود از localhost مجاز نیست"
+        # block IP-literal hosts (private ranges)
+        import re as _re
+        if _re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", host):
+            parts = [int(p) for p in host.split(".")]
+            if parts[0] in (10, 127) or (parts[0] == 192 and parts[1] == 168) or \
+               (parts[0] == 172 and 16 <= parts[1] <= 31) or (parts[0] == 169 and parts[1] == 254):
+                return "دانلود از IP داخلی مجاز نیست"
+        return None
+    except Exception as e:
+        return f"URL نامعتبر: {e}"
+
+
+def _safe_extract(zf, tmp: str) -> str | None:
+    """Zip-Slip-hardened extraction. Returns error string or None if OK.
+    Rejects: absolute paths, .. traversal outside tmp, symlinks, oversized/many entries."""
+    total = 0
+    if len(zf.namelist()) > MAX_ZIP_ENTRIES:
+        return "zip has too many files"
+    for info in zf.infolist():
+        name = info.filename
+        # normalize and check escape
+        dest = os.path.realpath(os.path.join(tmp, name))
+        base = os.path.realpath(tmp)
+        if not (dest == base or dest.startswith(base + os.sep)):
+            return f"unsafe path in zip: {name}"
+        if (info.external_attr >> 16) & 0o170000 == 0o120000:
+            return f"symlink in zip not allowed: {name}"
+        total += info.file_size
+        if total > MAX_ZIP_UNCOMPRESSED:
+            return "zip too large when extracted"
+    zf.extractall(tmp)
+    return None
+
+
 def _validate_meta(meta) -> str | None:
     """Return error string or None if valid."""
     name = meta.get("name", "")
@@ -216,7 +318,9 @@ def install_plugin_from_file(zip_path: str) -> dict:
                 manifest_name = next((n for n in names if n.endswith(MANIFEST)), None)
                 if not manifest_name:
                     return {"ok": False, "message": "zip شامل plugin.json نیست"}
-                zf.extractall(tmp)
+                err_x = _safe_extract(zf, tmp)
+                if err_x:
+                    return {"ok": False, "message": err_x}
             root = os.path.dirname(os.path.join(tmp, manifest_name))
             with open(os.path.join(tmp, manifest_name), encoding="utf-8") as f:
                 meta = json.load(f)
@@ -240,6 +344,9 @@ def install_plugin_from_url(url: str) -> dict:
     """Download a plugin (zip or raw plugin.json+entry from GitHub raw) and install.
     Returns {ok, message, name?}."""
     try:
+        err_url = _validate_install_url(url)
+        if err_url:
+            return {"ok": False, "message": err_url}
         if url.endswith(".zip") or "zipball" in url or "codeload" in url:
             return _install_zip(url)
         if url.endswith(".json"):
@@ -256,14 +363,26 @@ def _install_zip(url: str) -> dict:
     tmp = tempfile.mkdtemp(prefix="plugin_install_")
     zip_path = os.path.join(tmp, "plugin.zip")
     try:
-        urllib.request.urlretrieve(url, zip_path)
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=60) as resp, open(zip_path, "wb") as f:
+            remaining = MAX_ZIP_UNCOMPRESSED
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                if remaining < 0:
+                    return {"ok": False, "message": "فایل zip بیش از حد بزرگ است"}
+                f.write(chunk)
         with zipfile.ZipFile(zip_path) as zf:
             # find plugin.json in the archive
             names = zf.namelist()
             manifest_name = next((n for n in names if n.endswith(MANIFEST)), None)
             if not manifest_name:
                 return {"ok": False, "message": "zip has no plugin.json"}
-            zf.extractall(tmp)
+            err_x = _safe_extract(zf, tmp)
+            if err_x:
+                return {"ok": False, "message": err_x}
         root = os.path.dirname(os.path.join(tmp, manifest_name))
         with open(os.path.join(tmp, manifest_name), encoding="utf-8") as f:
             meta = json.load(f)

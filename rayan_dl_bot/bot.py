@@ -27,6 +27,7 @@ from telegram.ext import (
 import i18n
 import db
 import linkcache
+import dlqueue
 import downloader as dl
 import ig_tw as igtw
 import recognizer as recog
@@ -101,9 +102,12 @@ def rate_limited(user_id: int, seconds: int = 8) -> bool:
 
 
 async def _limited_download(*args, **kwargs):
-    """Run dl.download_video under a dynamic concurrency cap (1-6, admin-configurable)."""
-    sem = asyncio.Semaphore(_sem_value())
-    async with sem:
+    """Run dl.download_video through the REAL shared queue (dlqueue).
+
+    Old bug: a fresh Semaphore was created per call, so the concurrency cap
+    never applied. Now one global queue enforces max_concurrent_downloads."""
+    uid = 0  # global queue slot (per-user caps handled by rate limiter)
+    async with dlqueue.QueueSlot(uid):
         return await asyncio.to_thread(dl.download_video, *args, **kwargs)
 
 
@@ -3105,6 +3109,17 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     out_path = os.path.join(DOWNLOAD_DIR, f"dl_{uid}_{dl_id}_{best}.mp4")
     dl.cleanup(out_path)
+
+    # Queue feedback: if the queue is busy, tell the user their position
+    qpos = dlqueue.queue_position()
+    if qpos > 0:
+        try:
+            await status_msg.edit_text(
+                i18n.t(lang, "downloading").format(title=info.get("title", "")[:60], quality=f"{best}p") +
+                f"\n⏳ در صف دانلود: {qpos} کار دیگر",
+                parse_mode="Markdown")
+        except Exception:
+            pass
 
     ok = await _limited_download(url, str(best), False, out_path)
     out_path = resolve_out_path(out_path)

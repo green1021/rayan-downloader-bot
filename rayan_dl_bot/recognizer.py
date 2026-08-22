@@ -27,13 +27,26 @@ FPCALC = "/usr/bin/fpcalc"
 ACOUSTID_KEY = "KcghHD5WT6"
 
 
-def to_mono_wav(audio_path: str, out_wav: str, seconds: int = 30) -> bool:
-    """Downmix any audio to 30s mono 16kHz WAV (ideal for Shazam fingerprinting)."""
+def to_mono_wav(audio_path: str, out_wav: str, seconds: int = 30, offset: int = 0, normalize: bool = True) -> bool:
+    """Downmix audio to mono 16kHz WAV for fingerprinting.
+
+    Improvements over the original:
+    - offset: start N seconds in (intros/speech often kill recognition at 0:00)
+    - normalize: loudnorm volume leveling (quiet/phone-recorded clips fail otherwise)
+    """
     try:
-        r = subprocess.run(
-            ["ffmpeg", "-y", "-i", audio_path, "-t", str(seconds),
-             "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", out_wav],
-            capture_output=True, text=True, timeout=120)
+        cmd = ["ffmpeg", "-y"]
+        if offset > 0:
+            cmd += ["-ss", str(offset)]
+        cmd += ["-i", audio_path, "-t", str(seconds),
+                "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le"]
+        if normalize:
+            # Single-pass loudnorm to a sane level; cheap and helps a lot
+            cmd[cmd.index("-c:a"):cmd.index("-c:a")] = [
+                "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+            ]
+        cmd.append(out_wav)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         return os.path.exists(out_wav) and os.path.getsize(out_wav) > 0
     except Exception as e:
         log.error("to_mono_wav: %s", e)
@@ -53,7 +66,7 @@ async def main():
         conn = ProxyConnector.from_url("WARP_PROXY_PLACEHOLDER")
         async with aiohttp.ClientSession(connector=conn) as session:
             shazam = Shazam(http_client=session)
-            resp = await shazam.recognize("AUDIO_PATH_PLACEHOLDER")
+            resp = await shazam.recognize(AUDIO_PATH_PLACEHOLDER)
             data = json.loads(await resp.text())
             track = data.get("track")
             if track and data.get("matches"):
@@ -101,7 +114,9 @@ async def main():
 asyncio.run(main())
 '''
     # Substitute placeholders safely (json.dumps escapes quotes/newlines → no code injection)
-    code = code.replace("WARP_PROXY_PLACEHOLDER", json.dumps(WARP_PROXY))
+    # WARP_PROXY is a trusted module constant → raw substitution.
+    # audio_path IS user-influenced → json.dumps escapes quotes/newlines safely.
+    code = code.replace("WARP_PROXY_PLACEHOLDER", WARP_PROXY)
     code = code.replace("AUDIO_PATH_PLACEHOLDER", json.dumps(audio_path))
     try:
         # Blocking subprocess (up to 90s) — run in a thread so the event loop stays free
@@ -148,9 +163,13 @@ def _acoustid_lookup(duration, fingerprint) -> list:
             return []
         out = []
         for res in d.get("results", []):
+            score = float(res.get("score", 0))
             for rec in res.get("recordings", [])[:3]:
                 artists = ", ".join(a.get("name", "") for a in rec.get("artists", []))
-                out.append({"title": rec.get("title", ""), "artist": artists})
+                out.append({"title": rec.get("title", ""), "artist": artists,
+                            "score": score})
+        # best-score first
+        out.sort(key=lambda r: r["score"], reverse=True)
         return out
     except Exception as e:
         log.error("acoustid lookup: %s", e)
@@ -161,7 +180,11 @@ def _acoustid_lookup(duration, fingerprint) -> list:
 async def recognize_audio(audio_path: str, cache=True) -> dict:
     """Recognize a song from an audio file. Returns:
        {matched, title, artist, source, error, covers=[]}
-    Uses Shazam first, then AcoustID. Caches by audio hash."""
+    Improved strategy (multi-pass):
+      1. Shazam on normalized clip
+      2. Shazam retry from +30s offset (intros/speech often kill the first 30s)
+      3. AcoustID fallback (best-score result)
+    Caches by audio hash."""
     if not os.path.exists(audio_path):
         return {"matched": False, "error": "file not found"}
     fhash = _get_hash(audio_path)
@@ -170,22 +193,46 @@ async def recognize_audio(audio_path: str, cache=True) -> dict:
         if cached:
             return json.loads(cached)
 
-    # 1) Shazam
+    # 1) Shazam — pass 1: start of file
     result = await _shazam_recognize(audio_path)
+
+    # 2) Shazam — pass 2: skip first 30s (different fingerprint window)
+    if not result and os.path.getsize(audio_path) > 500_000:
+        wav2 = audio_path + ".off30.wav"
+        ok2 = await asyncio.to_thread(to_mono_wav, audio_path, wav2, 30, 30, True)
+        if ok2:
+            result = await _shazam_recognize(wav2)
+            try:
+                os.remove(wav2)
+            except Exception:
+                pass
+
+    # 3) Shazam — pass 3: middle of file (+60s), last resort before AcoustID
+    if not result and os.path.getsize(audio_path) > 900_000:
+        wav3 = audio_path + ".off60.wav"
+        ok3 = await asyncio.to_thread(to_mono_wav, audio_path, wav3, 20, 60, True)
+        if ok3:
+            result = await _shazam_recognize(wav3)
+            try:
+                os.remove(wav3)
+            except Exception:
+                pass
+
     if result:
         out = {"matched": True, "source": "shazam", **result}
         if cache:
             _db_cache_set(fhash, out)
         return out
 
-    # 2) AcoustID fallback (fpcalc + lookup are blocking subprocesses — run in threads)
+    # 4) AcoustID fallback (fpcalc + lookup are blocking subprocesses — run in threads)
     fp = await asyncio.to_thread(_fpcalc, audio_path)
     if fp:
         duration, fingerprint = fp
         recs = await asyncio.to_thread(_acoustid_lookup, duration, fingerprint)
         if recs:
+            best = max(recs, key=lambda r: r.get("score", 0)) if any("score" in r for r in recs) else recs[0]
             out = {"matched": True, "source": "acoustid",
-                   "title": recs[0]["title"], "artist": recs[0]["artist"]}
+                   "title": best["title"], "artist": best["artist"]}
             if cache:
                 _db_cache_set(fhash, out)
             return out
