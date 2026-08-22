@@ -3230,6 +3230,14 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 supports_streaming=True,
             )
             db.record_download(uid, url, site, f"{best} (cdn)", True)
+            # keep the action buttons (MP3 / Shazam / subs) under the cached video too
+            try:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=i18n.t(lang, "more_options"),
+                    reply_markup=InlineKeyboardMarkup(keyboard))
+            except Exception as e:
+                log.debug("cdn follow-up kb: %s", e)
             try:
                 await status_msg.delete()
             except Exception:
