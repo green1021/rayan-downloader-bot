@@ -3195,8 +3195,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             log.warning("subs probe: %s", e)
         if sub_langs:
             # bottom-most button; label hints at Persian translation
-            lbl = (i18n.t(lang, "subs_available") if lang != "fa"
-                   else "💬 زیرنویس + ترجمه فارسی")
+            # fa UI gets an explicit Persian hint; others a generic one
+            lbl = ("💬 زیرنویس + ترجمه فارسی" if lang == "fa"
+                   else "💬 " + i18n.t(lang, "subs_available").lstrip("💬 "))
             keyboard.append([InlineKeyboardButton(lbl,
                              callback_data=f"sub|{dl_id}|{sub_langs}")])
             context.user_data[f"suburl_{dl_id}"] = url
@@ -3386,26 +3387,29 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 await q.message.reply_document(document=fh,
                                                filename=f"subtitles_{sublang}.srt")
             db.record_download(uid, sub_url, "youtube", f"subs:{sublang}", True)
-            # ── Auto Persian translation (skip if track already Farsi) ──
-            target = "fa" if sublang != "fa" else None
+            # ── Auto translation into the user's interface language ──
+            # Skip entirely when the subtitle already IS that language
+            # (e.g. English video + English UI → no pointless en→en pass).
+            target = lang if sublang != lang else None
             if target:
                 try:
-                    tmsg = await q.message.reply_text("🌍 در حال ترجمه زیرنویس به فارسی...")
-                    fa_path = srt.replace(".srt", "_fa.srt")
+                    tmsg = await q.message.reply_text(
+                        i18n.t(lang, "subs_translating"))
+                    tr_path = srt.replace(".srt", f"_{target}.srt")
                     ok_tr = await asyncio.to_thread(
                         subtitle_translate.translate_srt_file,
-                        srt, fa_path, target, sublang)
+                        srt, tr_path, target, sublang)
                     try:
                         await tmsg.delete()
                     except Exception:
                         pass
-                    if ok_tr and os.path.exists(fa_path):
-                        with open(fa_path, "rb") as fh:
+                    if ok_tr and os.path.exists(tr_path):
+                        with open(tr_path, "rb") as fh:
                             await q.message.reply_document(
-                                document=fh, filename=f"زیرنویس_فارسی.srt")
+                                document=fh, filename=f"subtitles_{target}.srt")
                         db.record_download(uid, sub_url, "youtube",
-                                           f"subs:fa-translated", True)
-                        dl.cleanup(fa_path)
+                                           f"subs:{target}-translated", True)
+                        dl.cleanup(tr_path)
                 except Exception as e:
                     log.warning("subtitle translate: %s", e)
             dl.cleanup(srt)
