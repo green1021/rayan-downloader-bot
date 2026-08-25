@@ -367,6 +367,14 @@ def get_video_info(url: str) -> dict:
                 sizes[str(h)] = size
 
         thumb = d.get("thumbnail")
+        # subtitle language picker: which AUTO languages exist (manual ones are
+        # already in "subtitles"); and which heights carry per-format subtitle
+        # tracks (yt-dlp exposes subtitles on individual formats) — display-only
+        auto_langs = list((d.get("automatic_captions") or {}).keys())
+        sub_heights = sorted(
+            {f.get("height") for f in d.get("formats", [])
+             if f.get("height") and (f.get("subtitles") or f.get("requested_subtitles"))},
+            reverse=True)
         return {
             "title": d.get("title") or d.get("fulltitle") or "",
             "uploader": d.get("uploader") or d.get("channel") or d.get("uploader_id"),
@@ -383,6 +391,8 @@ def get_video_info(url: str) -> dict:
             # subtitle availability — read once here, bot reuses it (no second probe)
             "subtitles": list((d.get("subtitles") or {}).keys()),
             "auto_captions": bool(d.get("automatic_captions")),
+            "auto_caption_langs": auto_langs,
+            "format_sub_heights": [int(h) for h in sub_heights],
         }
     except Exception as e:
         return {"error": str(e)}

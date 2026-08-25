@@ -247,6 +247,80 @@ def lang_keyboard():
          InlineKeyboardButton("🇪🇸 Español", callback_data="setlang|es")],
     ])
 
+# ── Subtitle language picker (pure helpers — unit-tested offline) ──
+SUB_LANG_META = {
+    "fa": "🇮🇷 فارسی",
+    "en": "🇬🇧 English",
+    "de": "🇩🇪 Deutsch",
+    "es": "🇪🇸 Español",
+    "fr": "🇫🇷 Français",
+    "ar": "🇸🇦 العربية",
+}
+# fa-UI users get PERSIAN FIRST (they used to get German when only 'de'
+# existed because English outranked Persian and 'de' fell back to langs[0]).
+SUB_PREF_FA = ("fa", "en", "ar", "de", "es", "fr")
+SUB_PREF_OTHER = ("en", "fa", "ar", "de", "es", "fr")
+
+
+def sub_lang_pref_order(ui_lang: str) -> tuple:
+    """Subtitle-language preference order for a UI language."""
+    return SUB_PREF_FA if ui_lang == "fa" else SUB_PREF_OTHER
+
+
+def build_sub_choices(info: dict, ui_lang: str, max_choices: int = 6) -> list:
+    """Languages actually present in the info dict as [(code, is_auto)],
+    ordered by preference. Manual tracks come from info["subtitles"],
+    auto-generated from info["auto_caption_langs"] (any-auto fallback: "en").
+    NEVER invents an unrelated language just because it's the only one —
+    with only 'de' present, the picker offers German, marked as such."""
+    try:
+        manual = {str(x) for x in (info.get("subtitles") or [])
+                  if not str(x).endswith("-orig")}
+        auto = {str(x) for x in (info.get("auto_caption_langs") or [])}
+        if not auto and info.get("auto_captions"):
+            auto = {"en"}  # older probe: we only know SOME auto track exists
+        choices = []
+        for code in sub_lang_pref_order(ui_lang):
+            if code in manual:
+                choices.append((code, False))       # real human track wins
+            elif code in auto:
+                choices.append((code, True))        # auto-generated → "~" mark
+        return choices[:max_choices]
+    except Exception:
+        return []
+
+
+def sub_button_label(code: str, is_auto: bool) -> str:
+    """Picker button label; '~' prefix marks auto-generated captions.
+    The Persian button keeps the «زیرنویس + ترجمه» hint style."""
+    name = SUB_LANG_META.get(code)
+    if not name:
+        return ""
+    if code == "fa":
+        return "🇮🇷 زیرنویس فارسی + ترجمه"
+    return f"~ {name}" if is_auto else name
+
+
+def sub_picker_rows(dl_id: str, info: dict, ui_lang: str,
+                    per_row: int = 3) -> list:
+    """Up to 6 subtitle-language buttons laid out as ONE row-pair of
+    (label, callback_data) tuples: sub|{dl_id}|{lang}. Empty when the video
+    has no usable subtitles."""
+    btns = []
+    for code, is_auto in build_sub_choices(info, ui_lang):
+        lbl = sub_button_label(code, is_auto)
+        if lbl:
+            btns.append((lbl, f"sub|{dl_id}|{code}"))
+    return [btns[i:i + per_row] for i in range(0, len(btns), per_row)]
+
+
+def quality_sub_badge(label: str, height: int, fmt_sub_heights) -> str:
+    """Append ' 💬' when THIS height's yt-dlp format carries subtitle tracks.
+    Per-format data absent → no annotation (display-only, never guesses)."""
+    if height in set(fmt_sub_heights or []):
+        return f"{label} 💬"
+    return label
+
 
 # ── Handlers: start / help / about ────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3378,36 +3452,29 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     best = h
                     break
 
+    # Quality buttons; 💬 badge marks heights whose yt-dlp format carries
+    # subtitle tracks (per-format data only — absent data → no annotation).
+    fmt_sub_heights = info.get("format_sub_heights") or []
     keyboard = []
     for h in heights:
         if h != best:
             est = sizes.get(str(h))
             label = f"🎥 {h}p" + (f" ({dl.human_size(est)})" if est else "")
+            label = quality_sub_badge(label, h, fmt_sub_heights)
             keyboard.append([InlineKeyboardButton(label, callback_data=f"dl|{dl_id}|{h}")])
     keyboard.append([InlineKeyboardButton(i18n.t(lang, "mp3_only"), callback_data=f"dl|{dl_id}|audio")])
     keyboard.append([InlineKeyboardButton("🎵 تشخیص آهنگ", callback_data=f"dl|{dl_id}|shazam")])
 
-    # Subtitle button ONLY when the video actually has subtitles.
-    # FAST: read from the info dict we ALREADY have (no second yt-dlp call — saves ~10s).
-    sub_langs = None
+    # Subtitle LANGUAGE PICKER — one button per language the video actually
+    # HAS (manual + auto-generated), fa-first for Persian-UI users. The user
+    # complained about silently receiving German when they wanted Persian.
+    # FAST: still no second yt-dlp call — everything comes from the info dict.
+    # Callback routes into the EXISTING sub|… flow unchanged.
     if site == "youtube":
-        try:
-            manual_langs = list(info.get("subtitles") or [])
-            manual_langs = [x for x in manual_langs if not x.endswith("-orig")]
-            has_auto = bool(info.get("auto_captions"))
-            pref = [x for x in ("en", "fa", "de", "es", "fr", "ar") if x in manual_langs]
-            sub_langs = (pref[0] if pref else
-                         (manual_langs[0] if manual_langs else
-                          ("en" if has_auto else None)))
-        except Exception as e:
-            log.warning("subs probe: %s", e)
-        if sub_langs:
-            # bottom-most button; label hints at Persian translation
-            # fa UI gets an explicit Persian hint; others a generic one
-            lbl = ("💬 زیرنویس + ترجمه فارسی" if lang == "fa"
-                   else "💬 " + i18n.t(lang, "subs_available").lstrip("💬 "))
-            keyboard.append([InlineKeyboardButton(lbl,
-                             callback_data=f"sub|{dl_id}|{sub_langs}")])
+        sub_rows = sub_picker_rows(dl_id, info, lang)
+        if sub_rows:
+            for row in sub_rows:
+                keyboard.append([InlineKeyboardButton(lbl, callback_data=cb) for lbl, cb in row])
             context.user_data[f"suburl_{dl_id}"] = url
 
     await status_msg.edit_text(i18n.t(lang, "downloading").format(title=info.get("title", "")[:80], quality=f"{best}p"),
