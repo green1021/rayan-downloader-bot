@@ -30,6 +30,7 @@ import linkcache
 import dlqueue
 import cdncache
 import subtitle_translate
+import id3tag
 import downloader as dl
 import ig_tw as igtw
 import recognizer as recog
@@ -60,6 +61,9 @@ API_STORAGE = "/var/lib/tg-bot-api"
 DB_PATH = "/root/hermes-workspace/data/rayan.db"
 DISK_LIMIT_GB = 2
 MAX_FILE_SIZE_MB = 1900  # local Bot API allows up to 2GB
+# Keep yt-dlp's --max-filesize pre-gate in sync with our post-download check so
+# oversized files abort BEFORE wasting bandwidth/disk (post-check stays as backstop).
+dl.set_max_filesize_bytes(MAX_FILE_SIZE_MB * 1024 * 1024)
 
 # Admin IDs — initial owners from env (used for first-run bootstrap).
 # Additional admins are stored in DB (admins table) so ANY server deployment
@@ -121,14 +125,158 @@ def rate_limited(user_id: int, seconds: int = 8) -> bool:
     return False
 
 
-async def _limited_download(*args, **kwargs):
+async def _limited_download(*args, uid: int = 0, **kwargs):
     """Run dl.download_video through the REAL shared queue (dlqueue).
 
     Old bug: a fresh Semaphore was created per call, so the concurrency cap
-    never applied. Now one global queue enforces max_concurrent_downloads."""
-    uid = 0  # global queue slot (per-user caps handled by rate limiter)
-    async with dlqueue.QueueSlot(uid):
+    never applied. Now one global queue enforces max_concurrent_downloads.
+    B1: while the queue is BUSY (others waiting), one referral credit is
+    burned and the job enters the fast lane — credits are only consumed when
+    they actually buy something."""
+    skip = False
+    if dlqueue.queue_position() > 0 and uid:
+        if await asyncio.to_thread(db.get_referral_credits, uid) > 0:
+            if await asyncio.to_thread(db.consume_referral_credit, uid):
+                skip = True
+    async with dlqueue.QueueSlot(uid, skip=skip):
         return await asyncio.to_thread(dl.download_video, *args, **kwargs)
+
+
+# ── B7: auto-retry helper ─────────────────────────────────────
+_RETRYABLE = ("TimedOut", "TimeoutError", "NetworkError", "ConnectTimeout",
+              "ReadTimeout", "ConnectError", "ReadError", "RemoteProtocolError",
+              "BadGateway", "ServiceUnavailable", "GatewayTimeout",
+              "ConnectionResetError", "ConnectionError", "httpx.TimeoutException",
+              "httpx.ConnectError", "httpx.ReadError", "ChatNotFound")
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Network-ish / transient Telegram failures are retryable.
+    NEVER: user-cancel (CancelledError), validation (BadRequest like message
+    too long / wrong entity), Forbidden (user blocked the bot) — those fail fast."""
+    if isinstance(exc, asyncio.CancelledError):
+        return False
+    try:
+        from telegram.error import BadRequest, Forbidden, ChatNotFound
+        # validation errors & blocked-bot errors must not burn retries
+        name = type(exc).__name__
+        if isinstance(exc, (BadRequest, Forbidden)):
+            return False
+    except Exception:
+        pass
+    text = f"{type(exc).__name__}: {exc}"
+    return any(k in text for k in _RETRYABLE)
+
+
+async def _retry_async(coro_factory, attempts: int = 3, base_delay: float = 1.0):
+    """Await coro_factory() with exponential backoff on TRANSIENT failures.
+
+    coro_factory is called fresh per attempt (it must build a NEW coroutine —
+    awaited coroutines can't be reused). Backoff doubles each attempt
+    (base_delay * 2**n). User-cancel always propagates immediately;
+    validation/permanent errors raise after the first attempt without sleeping.
+    """
+    last_exc = None
+    for attempt in range(max(1, attempts)):
+        try:
+            return await coro_factory()
+        except asyncio.CancelledError:
+            raise  # user-cancel: propagate untouched, never retried
+        except Exception as e:
+            last_exc = e
+            if attempt >= attempts - 1 or not _is_retryable(e):
+                raise  # exhausted, or permanent/validation error → fail fast
+            await asyncio.sleep(base_delay * (2 ** attempt))  # 1s, 2s, 4s…
+    raise last_exc  # unreachable; keeps type-checkers happy
+
+
+async def _send_media_retry(factory, attempts: int = 3):
+    """Send media with auto-retry on network blips. File handles opened for a
+    failed attempt are closed before the next attempt re-opens them via factory()."""
+    try:
+        return await _retry_async(factory, attempts=attempts)
+    except Exception as e:
+        log.warning("media send failed after retries: %s", str(e)[:120])
+        raise
+
+
+async def _edit_retry(msg, *args, **kwargs):
+    """edit_text with ONE retry after 2s on transient failures (C2: a single
+    flaky local-bot-api «Timed out» killed a subtitle-flow transition). NEVER
+    raises — a dead edit is logged, not allowed to take the flow down.
+    Validation errors (BadRequest) still fail fast via _is_retryable."""
+    try:
+        return await _retry_async(lambda: msg.edit_text(*args, **kwargs),
+                                  attempts=2, base_delay=2.0)
+    except Exception as e:
+        log.warning("edit_retry: %s", str(e)[:160])
+        return None
+
+
+async def _answer_retry(q, *args, **kwargs):
+    """Same belt-and-braces for callback-query answers (never raises)."""
+    try:
+        return await _retry_async(lambda: q.answer(*args, **kwargs),
+                                  attempts=2, base_delay=2.0)
+    except Exception as e:
+        log.debug("answer_retry: %s", str(e)[:120])
+        return None
+
+
+# ── C/B6: daily download limit ────────────────────────────────
+def _over_daily_limit(uid: int) -> bool:
+    """True when a NON-allowed user has burned today's downloads (B6).
+
+    Allowed users (admins, referral-credit holders) are exempt — the cap
+    exists to meter anonymous private-chat usage. Group traffic never
+    reaches this gate (it's applied in handle_link's private path only).
+    Sync fn — call via asyncio.to_thread from async code.
+    """
+    if is_admin(uid):
+        return False
+    try:
+        if db.get_referral_credits(uid) > 0:
+            return False
+        return db.usage_today(uid) >= db.daily_limit()
+    except Exception as e:
+        log.error("daily limit check: %s", e)
+        return False  # fail open — a broken counter must not brick downloads
+
+
+async def check_daily_limit(update_or_msg, uid: int, lang: str) -> bool:
+    """Gate helper: sends the friendly cap message when over the limit.
+    Returns True when the user may proceed. Fails OPEN on internal errors."""
+    try:
+        if not await asyncio.to_thread(_over_daily_limit, uid):
+            return True
+        msg = getattr(update_or_msg, "message", None) or update_or_msg
+        await msg.reply_text(
+            i18n.t(lang, "daily_limit_reached").format(limit=db.daily_limit()))
+        return False
+    except Exception as e:
+        log.error("daily limit gate: %s", e)
+        return True  # fail open
+
+
+async def setlimit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/setlimit N — admin sets the per-day download cap for regular users."""
+    if not update.message:
+        return
+    lang = lang_of(update)
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text(i18n.t(lang, "not_admin"))
+        return
+    args = context.args or []
+    if not args or not str(args[0]).lstrip("-").isdigit():
+        await update.message.reply_text(i18n.t(lang, "setlimit_usage"))
+        return
+    n = int(args[0])
+    if not (1 <= n <= 1000):
+        await update.message.reply_text(i18n.t(lang, "setlimit_invalid"))
+        return
+    await asyncio.to_thread(db.set_daily_limit, n)
+    await update.message.reply_text(
+        i18n.t(lang, "setlimit_done").format(limit=n), parse_mode="Markdown")
 
 
 # ── Disk management ───────────────────────────────────────────
@@ -247,6 +395,7 @@ def lang_keyboard():
          InlineKeyboardButton("🇪🇸 Español", callback_data="setlang|es")],
     ])
 
+
 # ── Subtitle language picker (pure helpers — unit-tested offline) ──
 SUB_LANG_META = {
     "fa": "🇮🇷 فارسی",
@@ -314,6 +463,49 @@ def sub_picker_rows(dl_id: str, info: dict, ui_lang: str,
     return [btns[i:i + per_row] for i in range(0, len(btns), per_row)]
 
 
+# ── Sub-flow STEP 2: quality page (user-mandated redesign) ────────────
+def _height_button_label(height, sizes) -> str:
+    """Shared «🎥 720p (123 MiB)» label; size shown only when known."""
+    est = (sizes or {}).get(str(height))
+    return f"🎥 {height}p" + (f" ({dl.human_size(est)})" if est else "")
+
+
+def sub_quality_main_buttons(heights, sizes, dl_id: str, sublang: str) -> tuple:
+    """Sub-flow quality page: EXACTLY the qualities the main menu offers —
+    the 1080p/720p/480p trio (when available) plus a flag saying whether a
+    «کیفیت‌های دیگر» page exists. When NONE of the trio exists, ALL heights
+    are offered here (same degenerate case as the main menu).
+    Returns ([(label, callback_data)], has_others_page)."""
+    main, pages = split_qualities(heights)
+    btns = [(f"{_height_button_label(h, sizes)}",
+             f"subq|{dl_id}|{sublang}|{h}") for h in main]
+    return btns, bool(pages)
+
+
+def sub_quality_other_buttons(heights, sizes, dl_id: str, sublang: str,
+                              page: int) -> tuple:
+    """One «کیفیت‌های دیگر» page for the SUB flow — same split/pagination as
+    the main menu, but buttons continue the SUB chain (subq|…) instead of
+    starting a download. Returns ([(label, callback_data)], total_pages)."""
+    _, pages = split_qualities(heights)
+    if not pages:
+        return [], 0
+    page = max(0, min(page, len(pages) - 1))
+    btns = [(_height_button_label(h, sizes), f"subq|{dl_id}|{sublang}|{h}")
+            for h in pages[page]]
+    return btns, len(pages)
+
+
+def quality_others_page(heights, sizes, page: int) -> tuple:
+    """MAIN-menu «کیفیت‌های دیگر» page content: ([(label, height)], pages).
+    Labels carry sizes when known; buttons start a normal dl| download."""
+    _, pages = split_qualities(heights)
+    if not pages:
+        return [], 0
+    page = max(0, min(page, len(pages) - 1))
+    return [(f"{_height_button_label(h, sizes)}", h) for h in pages[page]], len(pages)
+
+
 def quality_sub_badge(label: str, height: int, fmt_sub_heights) -> str:
     """Append ' 💬' when THIS height's yt-dlp format carries subtitle tracks.
     Per-format data absent → no annotation (display-only, never guesses)."""
@@ -322,18 +514,71 @@ def quality_sub_badge(label: str, height: int, fmt_sub_heights) -> str:
     return label
 
 
+# ── Quality menu split (user-mandated): main page = 1080/720/480 only ──
+MAIN_HEIGHTS = (1080, 720, 480)
+OTHERS_PER_PAGE = 8
+
+
+def split_qualities(heights) -> tuple:
+    """Split available heights into (main_page, other_pages).
+
+    Main page holds ONLY 1080p/720p/480p (desc order, as available). The rest
+    go to a «کیفیت‌های دیگر» second page, chunked ≤8 per page. If NONE of the
+    three main heights exists the split degenerates to all-heights-on-main
+    with no extra pages — the menu must never hide every quality behind a
+    second click. Pure function; unit-tested offline."""
+    try:
+        hs = sorted({int(h) for h in (heights or [])}, reverse=True)
+    except (TypeError, ValueError):
+        return [], []
+    main = [h for h in MAIN_HEIGHTS if h in hs]
+    if not main:
+        return hs, []
+    others = [h for h in hs if h not in main]
+    pages = [others[i:i + OTHERS_PER_PAGE]
+             for i in range(0, len(others), OTHERS_PER_PAGE)]
+    return main, pages
+
+
 # ── Handlers: start / help / about ────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Guard: edited/channel updates reach handlers without update.message
     if not update.message:
         return
+    uid = update.effective_user.id
     db.record_user(update)
-    if db.is_banned(update.effective_user.id):
+
+    # ── B1 REFERRAL LINK (/start <code>) — only counts for brand-new users,
+    # so an existing user can't farm credits by re-clicking their own link.
+    args = context.args or []
+    ref_ok_msg = ""
+    if args:
+        code = str(args[0]).strip()
+        inviter = db.user_by_ref_code(code)
+        my_lang = db.get_user_lang(uid)
+        if inviter and inviter != uid:
+            # record first (idempotent); credit the INVITEE with their starting
+            # credit only on the very first successful recording.
+            if db.record_referral(inviter, uid):
+                db.get_or_create_ref_code(uid)  # invitee gets a code too
+                ref_ok_msg = i18n.t(my_lang, "ref_welcome_invited")
+                try:
+                    await context.bot.send_message(
+                        chat_id=inviter,
+                        text=i18n.t(db.get_user_lang(inviter), "ref_invite_success"))
+                except Exception:
+                    pass  # inviter may have blocked the bot — referral still stands
+        elif inviter == uid:
+            ref_ok_msg = i18n.t(my_lang, "ref_self")
+
+    if db.is_banned(uid):
         await update.message.reply_text(i18n.t(lang_of(update), "banned"))
         return
 
-    # First-time users: ask language (English is default if not chosen)
-    if not db.user_lang_chosen(update.effective_user.id):
+    # First-time users: ask language (English is default if not chosen).
+    # The referral was ALREADY recorded above — language choice must not be a
+    # lever to lose it. The welcome text rides along after the prompt.
+    if not db.user_lang_chosen(uid):
         await update.message.reply_text(
             i18n.t("en", "lang_prompt"),
             reply_markup=lang_keyboard(),
@@ -347,7 +592,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lang = lang_of(update)
     # Personalized greeting: name + lifetime stats + fresh feature hints
     name = (update.effective_user.first_name or "").strip()
-    n_dl = db.count_user_downloads(update.effective_user.id)
+    n_dl = db.count_user_downloads(uid)
     base = i18n.t(lang, "start")
     if name:
         hi = f"سلام {name}! 👋\n\n" if lang == "fa" else f"Hey {name}! 👋\n\n"
@@ -357,6 +602,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                       if lang == "fa" else
                       f"📊 You've made **{n_dl}** downloads with me — legend! 🏆\n\n")
         base = base + stats_line
+    if ref_ok_msg:
+        base = ref_ok_msg + "\n\n" + base
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(i18n.t(lang, "help_btn"), callback_data="help"),
          InlineKeyboardButton(i18n.t(lang, "history_btn"), callback_data="history")],
@@ -364,6 +611,217 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ])
     await update.message.reply_text(base, parse_mode="Markdown",
                                     disable_web_page_preview=True, reply_markup=kb)
+
+
+# ── B1: Referral system ───────────────────────────────────────
+async def ref_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/ref — show the user's personal invite link + credit balance."""
+    if not update.message:
+        return
+    uid = update.effective_user.id
+    db.record_user(update)
+    if db.is_banned(uid):
+        await update.message.reply_text(i18n.t(lang_of(update), "banned"))
+        return
+    lang = lang_of(update)
+    code = await asyncio.to_thread(db.get_or_create_ref_code, uid)
+    if not code:
+        await update.message.reply_text(i18n.t(lang, "processing_error").format(err="ref code"))
+        return
+    try:
+        bot_username = (await context.bot.get_me()).username or "bot"
+    except Exception:
+        bot_username = "bot"
+    link = f"https://t.me/{bot_username}?start={code}"
+    invited = await asyncio.to_thread(db.count_referrals, uid)
+    credits = await asyncio.to_thread(db.get_referral_credits, uid)
+    cap = db.REFERRAL_CAP
+    await update.message.reply_text(
+        i18n.t(lang, "ref_menu").format(
+            link=link, invited=invited,
+            earned=invited if invited <= cap else cap,
+            credits=credits, cap=cap),
+        parse_mode="Markdown", disable_web_page_preview=True)
+
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/stats — personal numbers for the calling user (incl. referral credits)."""
+    if not update.message:
+        return
+    uid = update.effective_user.id
+    db.record_user(update)
+    if db.is_banned(uid):
+        await update.message.reply_text(i18n.t(lang_of(update), "banned"))
+        return
+    lang = lang_of(update)
+    downloads = await asyncio.to_thread(db.count_user_downloads, uid)
+    invited = await asyncio.to_thread(db.count_referrals, uid)
+    credits = await asyncio.to_thread(db.get_referral_credits, uid)
+    today = await asyncio.to_thread(db.count_downloads_today, uid)
+    fa = lang == "fa"
+    lines = [
+        "📊 **آمار شما**" if fa else "📊 **Your stats**",
+        "",
+        (f"🎬 دانلودهای موفق: **{downloads}**" if fa
+         else f"🎬 Successful downloads: **{downloads}**"),
+        (f"📅 امروز: **{today}**" if fa else f"📅 Today: **{today}**"),
+        "",
+        ("🎁 **دعوت دوستان:**" if fa else "🎁 **Referrals:**"),
+        (f"👥 دعوت‌شده: **{min(invited, db.REFERRAL_CAP)}/{db.REFERRAL_CAP}**"
+         if fa else f"👥 Invited: **{min(invited, db.REFERRAL_CAP)}/{db.REFERRAL_CAP}**"),
+        (f"⚡ اعتبار رد کردن صف: **{credits}**" if fa
+         else f"⚡ Queue-skip credits: **{credits}**"),
+        "",
+        ("/ref برای لینک دعوتت 😊" if fa else "Use /ref to get your invite link 😊"),
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ── B3: /downloads library ────────────────────────────────────
+def _lib_keyboard(rows) -> InlineKeyboardMarkup:
+    """[re-send][delete-for-me] row per library entry. Callback data carries
+    the entry id; ownership is re-checked server-side on every action."""
+    kb = []
+    for entry_id, _fid, _cap, created in rows:
+        kb.append([
+            InlineKeyboardButton(f"📤 {created[:10]}", callback_data=f"lib|send|{entry_id}"),
+            InlineKeyboardButton("🗑", callback_data=f"lib|del|{entry_id}"),
+        ])
+    return InlineKeyboardMarkup(kb)
+
+
+async def downloads_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/downloads — last 10 delivered files (7-day expiry), re-send or delete."""
+    if not update.message:
+        return
+    uid = update.effective_user.id
+    db.record_user(update)
+    if db.is_banned(uid):
+        await update.message.reply_text(i18n.t(lang_of(update), "banned"))
+        return
+    lang = lang_of(update)
+    rows = await asyncio.to_thread(db.get_library, uid)
+    if not rows:
+        await update.message.reply_text(i18n.t(lang, "lib_empty"))
+        return
+    fa = lang == "fa"
+    header = (f"📚 **کتابخانه شما** ({len(rows)} فایل اخیر — ۷ روز نگه داشته می‌شن):"
+              if fa else
+              f"📚 **Your library** ({len(rows)} recent files — kept for 7 days):")
+    await update.message.reply_text(header, reply_markup=_lib_keyboard(rows))
+
+
+async def downloads_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    data = (q.data or "").split("|")  # lib|<action>|<id>
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    if not q.message or len(data) != 3:
+        return
+    uid = q.from_user.id
+    lang = lang_of(update)
+    action, entry_id = data[1], data[2]
+    try:
+        entry_id = int(entry_id)
+    except ValueError:
+        return
+
+    if action == "del":
+        # delete-for-me — ownership enforced inside delete_library_entry
+        ok = await asyncio.to_thread(db.delete_library_entry, uid, entry_id)
+        try:
+            await q.answer(("🗑 حذف شد" if ok else "⌛️ منقضی شده")
+                           if lang == "fa" else ("🗑 Deleted" if ok else "⌛️ Expired"),
+                           show_alert=False)
+        except Exception:
+            pass
+        if ok:
+            rows = await asyncio.to_thread(db.get_library, uid)
+            if rows:
+                try:
+                    await q.message.edit_reply_markup(reply_markup=_lib_keyboard(rows))
+                except Exception:
+                    pass  # message layout unchanged otherwise
+            else:
+                try:
+                    await q.message.edit_text(i18n.t(lang, "lib_empty"))
+                except Exception:
+                    pass
+        return
+
+    if action == "send":
+        row = await asyncio.to_thread(db.get_library_entry, uid, entry_id)
+        if not row:
+            try:
+                await q.answer(i18n.t(lang, "link_expired"), show_alert=True)
+            except Exception:
+                pass
+            return
+        _eid, file_id, caption, _created = row
+        try:
+            # file_ids are Telegram-CDN handles: re-sending costs no disk/bandwidth.
+            # Audio vs video is decided by what Telegram has under this file_id.
+            try:
+                await context.bot.send_video(chat_id=update.effective_chat.id,
+                                             video=file_id,
+                                             caption=caption or None,
+                                             supports_streaming=True)
+            except Exception:
+                await context.bot.send_audio(chat_id=update.effective_chat.id,
+                                             audio=file_id,
+                                             caption=caption or None)
+        except Exception as e:
+            log.warning("library re-send failed (user=%s, entry=%s): %s", uid, entry_id, e)
+            try:
+                await q.answer(i18n.t(lang, "link_expired"), show_alert=True)
+            except Exception:
+                pass
+
+
+# ── B4: /fast mode ────────────────────────────────────────────
+async def fast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/fast — toggle per-user fast mode: skip thumbnail fetch + subtitle
+    translation for the fastest possible delivery."""
+    if not update.message:
+        return
+    uid = update.effective_user.id
+    db.record_user(update)
+    if db.is_banned(uid):
+        await update.message.reply_text(i18n.t(lang_of(update), "banned"))
+        return
+    lang = lang_of(update)
+    new_state = not await asyncio.to_thread(db.fast_mode_enabled, uid)
+    await asyncio.to_thread(db.set_fast_mode, uid, new_state)
+    fa = lang == "fa"
+    state_txt = ("⚡ **حالت سریع: روشن**\n\n"
+                 "✅ عکس جلد ویدیو گرفته نمیشه\n"
+                 "✅ ترجمه زیرنویس انجام نمیشه\n"
+                 "🚀 نتیجه: تحویل سریع‌تر، مخصوصاً برای یوتیوب\n\n"
+                 "برای خاموش کردن دوباره /fast رو بزن."
+                 if fa else
+                 "⚡ **Fast mode: ON**\n\n"
+                 "✅ No thumbnail fetch\n"
+                 "✅ No subtitle translation\n"
+                 "🚀 Result: faster delivery, especially for YouTube\n\n"
+                 "Tap /fast again to turn it off.")
+    off_txt = ("🐢 **حالت سریع: خاموش**\n\n"
+               "عکس جلد گرفته میشه و زیرنویس‌ها ترجمه می‌شن (کیفیت کامل).\n\n"
+               "برای روشن کردن دوباره /fast رو بزن."
+               if fa else
+               "🐢 **Fast mode: OFF**\n\n"
+               "Thumbnails are fetched and subtitles translated (full quality).\n\n"
+               "Tap /fast again to turn it on.")
+    await update.message.reply_text(state_txt if new_state else off_txt)
+
+
+def _fast_mode_on(uid: int) -> bool:
+    """Sync wrapper used inside download paths (called via to_thread where needed)."""
+    try:
+        return db.fast_mode_enabled(uid)
+    except Exception:
+        return False
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -761,10 +1219,19 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         s = db.get_stats()
         by_site = "\n".join(f"▫️ {k}: {v}" for k, v in list(s["by_site"].items())[:8]) or "—"
         disk = f"{folder_size(DOWNLOAD_DIR)//1024//1024 + folder_size(API_STORAGE)//1024//1024} MB"
+        total_refs = 0
+        try:
+            conn = db._conn()
+            row = conn.execute("SELECT COUNT(*) FROM referrals").fetchone()
+            conn.close()
+            total_refs = row[0] if row else 0
+        except Exception:
+            pass
         await q.message.edit_text(
             i18n.t(lang, "admin_stats").format(
                 users=s["users"], links=s["links"], success=s["success"],
-                failed=s["failed"], by_site=by_site, disk=disk),
+                failed=s["failed"], by_site=by_site, disk=disk) +
+            f"\n\n🎁 Referrals: {total_refs}",
             parse_mode="Markdown",
             reply_markup=admin_back_keyboard(lang))
     elif action == "users":
@@ -1011,12 +1478,19 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text += f"📦 حجم دانلود فعلی: {folder_size(DOWNLOAD_DIR)//1024//1024} MB\n"
         await q.message.edit_text(text, parse_mode="Markdown", reply_markup=admin_back_keyboard(lang))
     elif action == "logs":
-        # Show recent errors from systemd journal
+        # Show recent errors from systemd journal.
+        # journalctl can block for seconds — run it OFF the event loop so other
+        # users' messages keep flowing while the admin pulls logs.
         try:
-            r = subprocess.run(
-                ["journalctl", "-u", "tg-download-bot", "--no-pager", "-n", "200", "-o", "short-iso"],
-                capture_output=True, text=True, timeout=15)
-            lines = [l for l in r.stdout.splitlines()
+
+            def _read_journal():
+                r = subprocess.run(
+                    ["journalctl", "-u", "tg-download-bot", "--no-pager", "-n", "200", "-o", "short-iso"],
+                    capture_output=True, text=True, timeout=15)
+                return r.stdout or ""
+
+            out = await asyncio.to_thread(_read_journal)
+            lines = [l for l in out.splitlines()
                      if any(x in l.lower() for x in ("error", "exception", "traceback"))
                      and "HTTP Request" not in l]
             if not lines:
@@ -1329,15 +1803,21 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if state == "broadcast":
         context.user_data.pop("adm_state", None)
+        # C/B8: get_all_user_ids() already excludes banned users; chunked at
+        # 25 messages / 1s sleep so Telegram's ~30 msg/s global cap is never hit.
         user_ids = db.get_all_user_ids()
         sent = failed = 0
-        for uid in user_ids:
-            try:
-                await context.bot.send_message(chat_id=uid, text=text)
-                sent += 1
-            except Exception:
-                failed += 1
-            await asyncio.sleep(0.05)
+        for i in range(0, len(user_ids), 25):
+            chunk = user_ids[i:i + 25]
+            for uid in chunk:
+                try:
+                    await context.bot.send_message(chat_id=uid, text=text)
+                    sent += 1
+                except Exception as e:
+                    log.debug("broadcast to %s failed: %s", uid, str(e)[:60])
+                    failed += 1
+            if i + 25 < len(user_ids):
+                await asyncio.sleep(1)
         await update.message.reply_text(i18n.t(lang, "broadcast_sent").format(sent=sent) +
                                         (i18n.t(lang, "broadcast_failed").format(failed=failed) if failed else ""))
 
@@ -2179,25 +2659,56 @@ async def group_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     me = await context.bot.get_me()
     if not any(m.id == me.id for m in msg.new_chat_members):
         return
-    text = (
-        "👋 **سلام! من رایان دانلودر هستم** 🎬\n\n"
-        "هر لینکی تو گروه بفرستید براتون دانلود می‌کنم:\n"
-        "🔹 یوتیوب • اینستاگرام • توییتر • تیک‌تاک • آپارات و ده‌ها سایت دیگه\n"
-        "🎵 MP3 • 💬 زیرنویس یوتیوب • 🔎 تشخیص آهنگ\n\n"
-        "⚙️ **تنظیمات گروه (فقط ادمین‌ها):**\n"
-        "/groupsettings — وضعیت تنظیمات\n"
-        "/setquality — حداکثر کیفیت\n"
-        "/setmedia — نوع رسانه‌های مجاز\n"
-        "/setfilter — فیلتر لینک‌ها\n"
-        "/autodl — دانلود خودکار روشن/خاموش\n"
-        "/silent — حالت بی‌صدا\n"
-        "/commandonly — فقط با دستور دانلود کنه\n\n"
-        "💡 همین الان یه لینک بفرستید تا شروع کنیم!"
-    )
+    # Group language is whatever the first actor's stored lang says; fall back
+    # to the group members' most common lang, then fa. tr/ru/de/es get a fully
+    # localized settings block via i18n (A5).
+    lang = _group_lang(update)
+    if lang != "fa":
+        base = i18n.t(lang, "group_welcome_intro")
+        text = base + i18n.t(lang, "group_welcome_extra")
+    else:
+        text = (
+            "👋 **سلام! من رایان دانلودر هستم** 🎬\n\n"
+            "هر لینکی تو گروه بفرستید براتون دانلود می‌کنم:\n"
+            "🔹 یوتیوب • اینستاگرام • توییتر • تیک‌تاک • آپارات و ده‌ها سایت دیگه\n"
+            "🎵 MP3 • 💬 زیرنویس یوتیوب • 🔎 تشخیص آهنگ\n\n"
+            "⚙️ **تنظیمات گروه (فقط ادمین‌ها):**\n"
+            "/groupsettings — وضعیت تنظیمات\n"
+            "/setquality — حداکثر کیفیت\n"
+            "/setmedia — نوع رسانه‌های مجاز\n"
+            "/setfilter — فیلتر لینک‌ها\n"
+            "/autodl — دانلود خودکار روشن/خاموش\n"
+            "/silent — حالت بی‌صدا\n"
+            "/commandonly — فقط با دستور دانلود کنه\n\n"
+            "💡 همین الان یه لینک بفرستید تا شروع کنیم!"
+        )
     try:
         await msg.reply_text(text, parse_mode="Markdown", disable_web_page_preview=True)
     except Exception as e:
         log.warning("group_welcome: %s", e)
+
+
+def _group_lang(update: Update) -> str:
+    """Language for group-wide messages: prefer the adder's stored lang when it
+    is one of the fully-supported ones, else fa."""
+    try:
+        msg = update.message or update.effective_message
+        actors = [m.id for m in (msg.new_chat_members or [])]
+        me_hint = getattr(update.effective_user, "id", None)
+        candidates = [uid for uid in ([me_hint] + actors) if uid]
+        from collections import Counter
+        counts = Counter()
+        conn = None
+        for uid in candidates[:5]:
+            l = db.get_user_lang(uid)
+            if l:
+                counts[l] += 1
+        for l, _n in counts.most_common():
+            if l in ("tr", "ru", "de", "es", "en"):
+                return l
+    except Exception as e:
+        log.debug("group_lang: %s", e)
+    return "fa"
 
 
 async def setquality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2525,8 +3036,18 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
          InlineKeyboardButton("2160p", callback_data=f"setdefq|2160")],
     ])
     fmt = "🎵 MP3" if s["default_audio"] else "🎬 MP4"
+    # B4: show current /fast state (toggle lives in /fast)
+    fa = lang == "fa"
+    fast_line = ("⚡ حالت سریع: **روشن** — با /fast خاموش کن"
+                 if db.fast_mode_enabled(uid) else
+                 "⚡ حالت سریع: خاموش — با /fast روشن کن") \
+        if fa else \
+        ("⚡ Fast mode: **ON** — tap /fast to disable"
+         if db.fast_mode_enabled(uid) else
+         "⚡ Fast mode: off — tap /fast to enable")
     await update.message.reply_text(
         i18n.t(lang, "settings_title").format(quality=s["default_quality"], format=fmt) +
+        "\n" + fast_line +
         "\n\n" + i18n.t(lang, "settings_quality_prompt"),
         reply_markup=kb)
 
@@ -2870,6 +3391,122 @@ async def _send_album(context, chat_id: int, media: list, caption: str = None) -
                 log.warning("single media fallback failed: %s", e)
 
 
+# ── C/B5: batch links (2-5 URLs in one private message) ───────
+BATCH_MIN_URLS = 2
+BATCH_MAX_URLS = 5
+
+
+def _extract_urls(text: str) -> list:
+    """All http(s) URLs in a message, trailing punctuation stripped."""
+    urls = [u.rstrip('.,;!?،؛') for u in re.findall(r'https?://[^\s]+', text or "")]
+    return [u for u in urls if u.startswith("http")]
+
+
+def _batch_summary_text(n: int, results: list, lang: str) -> str:
+    """Compose the per-message summary: one line per URL (✅ title / ❌)."""
+    lines = []
+    for i, r in enumerate(results, 1):
+        status = (i18n.t(lang, "batch_item_ok").format(title=(r.get("title") or "?")[:60])
+                  if r.get("ok") else i18n.t(lang, "batch_item_fail"))
+        lines.append(i18n.t(lang, "batch_item_line").format(
+            i=i, status=dl._esc_md(status)))
+    return i18n.t(lang, "batch_summary").format(
+        n=n, lines="\n".join(lines))
+
+
+async def _handle_batch_links(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                              urls: list, lang: str) -> None:
+    """Download 2-5 URLs from ONE private message and deliver them one by one,
+    then a summary listing each link's outcome."""
+    uid = update.effective_user.id
+    chat_id = update.effective_chat.id
+    n = len(urls)
+    if n > BATCH_MAX_URLS:
+        await update.message.reply_text(
+            i18n.t(lang, "batch_too_many").format(n=n), parse_mode="Markdown")
+        urls = urls[:BATCH_MAX_URLS]
+        n = BATCH_MAX_URLS
+
+    summary_msg = await update.message.reply_text(
+        i18n.t(lang, "batch_progress").format(done=0, n=n))
+    results = []
+    sent_any = False
+    for idx, url in enumerate(urls):
+        site = dl.detect_site(url)
+        db.record_link(update, url, f"batch:{site}")
+        ok_item, title = False, ""
+        try:
+            # info via to_thread — yt-dlp must never block the event loop
+            info = await asyncio.to_thread(dl.get_video_info, url)
+            if not info.get("error"):
+                title = info.get("title") or ""
+                qualities = info.get("qualities") or {}
+                heights = sorted([int(q) for q in qualities.keys()], reverse=True)
+                quality = str(heights[0]) if heights else "best"
+                out_path = os.path.join(DOWNLOAD_DIR, f"bt_{uid}_{idx}_{int(time.time())}.mp4")
+                dl.cleanup(out_path)
+                ok_dl = await _limited_download(url, quality, False, out_path, uid=uid)
+                out_path = resolve_out_path(out_path)
+                if ok_dl and out_path and os.path.exists(out_path):
+                    size_mb = os.path.getsize(out_path) / (1024 * 1024)
+                    if size_mb <= MAX_FILE_SIZE_MB:
+                        try:
+                            info2 = dict(info)
+                            info2["quality"] = quality
+                            info2["size_str"] = dl.human_size(os.path.getsize(out_path))
+                            caption = dl.make_caption(info2, lang)
+                            thumb_path = (None if _fast_mode_on(uid)
+                                          else await _fetch_thumb(info, url))
+                            thumb_fh = open(thumb_path, "rb") if thumb_path else None
+                            try:
+                                sent = await context.bot.send_video(
+                                    chat_id=chat_id,
+                                    video=open(out_path, "rb"),
+                                    caption=caption,
+                                    parse_mode="Markdown",
+                                    supports_streaming=True,
+                                    thumbnail=thumb_fh,
+                                )
+                                ok_item = bool(sent)
+                                fid = getattr(getattr(sent, "video", None), "file_id", None)
+                                if fid:
+                                    cdncache.put(f"{url}|{quality}", fid, "video", caption)
+                                    await asyncio.to_thread(
+                                        db.library_add, uid, fid,
+                                        f"🎬 {info.get('title', '')}")
+                            finally:
+                                if thumb_fh:
+                                    thumb_fh.close()
+                        except Exception as e:
+                            log.warning("batch send %s: %s", url[:60], e)
+                    else:
+                        log.info("batch item too big (%d MB): %s", int(size_mb), url[:60])
+                    dl.cleanup(out_path)
+            if ok_item:
+                db.record_download(uid, url, site, "batch", True)
+                sent_any = True
+            else:
+                db.record_download(uid, url, site, "batch", False)
+        except Exception as e:
+            log.warning("batch item failed %s: %s", url[:80], e)
+            db.record_download(uid, url, site, "batch", False)
+        results.append({"ok": ok_item, "title": title})
+        try:
+            await summary_msg.edit_text(
+                i18n.t(lang, "batch_progress").format(done=idx + 1, n=n))
+        except Exception:
+            pass
+
+    final_text = _batch_summary_text(n, results, lang)
+    try:
+        await summary_msg.edit_text(final_text, parse_mode="Markdown",
+                                    disable_web_page_preview=True)
+    except Exception as e:
+        log.warning("batch summary edit: %s", e)
+    if sent_any:
+        await asyncio.to_thread(enforce_disk_limit)
+
+
 # ── Main link handler ─────────────────────────────────────────
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Guard: this handler is registered on filters.TEXT which also fires for
@@ -2896,8 +3533,22 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(i18n.t(lang, "banned"))
         return
 
-    # Extract the first URL from the message (handles "@bot" mentions, extra text, etc.)
+    # Extract URLs from the message (handles "@bot" mentions, extra text, etc.)
     raw_text = update.message.text.strip()
+
+    # ── C/B6: DAILY LIMIT — non-allowed users in private chat get a per-day
+    # download cap (default 10). Groups are exempt. Batch path checks its own.
+    if not is_group:
+        if not await check_daily_limit(update, uid, lang):
+            return
+
+    # ── C/B5: BATCH LINKS — 2-5 URLs in ONE private message → queue them all,
+    # deliver one by one + a summary. Groups keep the single-link behavior.
+    urls = [] if is_group else _extract_urls(raw_text)
+    if len(urls) >= BATCH_MIN_URLS:
+        await _handle_batch_links(update, context, urls, lang)
+        return
+
     m = re.search(r'https?://[^\s]+', raw_text)
     if not m:
         # In groups, normal chat messages must be ignored silently (no "invalid link" spam).
@@ -3275,20 +3926,39 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 header = i18n.t(lang, "tw_thread_item").format(n=i, name=dl._esc_md(t.get("user_name") or ""), text=text)
                 await update.message.reply_text(header, disable_web_page_preview=True)
                 # Send photos for each tweet in the thread as ONE album
-                th_photos = []
+                th_media = []
                 for j, photo_url in enumerate(t.get("photos", [])[:4]):
                     p_path = os.path.join(DOWNLOAD_DIR, f"twth_{uid}_{i}_{j}_{int(time.time())}.jpg")
                     ok_p = await asyncio.to_thread(igtw.download_twitter_photo, photo_url, p_path)
                     if ok_p and os.path.exists(p_path) and os.path.getsize(p_path) > 0:
-                        th_photos.append(("photo", p_path))
-                if len(th_photos) > 1:
+                        th_media.append(("photo", p_path))
+                # Thread VIDEOS were collected by get_twitter_thread but never
+                # sent — download them too and let _send_album group them with
+                # the photos of the same tweet.
+                for j, v_url in enumerate((t.get("video_urls") or [])[:2]):
+                    v_path = os.path.join(DOWNLOAD_DIR, f"twthv_{uid}_{i}_{j}_{int(time.time())}.mp4")
+                    ok_v = await asyncio.to_thread(igtw.download_twitter, url, "best", v_path, v_url)
+                    if ok_v and os.path.exists(v_path) and os.path.getsize(v_path) > 0 \
+                            and os.path.getsize(v_path) <= MAX_FILE_SIZE_MB * 1024 * 1024:
+                        th_media.append(("video", v_path))
+                if len(th_media) > 1:
                     try:
-                        await _send_album(context, update.effective_chat.id, th_photos)
+                        await _send_album(context, update.effective_chat.id, th_media)
                     except Exception as e:
                         log.warning("thread album failed: %s", e)
-                elif th_photos:
-                    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=open(th_photos[0][1], "rb"))
-                for _, p in th_photos:
+                elif th_media:
+                    kind, path = th_media[0]
+                    opener = context.bot.send_video if kind == "video" else context.bot.send_photo
+                    try:
+                        if kind == "video":
+                            await context.bot.send_video(chat_id=update.effective_chat.id,
+                                                         video=open(path, "rb"), supports_streaming=True)
+                        else:
+                            await context.bot.send_photo(chat_id=update.effective_chat.id,
+                                                         photo=open(path, "rb"))
+                    except Exception as e:
+                        log.warning("thread single media: %s", e)
+                for _, p in th_media:
                     dl.cleanup(p)
             db.record_download(uid, url, "twitter", "thread", True)
             try:
@@ -3392,7 +4062,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                                        parse_mode="Markdown")
             out_path = os.path.join(DOWNLOAD_DIR, f"grp_{chat.id}_{uuid.uuid4().hex[:8]}")
             dl.cleanup(out_path)
-            ok = await _limited_download(url, str(chosen), False, out_path)
+            ok = await _limited_download(url, str(chosen), False, out_path, uid=uid)
             out_path = resolve_out_path(out_path)
             if not ok:
                 db.record_download(uid, url, site, str(chosen), False)
@@ -3410,7 +4080,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             info2["quality"] = chosen
             info2["size_str"] = dl.human_size(os.path.getsize(out_path))
             caption = dl.make_caption(info2, lang) if not gs["silent"] else None
-            thumb_path = await _fetch_thumb(info, url)
+            # B4: /fast ON → no thumbnail fetch
+            thumb_path = (None if _fast_mode_on(uid)
+                          else await _fetch_thumb(info, url))
             thumb_fh = open(thumb_path, "rb") if thumb_path else None
             try:
                 sent = await context.bot.send_video(
@@ -3452,16 +4124,23 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     best = h
                     break
 
-    # Quality buttons; 💬 badge marks heights whose yt-dlp format carries
-    # subtitle tracks (per-format data only — absent data → no annotation).
+    # Quality buttons — MAIN PAGE: ONLY 1080p/720p/480p (user-mandated cleanup);
+    # every other height moves behind «🎥 کیفیت‌های دیگر» (paginated ≤8/page,
+    # handled by the more| callback). When none of the trio exists the menu
+    # keeps showing ALL heights as before. 💬 badge marks heights whose
+    # yt-dlp format carries subtitle tracks (per-format data only).
     fmt_sub_heights = info.get("format_sub_heights") or []
+    main_heights, other_pages = split_qualities(heights)
     keyboard = []
-    for h in heights:
+    for h in main_heights:
         if h != best:
             est = sizes.get(str(h))
             label = f"🎥 {h}p" + (f" ({dl.human_size(est)})" if est else "")
             label = quality_sub_badge(label, h, fmt_sub_heights)
             keyboard.append([InlineKeyboardButton(label, callback_data=f"dl|{dl_id}|{h}")])
+    if other_pages:
+        keyboard.append([InlineKeyboardButton(
+            "🎥 کیفیت‌های دیگر", callback_data=f"more|{dl_id}|0")])
     keyboard.append([InlineKeyboardButton(i18n.t(lang, "mp3_only"), callback_data=f"dl|{dl_id}|audio")])
     keyboard.append([InlineKeyboardButton("🎵 تشخیص آهنگ", callback_data=f"dl|{dl_id}|shazam")])
 
@@ -3522,7 +4201,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception as e:
             log.info("cdn re-send failed, downloading fresh: %s", str(e)[:80])
 
-    ok = await _limited_download(url, str(best), False, out_path)
+    ok = await _limited_download(url, str(best), False, out_path, uid=uid)
     out_path = resolve_out_path(out_path)
     if not ok:
         db.record_download(uid, url, site, str(best), False)
@@ -3541,31 +4220,36 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     info2["size_str"] = dl.human_size(os.path.getsize(out_path))
     caption = dl.make_caption(info2, lang)
 
-    thumb_path = await _fetch_thumb(info, url)
+    # B4: /fast ON → no thumbnail fetch
+    thumb_path = (None if _fast_mode_on(uid)
+                  else await _fetch_thumb(info, url))
     thumb_fh = open(thumb_path, "rb") if thumb_path else None
     is_gif = bool((info.get("tw_full") or {}).get("is_gif")) and len(heights) <= 1
-    try:
+
+    def _send_factory():
+        """B7: fresh coroutine per retry attempt — re-opens the file handle."""
         if is_gif:
-            # Twitter GIF = silent looping mp4 → send as ANIMATION (loops in Telegram)
-            sent = await context.bot.send_animation(
+            return context.bot.send_animation(
                 chat_id=update.effective_chat.id,
                 animation=open(out_path, "rb"),
                 caption=caption,
                 parse_mode="Markdown",
                 thumbnail=thumb_fh,
             )
-        else:
-            sent = await context.bot.send_video(
-                chat_id=update.effective_chat.id,
-                video=open(out_path, "rb"),
-                caption=caption,
-                parse_mode="Markdown",
-                supports_streaming=True,
-                thumbnail=thumb_fh,
-                reply_markup=InlineKeyboardMarkup(keyboard + [
-                    [InlineKeyboardButton(i18n.t(lang, "more_qualities"), callback_data=f"more|{dl_id}")]
-                ]),
-            )
+        return context.bot.send_video(
+            chat_id=update.effective_chat.id,
+            video=open(out_path, "rb"),
+            caption=caption,
+            parse_mode="Markdown",
+            supports_streaming=True,
+            thumbnail=thumb_fh,
+            reply_markup=InlineKeyboardMarkup(keyboard + [
+                [InlineKeyboardButton(i18n.t(lang, "more_qualities"), callback_data=f"more|{dl_id}|0")]
+            ]),
+        )
+
+    try:
+        sent = await _send_media_retry(_send_factory)
     finally:
         if thumb_fh:
             thumb_fh.close()
@@ -3589,6 +4273,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             fid = getattr(tg_id, "file_id", None)
             if fid:
                 cdncache.put(f"{url}|{best}", fid, "video", caption)
+                # B3: private deliveries land in the user's /downloads library
+                if not is_group:
+                    await asyncio.to_thread(
+                        db.library_add, uid, fid,
+                        f"🎬 {info.get('title', '')}")
                 # free the local copy ONLY if nothing else references it — the
                 # linkcache entry above still serves this exact file
                 if not cached_locally:
@@ -3646,17 +4335,58 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     parts = data.split("|")
     if len(parts) >= 3 and parts[0] == "sub":
-        # ── Subtitle flow step 1: ask WHICH kind the user wants ──
+        # ── Subtitle flow STEP 1→2: language chosen → QUALITY picker.
+        # Only the qualities the MAIN menu offered (1080/720/480 trio, or all
+        # heights when none of the trio exists); same dl_id/user_data. Each
+        # step edits the SAME message (C: no more confusing message pile-up).
         dl_id, sublang = parts[1], parts[2]
         sub_url = context.user_data.get(f"suburl_{dl_id}")
         if not sub_url:
-            try:
-                await q.answer()
-            except Exception:
-                pass  # already answered above / query too old
-            await q.message.reply_text(i18n.t(lang, "link_expired"))
+            await _answer_retry(q, i18n.t(lang, "link_expired"), show_alert=True)
             return
-        context.user_data[f"suburl_{dl_id}"] = sub_url  # keep for submode callbacks
+        entry = context.user_data.get(f"dl_{dl_id}") or {}
+        heights = entry.get("heights") or []
+        sizes = (entry.get("info") or {}).get("sizes", {})
+        main_btns, has_others = sub_quality_main_buttons(heights, sizes, dl_id, sublang)
+        rows = [[InlineKeyboardButton(lbl, callback_data=cb)] for lbl, cb in main_btns]
+        if has_others:
+            rows.append([InlineKeyboardButton("🎥 کیفیت‌های دیگر",
+                                              callback_data=f"subqo|{dl_id}|{sublang}|0")])
+        rows.append([InlineKeyboardButton("❌", callback_data="cancel")])
+        await _answer_retry(q)
+        await _edit_retry(q.message,
+                          "🎯 کیفیت ویدیو را انتخاب کن",
+                          reply_markup=InlineKeyboardMarkup(rows))
+        return
+    if len(parts) >= 4 and parts[0] == "subqo":
+        # ── Sub-flow «کیفیت‌های دیگر» page for the SUB chain (paginated) ──
+        _, dl_id, sublang, page_s = parts
+        page = int(page_s) if page_s.isdigit() else 0
+        entry = context.user_data.get(f"dl_{dl_id}") or {}
+        heights = entry.get("heights") or []
+        sizes = (entry.get("info") or {}).get("sizes", {})
+        btns, total = sub_quality_other_buttons(heights, sizes, dl_id, sublang, page)
+        rows = [[InlineKeyboardButton(lbl, callback_data=cb)] for lbl, cb in btns]
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀️", callback_data=f"subqo|{dl_id}|{sublang}|{page - 1}"))
+        nav.append(InlineKeyboardButton("❌", callback_data="cancel"))
+        if page < total - 1:
+            nav.append(InlineKeyboardButton("▶️", callback_data=f"subqo|{dl_id}|{sublang}|{page + 1}"))
+        rows.append(nav)
+        await _answer_retry(q)
+        await _edit_retry(q.message,
+                          "🎯 کیفیت ویدیو را انتخاب کن",
+                          reply_markup=InlineKeyboardMarkup(rows))
+        return
+    if len(parts) >= 4 and parts[0] == "subq":
+        # ── Subtitle flow STEP 2→3: quality chosen → MODE picker ──
+        _, dl_id, sublang, quality = parts
+        sub_url = context.user_data.get(f"suburl_{dl_id}")
+        if not sub_url:
+            await _answer_retry(q, i18n.t(lang, "link_expired"), show_alert=True)
+            return
+        context.user_data[f"subq_{dl_id}"] = quality  # carried into submode
         # hardsub temporarily disabled — AV1 decode OOM-kills on this 2GB box
         kb_sub = InlineKeyboardMarkup([
             [InlineKeyboardButton("🎬 زیرنویس جداشدنی (سافت ساب)",
@@ -3665,28 +4395,35 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                                   callback_data=f"submode|{dl_id}|{sublang}|srt")],
             [InlineKeyboardButton("❓ فرقشون چیه؟",
                                   callback_data=f"subhelp|{dl_id}")],
+            [InlineKeyboardButton("❌", callback_data="cancel")],
         ])
-        await q.answer()
-        await q.message.reply_text(
-            "💬 چی میخوای؟\n\n"
-            "🔥 **هاردساب:** زیرنویس روی خود ویدیو حک میشه (همیشه معلومه، تو هر پلیری)\n"
-            "🎬 **سافت ساب:** ویدیو به صورت فایل با تراک زیرنویس جدا — تو پلیرهایی مثل VLC خاموش/روشن میشه\n"
-            "📄 **فایل زیرنویس:** فقط srt جدا میاد",
-            parse_mode="Markdown", reply_markup=kb_sub)
+        await _answer_retry(q)
+        await _edit_retry(q.message,
+                          f"💬 چی میخوای؟ (کیفیت {quality}p)\n\n"
+                          "🔥 **هاردساب:** زیرنویس روی خود ویدیو حک میشه (همیشه معلومه، تو هر پلیری)\n"
+                          "🎬 **سافت ساب:** ویدیو به صورت فایل با تراک زیرنویس جدا — تو پلیرهایی مثل VLC خاموش/روشن میشه\n"
+                          "📄 **فایل زیرنویس:** فقط srt جدا میاد",
+                          parse_mode="Markdown", reply_markup=kb_sub)
         return
     if len(parts) >= 4 and parts[0] == "submode":
-        # ── Subtitle flow step 2: execute the chosen mode ──
+        # ── Subtitle flow STEP 3→4: execute the chosen mode ──
         _, dl_id, sublang, mode = parts
         sub_url = context.user_data.get(f"suburl_{dl_id}")
         if not sub_url:
-            try:
-                await q.answer()
-            except Exception:
-                pass  # already answered above / query too old
-            await q.message.reply_text(i18n.t(lang, "link_expired"))
+            await _answer_retry(q, i18n.t(lang, "link_expired"), show_alert=True)
             return
+        sub_quality = context.user_data.get(f"subq_{dl_id}")  # from step 2 (subq|)
+        info_d = context.user_data.get(f"dl_{dl_id}") or {}
+        heights_d = info_d.get("heights") or []
+        # quality chosen in the picker; absent (legacy/stale keyboards) → the
+        # same best-fit default the main menu would have picked
+        if sub_quality and str(sub_quality).isdigit():
+            hs_quality = str(sub_quality)
+        else:
+            best_h = min((h for h in heights_d), default=720)
+            hs_quality = str(best_h)
         try:
-            await q.answer(i18n.t(lang, "subs_sending").format(lang=sublang))
+            await _answer_retry(q, i18n.t(lang, "subs_sending").format(lang=sublang))
         except Exception:
             pass
         status_s = await q.message.reply_text(i18n.t(lang, "subs_sending").format(lang=sublang))
@@ -3700,28 +4437,50 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await q.message.reply_text(i18n.t(lang, "download_failed"))
             return
         # remember title + quality for file naming and downloads
-        info_d = context.user_data.get(f"dl_{dl_id}") or {}
         vtitle = ((info_d.get("info") or {}).get("title") or "video")[:60].strip()
         safe_title = re.sub(r"[^\w\s()-]", "", vtitle) or "video"
-        hs_heights = info_d.get("heights") or []
-        # hardsub decodes the WHOLE video in RAM — cap at 720p on this 2GB box
-        hs_q = int(hs_heights[0]) if hs_heights else 720
-        hs_quality = str(min(hs_q, 720))
 
-        # translation into UI language happens at the end for every mode
+        # translation into UI language happens at the end for every mode.
+        # Any send failure must NOT leak the temp files — clean them here
+        # (callers also cleanup(srt), which is then a harmless no-op).
         async def _send_srt_and_translation():
-            with open(srt, "rb") as fh:
-                await q.message.reply_document(document=fh,
-                                               filename=f"{safe_title} [{sublang}].srt")
-            db.record_download(uid, sub_url, "youtube", f"subs:{sublang}", True)
-            target = lang if sublang != lang else None
-            if target:
-                try:
+            tr_path = None
+            try:
+                with open(srt, "rb") as fh:
+                    await q.message.reply_document(document=fh,
+                                                   filename=f"{safe_title} [{sublang}].srt")
+                db.record_download(uid, sub_url, "youtube", f"subs:{sublang}", True)
+                target = lang if sublang != lang else None
+                # B4: /fast ON → skip the translation pass entirely
+                if target and _fast_mode_on(uid):
+                    target = None
+                if target:
                     tmsg = await q.message.reply_text(i18n.t(lang, "subs_translating"))
                     tr_path = srt.replace(".srt", f"_{target}.srt")
-                    ok_tr = await asyncio.to_thread(
-                        subtitle_translate.translate_srt_file,
-                        srt, tr_path, target, sublang)
+                    # T3: cache-first (repeat requests are instant + free),
+                    # then the budget-guarded translator. BudgetExhausted →
+                    # original srt already sent above + a one-line fa notice.
+                    vid_key = hashlib.md5(sub_url.encode()).hexdigest()[:12]
+                    cached = subtitle_translate.cache_get(vid_key, target)
+                    ok_tr = False
+                    if cached:
+                        tr_path = cached
+                        ok_tr = True
+                    else:
+                        try:
+                            ok_tr = await asyncio.to_thread(
+                                subtitle_translate.translate_srt_file,
+                                srt, tr_path, target, sublang, video_id=vid_key)
+                            if ok_tr:
+                                subtitle_translate.cache_put(vid_key, target, tr_path)
+                        except subtitle_translate.BudgetExhausted:
+                            ok_tr = False
+                            tr_path = None
+                            try:
+                                await q.message.reply_text(
+                                    "(ترجمه امروز به سقف رسید — زیرنویس اصلی ارسال شد)")
+                            except Exception:
+                                pass
                     try:
                         await tmsg.delete()
                     except Exception:
@@ -3733,8 +4492,11 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                         db.record_download(uid, sub_url, "youtube",
                                            f"subs:{target}-translated", True)
                         dl.cleanup(tr_path)
-                except Exception as e:
-                    log.warning("subtitle translate: %s", e)
+            except Exception as e:
+                log.warning("srt send/translate failed (cleaning temp): %s", e)
+                dl.cleanup(srt)
+                if tr_path:
+                    dl.cleanup(tr_path)
 
         if mode == "srt":
             await _send_srt_and_translation()
@@ -3903,7 +4665,7 @@ async def _run_download(update: Update, context: ContextTypes.DEFAULT_TYPE,
     out_path = os.path.join(DOWNLOAD_DIR, f"dl_{uid}_{dl_id}_{quality}.{ext}")
     dl.cleanup(out_path)
 
-    ok = await _limited_download(url, quality, is_audio, out_path)
+    ok = await _limited_download(url, quality, is_audio, out_path, uid=uid)
     out_path = resolve_out_path(out_path)
     if not ok:
         db.record_download(uid, url, dl.detect_site(url), label, False)
@@ -3919,44 +4681,98 @@ async def _run_download(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     await msg.edit_text(i18n.t(lang, "sending"))
 
+    site = dl.detect_site(url)
+    sent = None
     if is_audio:
-        await q.message.reply_audio(audio=open(out_path, "rb"), title=info.get("title", "audio"))
+        # ── B2: embed ID3v2.3 (title/artist=uploader/album=platform + cover)
+        # BEFORE sending, so what lands in the user's player is properly tagged.
+        # Cover comes from the video thumbnail — except in /fast mode, which
+        # skips ALL thumbnail fetching (B4).
+        artist = info.get("uploader") or info.get("channel") or ""
+        album = site if site and site != "other" else (info.get("extractor") or "")
+        cover = None
+        if not _fast_mode_on(uid):
+            cover = await _fetch_thumb(info, url)
+        tagged = await asyncio.to_thread(
+            id3tag.write_tags, out_path,
+            title=(info.get("title") or "audio")[:300],
+            artist=str(artist)[:200], album=str(album)[:200],
+            cover_jpeg=cover or "")
+        if not tagged:
+            log.warning("id3 tag failed for %s — sending untagged", out_path)
+
+        def _send_audio_factory():
+            """B7: fresh coroutine per retry attempt — re-opens the file handle."""
+            return q.message.reply_audio(audio=open(out_path, "rb"),
+                                         title=(info.get("title") or "audio"),
+                                         performer=str(artist) or None)
+
+        sent = await _send_media_retry(_send_audio_factory)
+        # B3: remember for /downloads (re-send straight from Telegram's CDN)
+        fid = getattr(getattr(sent, "audio", None), "file_id", None)
+        if fid:
+            await asyncio.to_thread(db.library_add, uid, fid,
+                                    f"🎵 {info.get('title', '')}")
     else:
         info2 = dict(info)
         info2["quality"] = quality
         info2["size_str"] = dl.human_size(os.path.getsize(out_path))
         caption = dl.make_caption(info2, lang)
-        await q.message.reply_video(video=open(out_path, "rb"), caption=caption,
-                                    parse_mode="Markdown", supports_streaming=True)
+        sent = await q.message.reply_video(video=open(out_path, "rb"), caption=caption,
+                                           parse_mode="Markdown", supports_streaming=True)
+        fid = getattr(getattr(sent, "video", None), "file_id", None)
+        if fid:
+            await asyncio.to_thread(db.library_add, uid, fid,
+                                    f"🎬 {info.get('title', '')}")
 
-    db.record_download(uid, url, dl.detect_site(url), label, True)
+    db.record_download(uid, url, site, label, True)
     dl.cleanup(out_path)
     await msg.delete()
     await asyncio.to_thread(enforce_disk_limit)
 
 
 async def more_qualities(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """«🎥 کیفیت‌های دیگر» — second page of the quality menu, listing ALL
+    remaining heights (paginated ≤8/page). more|{dl_id}|{page}."""
     q = update.callback_query
-    try:
-        await q.answer()
-    except Exception:
-        pass
+    await _answer_retry(q)
     parts = q.data.split("|") if q.data else []
     if len(parts) < 2 or parts[0] != "more":
         return
     dl_id = parts[1]
+    page = int(parts[2]) if len(parts) >= 3 and str(parts[2]).isdigit() else 0
     lang = lang_of(update)
-    keyboard = context.user_data.get(f"more_{dl_id}", [])
+    entry = context.user_data.get(f"dl_{dl_id}")
+    if not entry:
+        try:
+            await _answer_retry(q, i18n.t(lang, "link_expired"), show_alert=True)
+        except Exception:
+            pass
+        return
+    heights = entry.get("heights") or []
+    sizes = (entry.get("info") or {}).get("sizes", {})
+    rows = [[InlineKeyboardButton(lbl, callback_data=f"dl|{dl_id}|{h}")]
+            for lbl, h in quality_others_page(heights, sizes, page)[0]]
+    if not rows:
+        # degenerate: nothing beyond the main trio — fall back to full menu
+        rows = [[InlineKeyboardButton(_height_button_label(h, sizes),
+                                      callback_data=f"dl|{dl_id}|{h}")]
+                for h in split_qualities(heights)[0]]
+    nav = []
+    total = quality_others_page(heights, sizes, 0)[1]
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"more|{dl_id}|{page - 1}"))
+    nav.append(InlineKeyboardButton("❌", callback_data="cancel"))
+    if page < total - 1:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"more|{dl_id}|{page + 1}"))
+    rows.append(nav)
     try:
-        if keyboard:
-            await q.message.reply_text(i18n.t(lang, "choose_quality"),
-                                       reply_markup=InlineKeyboardMarkup(keyboard))
-        else:
-            await q.message.reply_text(i18n.t(lang, "link_expired"))
+        await _edit_retry(q.message, i18n.t(lang, "choose_quality"),
+                          reply_markup=InlineKeyboardMarkup(rows))
     except Exception:
         # Message may have been deleted or the bot restarted — don't crash the loop
         try:
-            await q.answer(i18n.t(lang, "link_expired"), show_alert=True)
+            await _answer_retry(q, i18n.t(lang, "link_expired"), show_alert=True)
         except Exception:
             pass
 
@@ -4059,6 +4875,10 @@ async def _register_commands(app) -> None:
             BotCommand("lang", "🌍 Language / زبان"),
             BotCommand("settings", "⚙️ Default quality"),
             BotCommand("history", "📜 Download history"),
+            BotCommand("downloads", "📚 My files"),
+            BotCommand("fast", "⚡ Fast mode"),
+            BotCommand("ref", "🎁 Invite friends"),
+            BotCommand("stats", "📊 My stats"),
             BotCommand("about", "🤖 About"),
         ]
         _all = private_cmds + [BotCommand("admin", "🛡 Admin panel")]
@@ -4097,6 +4917,14 @@ def main():
     app.add_handler(CommandHandler("ytdl", ytdl_cmd))
     # Shazam-like recognition
     app.add_handler(CommandHandler("shazam", shazam_cmd))
+    # B1 referrals + per-user stats, B3 downloads library, B4 fast mode
+    app.add_handler(CommandHandler("ref", ref_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("downloads", downloads_cmd))
+    app.add_handler(CallbackQueryHandler(downloads_cb, pattern="^lib"))
+    app.add_handler(CommandHandler("fast", fast_cmd))
+    # C/B6: admin sets the per-day download cap for regular users
+    app.add_handler(CommandHandler("setlimit", setlimit_cmd))
     # Force-join channels are managed INSIDE the /admin panel (adm|channels, adm|addchan, adm|delchan)
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
