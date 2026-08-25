@@ -103,6 +103,7 @@ def extract_ig_carousel(post_url: str) -> dict:
         # Each child block: \"is_video\":true/false ... followed by display_url / video_url
         items = []
         seen = set()
+        posters = set()
         # videos first (they also have display_url as poster — mark and skip those)
         video_spans = [(m.start(), m.end()) for m in re.finditer(r'\\\\"is_video\\\\":true', flat)]
         for s, _ in video_spans:
@@ -112,10 +113,15 @@ def extract_ig_carousel(post_url: str) -> dict:
                 vu = vm.group(1).replace("\\\\u0026", "&")
                 items.append(("video", vu))
                 seen.add(vm.group(1))
+            # this child's OWN poster lives in the same JSON block — remember it so
+            # the photo pass below doesn't re-add it as a bogus duplicate "photo"
+            pm2 = re.search(r'\\\\"display_url\\\\":\\\\"(https://[^\\\\"]+)', chunk)
+            if pm2:
+                posters.add(pm2.group(1))
         # photos: display_urls not already claimed by a video poster
         for pm in re.finditer(r'\\\\"display_url\\\\":\\\\"(https://[^\\\\"]+)', flat):
             raw = pm.group(1)
-            if raw in seen:
+            if raw in seen or raw in posters:
                 continue
             u = raw.replace("\\\\u0026", "&")
             if "/t51." not in u and "cdninstagram" not in u:
@@ -123,6 +129,9 @@ def extract_ig_carousel(post_url: str) -> dict:
             if u.endswith((".jpg", ".webp")) or ".jpg" in u:
                 items.append(("photo", u))
                 seen.add(raw)
+        if len(items) <= 1:
+            return {"carousel": False}
+        return {"carousel": True, "items": items[:10], "count": len(items)}
         if len(items) <= 1:
             return {"carousel": False}
         return {"carousel": True, "items": items[:10], "count": len(items)}
@@ -138,7 +147,7 @@ def download_instagram(url: str, out_path: str) -> bool:
         return False
     try:
         r = subprocess.run(
-            ["curl", "-s", "-L", "--max-time", "300", "-A", UA, "-o", out_path, video_url],
+            ["curl", "-s", "-f", "-L", "--max-time", "300", "-A", UA, "-o", out_path, video_url],
             capture_output=True, text=True, timeout=320,
         )
         return os_path_exists(out_path) and os_path_size(out_path) > 0
@@ -312,6 +321,26 @@ def _build_from_fxtwitter(fx: dict, url: str, twid: str) -> dict:
     return result
 
 
+def _best_mp4_variant(variants) -> str | None:
+    """Pick ONE highest-bitrate mp4 URL from syndication/mediaDetails variant
+    lists. Variants are bitrate renditions of the SAME video — keeping them all
+    made callers send duplicates. Accepts dicts ({src|url, bitrate}) or bare URLs.
+    Falls back to the first entry when bitrates are absent/unequal-quality."""
+    best, best_br = None, -1
+    for v in variants or []:
+        if isinstance(v, dict):
+            src = v.get("src") or v.get("url")
+            try:
+                br = int(v.get("bitrate", 0) or 0)
+            except (TypeError, ValueError):
+                br = 0
+        else:
+            src, br = v, 0
+        if src and br > best_br:
+            best, best_br = src, br
+    return best
+
+
 def _build_from_syndication(d: dict, url: str, twid: str) -> dict:
     """Build result from the OLD syndication shape (fallback path)."""
     result = {
@@ -338,21 +367,26 @@ def _build_from_syndication(d: dict, url: str, twid: str) -> dict:
         if m.get("type") == "photo" and m.get("media_url_https"):
             result["photos"].append(m["media_url_https"])
 
-    # Video (prefer best mp4)
+    # Video (prefer best mp4) — variants are bitrate renditions of ONE video,
+    # keep only the highest so callers don't send the same clip 2-3 times
     vid = d.get("video") or {}
     variants = vid.get("variants") or []
     mp4s = [v for v in variants
             if v.get("src") and ("mp4" in str(v.get("type", "")).lower() or "mp4" in v.get("src", ""))]
     if mp4s:
-        result["video_urls"] = [v["src"] for v in mp4s]
-        result["poster"] = vid.get("poster")
+        best_v = _best_mp4_variant(mp4s)
+        if best_v:
+            result["video_urls"] = [best_v]
+            result["poster"] = vid.get("poster")
     else:
         for m in d.get("mediaDetails") or []:
             vi = m.get("video_info") or {}
-            for v in vi.get("variants") or []:
-                if v.get("content_type") == "video/mp4" and v.get("url"):
-                    result["video_urls"].append(v["url"])
-            if result["video_urls"]:
+            vs = [v.get("url") for v in vi.get("variants") or []
+                  if v.get("content_type") == "video/mp4" and v.get("url")]
+            if vs:
+                best_v = _best_mp4_variant(vs)
+                if best_v:
+                    result["video_urls"] = [best_v]
                 break
 
     # Quoted tweet
@@ -412,7 +446,7 @@ def download_twitter(url: str, quality: str, out_path: str, direct_url: str = No
     if direct_url:
         try:
             r = subprocess.run(
-                ["curl", "-s", "-L", "--max-time", "300", "-A",
+                ["curl", "-s", "-f", "-L", "--max-time", "300", "-A",
                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "-o", out_path, direct_url],
                 capture_output=True, text=True, timeout=320)
             if os_path_exists(out_path) and os_path_size(out_path) > 0:
@@ -445,9 +479,18 @@ def download_twitter_photo(url: str, out_path: str) -> bool:
     """Download a single Twitter photo (direct pbs.twimg.com URL)."""
     try:
         r = subprocess.run(
-            ["curl", "-s", "-L", "--max-time", "60", "-A", UA, "-o", out_path, url],
+            ["curl", "-s", "-f", "-L", "--max-time", "60", "-A", UA, "-o", out_path, url],
             capture_output=True, text=True, timeout=70)
-        return os_path_exists(out_path) and os_path_size(out_path) > 0
+        ok = os_path_exists(out_path) and os_path_size(out_path) > 0
+        if not ok:
+            # don't leave zero-byte/partial files in DOWNLOAD_DIR on failure
+            try:
+                import os as _os
+                if _os.path.exists(out_path):
+                    _os.remove(out_path)
+            except OSError:
+                pass
+        return ok
     except Exception as e:
         log.error("tw photo error: %s", e)
         return False
@@ -486,7 +529,9 @@ def get_twitter_thread(url: str, max_items: int = 15) -> dict:
         mp4s = [v for v in (vid.get("variants") or [])
                 if v.get("src") and ("mp4" in str(v.get("type", "")).lower() or "mp4" in v.get("src", ""))]
         if mp4s:
-            item["video_urls"] = [v["src"] for v in mp4s]
+            best_v = _best_mp4_variant([v["src"] for v in mp4s])
+            if best_v:
+                item["video_urls"] = [best_v]
         else:
             for m in d.get("mediaDetails") or []:
                 for v in (m.get("video_info") or {}).get("variants") or []:

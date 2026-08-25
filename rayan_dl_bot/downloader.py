@@ -703,7 +703,9 @@ def download_video_with_subs(url: str, lang: str, out_path: str,
     (VLC / MX Player / Infuse) can toggle it. Returns path or None."""
     import glob as _glob
     d = os.path.dirname(out_path) or "."
-    stem = os.path.join(d, f"subbed_{int(time.time())}")
+    # unique per request — callers pass uid+dl_id names; two users requesting
+    # subtitles in the same second must not collide on one output file
+    stem = out_path.rsplit(".", 1)[0] + f"_{int(time.time()*1000)%100000}"
     proxy = get_proxy_args(url)
     vf = (f"bestvideo[height<={height}]+bestaudio/best"
           if height else "bestvideo+bestaudio/best")
@@ -758,7 +760,9 @@ def download_subtitle(url: str, lang: str, out_path: str) -> str | None:
     Returns the path of the .srt file or None."""
     import glob
     d = os.path.dirname(out_path) or "."
-    stem = f"sub_{int(time.time())}"
+    # honor the caller's unique path (uid+dl_id) — epoch stems collided across users
+    stem = out_path[:-4] if out_path.endswith(".srt") else out_path
+    stem = stem + f"_{int(time.time()*1000)%100000}"
     proxy = get_proxy_args(url)
     try:
         r = subprocess.run(

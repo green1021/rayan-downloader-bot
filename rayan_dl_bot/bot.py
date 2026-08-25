@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    CallbackQueryHandler, filters, ContextTypes,
+    CallbackQueryHandler, TypeHandler, filters, ContextTypes,
 )
 
 import i18n
@@ -250,6 +250,9 @@ def lang_keyboard():
 
 # ── Handlers: start / help / about ────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Guard: edited/channel updates reach handlers without update.message
+    if not update.message:
+        return
     db.record_user(update)
     if db.is_banned(update.effective_user.id):
         await update.message.reply_text(i18n.t(lang_of(update), "banned"))
@@ -290,6 +293,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Guard: edited/channel updates reach handlers without update.message
+    if not update.message:
+        return
     db.record_user(update)
     lang = lang_of(update)
     if not _private_only(update):
@@ -302,6 +308,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def about_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Guard: edited/channel updates reach handlers without update.message
+    if not update.message:
+        return
     if not _private_only(update):
         return
     db.record_user(update)
@@ -310,6 +319,9 @@ async def about_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── Language selection ────────────────────────────────────────
 async def lang_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Guard: edited/channel updates reach handlers without update.message
+    if not update.message:
+        return
     if not _private_only(update):
         return
     db.record_user(update)
@@ -319,6 +331,8 @@ async def lang_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def set_lang_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    if not q or not q.data:
+        return
     parts = q.data.split("|")
     log.info("set_lang_cb: data=%s parts=%s", q.data, parts)
     if len(parts) == 2 and parts[0] == "setlang":
@@ -421,6 +435,9 @@ async def search_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await q.answer()
     except Exception:
         pass
+    # Callbacks on stale (>48h) messages deliver message=None — bail cleanly
+    if not q.message:
+        return
     lang = lang_of(update)
     uid = q.from_user.id
     if data == "srch|close":
@@ -499,6 +516,9 @@ def _private_only(update: Update) -> bool:
 
 
 async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Guard: edited/channel updates reach handlers without update.message
+    if not update.message:
+        return
     # History is a personal feature — only in private chat, never in groups
     if not _private_only(update):
         return
@@ -569,6 +589,9 @@ def is_admin(user_id: int) -> bool:
 
 
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Guard: edited/channel updates reach handlers without update.message
+    if not update.message:
+        return
     # Admin panel is private-only — never visible in a group
     if not _private_only(update):
         return
@@ -642,6 +665,9 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await q.answer()
     except Exception:
         pass
+    # Callbacks on stale (>48h) messages deliver message=None — bail cleanly
+    if not q.message:
+        return
     if not is_admin(q.from_user.id):
         try:
             await q.message.reply_text(i18n.t(lang_of(update), "not_admin"))
@@ -1186,6 +1212,7 @@ async def plugin_file_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         zip_path = os.path.join(DOWNLOAD_DIR, f"plug_{int(time.time())}_{doc.file_name}")
         await tg_file.download_to_drive(zip_path)
         result = await asyncio.to_thread(pm.install_plugin_from_file, zip_path)
+        # remove the uploaded zip on EVERY path — failure must not leak the file
         try:
             os.remove(zip_path)
         except OSError:
@@ -1589,6 +1616,10 @@ async def chapter_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     data = q.data or ""
     parts = data.split("|")
     action = parts[0]
+    # Callbacks on stale (>48h) messages deliver message=None — bail cleanly
+    # (plnoop needs no message anyway)
+    if not q.message and action != "plnoop":
+        return
 
     if action == "plclose":
         try:
@@ -1736,8 +1767,51 @@ async def _send_plugin_result(update: Update, context, result: dict, lang: str,
 
 
 # ── Shazam-like song recognition ─────────────────────────────
+async def _shazam_status(status_msg, lang: str):
+    """Animated «دارم گوش میکنم… 🎵» status edited in place with elapsed seconds.
+
+    Returns a `set_stage(stage)` closure used by the recognition flow; the ticker
+    stops itself. Feedback every ≤5s so the user never stares at silence."""
+    start = time.time()
+    stage_txt = ""
+    stopped = asyncio.Event()
+
+    async def _tick():
+        while not stopped.is_set():
+            elapsed = int(time.time() - start)
+            dots = "." * (1 + elapsed % 3)
+            try:
+                await status_msg.edit_text(
+                    i18n.t(lang, "shazam_searching").format(
+                        elapsed=f"{elapsed}s{stage_txt}{dots}"))
+            except Exception as e:
+                # Retryable-to-ignore: message unchanged / too-similar / deleted
+                log.debug("shazam status tick: %s", e)
+            try:
+                await asyncio.wait_for(stopped.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                pass
+
+    task = asyncio.ensure_future(_tick())
+
+    def set_stage(s: str):
+        nonlocal stage_txt
+        stage_txt = {"fallback": " | 🎹 AcoustID"}.get(s, "")
+
+    async def finish():
+        stopped.set()
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    return set_stage, finish
+
+
 async def _send_shazam_result(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                              result: dict, lang: str) -> None:
+                              result: dict, lang: str,
+                              status_msg=None) -> None:
     """Send the full recognition card: cover photo + metadata + links + music file.
     Works from both a message and a callback_query (button click)."""
     chat_id = update.effective_chat.id
@@ -1751,18 +1825,47 @@ async def _send_shazam_result(update: Update, context: ContextTypes.DEFAULT_TYPE
         spotify_url=result.get("spotify_url") or "https://open.spotify.com",
         shazam_url=result.get("shazam_url") or "https://www.shazam.com",
     )
+    alts = [a for a in (result.get("alternates") or [])
+            if a.get("title")] if isinstance(result, dict) else []
+    if alts:
+        names = " / ".join(f"{a['title']} — {a.get('artist','')}" for a in alts)
+        txt += i18n.t(lang, "shazam_maybe").format(alts=names[:200])
+    src_tag = f"\n🔎 ({result.get('source', 'acoustid')})" \
+        if result.get("source") == "acoustid" else ""
+
+    kb = [[
+        InlineKeyboardButton("▶ YouTube", url=result.get("ytm_url")
+                             or "https://music.youtube.com"),
+        InlineKeyboardButton("🎧 Spotify", url=result.get("spotify_url")
+                             or "https://open.spotify.com"),
+        InlineKeyboardButton(i18n.t(lang, "shazam_retry_btn"),
+                             callback_data=f"shzr|{result.get('key') or 'x'}"),
+    ]]
+    reply_markup = InlineKeyboardMarkup(kb)
+
+    # Store enough state for «تشخیص مجدد»: the original audio source to re-derive.
+    _store_shazam_retry(chat_id, result)
+
     cover = result.get("cover")
-    # Send the card (photo + caption) first — use bot.send_* so it works from callbacks
+    sent = None
+    # Send the card (photo + caption) — use bot.send_* so it works from callbacks
     if cover:
         try:
-            sent = await context.bot.send_photo(chat_id=chat_id, photo=cover, caption=txt,
-                                                parse_mode="Markdown")
-        except Exception:
-            sent = await context.bot.send_message(chat_id=chat_id, text=txt,
-                                                  parse_mode="Markdown", disable_web_page_preview=True)
-    else:
-        sent = await context.bot.send_message(chat_id=chat_id, text=txt,
-                                              parse_mode="Markdown", disable_web_page_preview=True)
+            sent = await context.bot.send_photo(chat_id=chat_id, photo=cover,
+                                                caption=txt + src_tag,
+                                                parse_mode="Markdown",
+                                                reply_markup=reply_markup)
+        except Exception as e:
+            log.warning("shazam send photo card: %s", e)
+    if sent is None:
+        try:
+            sent = await context.bot.send_message(chat_id=chat_id, text=txt + src_tag,
+                                                  parse_mode="Markdown",
+                                                  disable_web_page_preview=True,
+                                                  reply_markup=reply_markup)
+        except Exception as e:
+            log.error("shazam send card: %s", e)
+            raise
     # Then download the actual song and send the music file (fast m4a, no re-encode)
     try:
         await context.bot.send_chat_action(chat_id=chat_id, action="upload_audio")
@@ -1771,19 +1874,93 @@ async def _send_shazam_result(update: Update, context: ContextTypes.DEFAULT_TYPE
     song = os.path.join(DOWNLOAD_DIR, f"song_{int(time.time())}_{result.get('key','x')}.m4a")
     ok = await asyncio.to_thread(
         dl.download_song, result.get("title", ""), result.get("artist", ""), song)
-    if ok and os.path.getsize(song) < MAX_FILE_SIZE_MB * 1024 * 1024:
+    if ok and os.path.exists(song) and os.path.getsize(song) < MAX_FILE_SIZE_MB * 1024 * 1024:
+        fh = None
         try:
+            fh = open(song, "rb")
             await context.bot.send_audio(
                 chat_id=chat_id,
-                audio=open(song, "rb"),
+                audio=fh,
                 title=result.get("title", ""),
                 performer=result.get("artist", ""),
                 caption=f"🎵 {result.get('title','')} — {result.get('artist','')}",
             )
         except Exception as e:
             log.warning("shazam send audio: %s", e)
+        finally:
+            if fh:
+                try:
+                    fh.close()
+                except OSError:
+                    pass
     dl.cleanup(song)
     return sent
+
+
+def _store_shazam_retry(chat_id: int, result: dict) -> None:
+    """Remember what was recognized so «تشخیص مجدد» can re-run on the SAME input."""
+    try:
+        _SHZ_RETRY[chat_id] = {
+            "title": result.get("title", ""), "artist": result.get("artist", ""),
+            "ts": time.time(),
+        }
+    except Exception as e:
+        log.warning("store shazam retry: %s", e)
+
+
+_SHZ_RETRY: dict[int, dict] = {}   # chat_id → last recognized track info
+
+
+async def shazam_retry_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """«🔁 تشخیص مجدد» button: re-recognize with cache disabled.
+
+    The original file is usually already cleaned up by now, so we can't re-fingerprint
+    it exactly. Instead: search YouTube for this title+artist and recognize THAT —
+    a genuinely fresh fingerprint that either confirms or corrects the answer."""
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception as e:
+        log.debug("shzr answer: %s", e)
+    # Callbacks on stale (>48h) messages deliver message=None — bail cleanly
+    if not q.message:
+        return
+    chat_id = q.message.chat_id
+    lang = lang_of(update)
+    entry = _SHZ_RETRY.get(chat_id)
+    if not entry or time.time() - entry["ts"] > 3600:
+        await q.message.reply_text(i18n.t(lang, "link_expired"))
+        return
+    query = f"{entry['title']} {entry['artist']}".strip()
+    status = await q.message.reply_text(i18n.t(lang, "shazam_searching").format(elapsed="0s"))
+    results = await asyncio.to_thread(dl.search_youtube, query, 5)
+    results = [r for r in results if r.get("duration") and 30 <= r["duration"] <= 900]
+    if not results:
+        await status.edit_text(i18n.t(lang, "shazam_no_match"))
+        return
+    url = results[0].get("url") or results[0].get("webpage_url")
+    out_wav = os.path.join(DOWNLOAD_DIR, f"shzr_{chat_id}_{int(time.time())}.wav")
+    ok_wav = False
+    try:
+        ok_wav = await asyncio.to_thread(dl.download_audio_wav, url, out_wav, 45)
+    except Exception as e:
+        log.warning("shazam retry wav: %s", e)
+    result = None
+    if ok_wav:
+        try:
+            result = await recog.recognize_audio(out_wav, cache=False)
+        except Exception as e:
+            log.warning("shazam retry recognize: %s", e)
+        finally:
+            dl.cleanup(out_wav)
+    try:
+        await status.delete()
+    except Exception as e:
+        log.debug("shzr status delete: %s", e)
+    if result and result.get("matched"):
+        await _send_shazam_result(update, context, result, lang)
+    else:
+        await q.message.reply_text(i18n.t(lang, "shazam_no_match"))
 
 
 async def shazam_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1832,35 +2009,50 @@ async def handle_media_file(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     if not file_obj:
         return
-    status = await update.message.reply_text(i18n.t(lang, "shazam_searching"))
+    status = await update.message.reply_text(
+        i18n.t(lang, "shazam_searching").format(elapsed="0s"))
+    set_stage, finish_status = await _shazam_status(status, lang)
     local_path = os.path.join(DOWNLOAD_DIR, f"shz_{uid}_{int(time.time())}")
     try:
         tg_file = await context.bot.get_file(file_obj.file_id)
         await tg_file.download_to_drive(local_path)
     except Exception as e:
-        log.error("shazam download file: %s", e)
+        log.error("shazam download file (user=%s): %s", uid, e)
+        await finish_status()
         await status.edit_text(i18n.t(lang, "shazam_error").format(err=str(e)[:100]))
         return
     # Convert to mono wav for fingerprinting
     wav = local_path + ".wav"
     if not await asyncio.to_thread(recog.to_mono_wav, local_path, wav):
+        await finish_status()
         await status.edit_text(i18n.t(lang, "shazam_error").format(err="ffmpeg convert failed"))
         dl.cleanup(local_path)
         return
-    result = await recog.recognize_audio(wav)
-    dl.cleanup(local_path)
-    dl.cleanup(wav)
+
+    async def _progress(stage: str):
+        set_stage(stage)
+
+    result = None
     try:
-        await status.delete()
-    except Exception:
-        pass
-    if result.get("matched"):
+        result = await recog.recognize_audio(wav, cache=True, progress=_progress)
+    except Exception as e:
+        log.error("shazam recognize (user=%s): %s", uid, e)
+    finally:
+        dl.cleanup(local_path)
+        dl.cleanup(wav)
+        for suffix in (".wina.wav", ".winb.wav", ".winc.wav"):
+            dl.cleanup(wav + suffix)
+        await finish_status()
+
+    if result and result.get("matched"):
         await _send_shazam_result(update, context, result, lang)
+    elif result and result.get("error") == "no_audio_stream":
+        await status.edit_text(i18n.t(lang, "shazam_no_audio"))
     else:
         try:
             await update.message.reply_text(i18n.t(lang, "shazam_no_match"))
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("shazam no-match reply (user=%s): %s", uid, e)
 
 
 # ── Group settings handlers ───────────────────────────────────
@@ -2052,6 +2244,8 @@ async def setmedia_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not q.data or not q.data.startswith("setmedia|"):
         return
     val = q.data.split("|", 1)[1]
+    if not q.message:
+        return
     if val == "close":
         try:
             await q.message.delete()
@@ -2146,6 +2340,8 @@ async def setfilter_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         pass
     if not q.data or not q.data.startswith("setfilter|"):
         return
+    if not q.message:
+        return
     val = q.data.split("|", 1)[1]
     chat = q.message.chat
     if chat.type == "private":
@@ -2236,6 +2432,9 @@ async def setfilter_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 # ── Per-user settings ─────────────────────────────────────────
 async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Guard: edited/channel updates reach handlers without update.message
+    if not update.message:
+        return
     # Personal settings — private only
     if not _private_only(update):
         return
@@ -2260,6 +2459,8 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def set_def_q_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    if not q.data:
+        return
     parts = q.data.split("|")
     if len(parts) == 2 and parts[0] == "setdefq":
         try:
@@ -2435,6 +2636,8 @@ async def force_join_check_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
         await q.answer()
     except Exception:
         pass
+    if not q.message:
+        return
     user = q.from_user
     lang = lang_of(update)
     ok, missing = await _check_channel_membership(context, user.id)
@@ -2894,7 +3097,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         status_msg = await update.message.reply_text(i18n.t(lang, "checking"))
 
     if not auto_info_built:
-        info = dl.get_video_info(url)
+        # to_thread: this runs yt-dlp (up to ~2min, TikTok retry loop longer) —
+        # calling it inline froze the whole event loop for every other user
+        info = await asyncio.to_thread(dl.get_video_info, url)
     if info.get("error"):
         err = info["error"][:200]
         # Instagram/Twitter often need login cookies — give a clear message
@@ -3229,8 +3434,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await context.bot.send_video(
                 chat_id=update.effective_chat.id,
                 video=cdn["file_id"],
-                caption=cdn.get("caption") or caption,
-                parse_mode="Markdown" if (cdn.get("caption") or caption) else None,
+                caption=cdn.get("caption"),
+                parse_mode="Markdown" if cdn.get("caption") else None,
                 supports_streaming=True,
             )
             db.record_download(uid, url, site, f"{best} (cdn)", True)
@@ -3299,10 +3504,12 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             thumb_fh.close()
     db.record_download(uid, url, site, str(best), True)
     # Cache for duplicate-link re-serve (register the existing file; skip the cleanup below)
+    cached_locally = False
     if sent and not is_group:
         fkey = uuid.uuid4().hex[:8]
         context.bot_data[f"cachefile_{fkey}"] = out_path
         linkcache.put(url, {"type": "media", "kind": "video", "file_key": fkey, "caption": caption})
+        cached_locally = True
     else:
         dl.cleanup(out_path)
 
@@ -3315,8 +3522,10 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             fid = getattr(tg_id, "file_id", None)
             if fid:
                 cdncache.put(f"{url}|{best}", fid, "video", caption)
-                # free the local copy — no longer needed (CDN has it)
-                dl.cleanup(out_path)
+                # free the local copy ONLY if nothing else references it — the
+                # linkcache entry above still serves this exact file
+                if not cached_locally:
+                    dl.cleanup(out_path)
         except Exception as e:
             log.debug("cdncache put: %s", e)
 
@@ -3326,7 +3535,10 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ── Quality selection callbacks ───────────────────────────────
 async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    data = q.data
+    data = q.data or ""
+    # Callbacks on stale (>48h) messages deliver message=None — bail cleanly
+    if not q.message:
+        return
     try:
         await q.answer()
     except Exception:
@@ -3371,7 +3583,10 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         dl_id, sublang = parts[1], parts[2]
         sub_url = context.user_data.get(f"suburl_{dl_id}")
         if not sub_url:
-            await q.answer()
+            try:
+                await q.answer()
+            except Exception:
+                pass  # already answered above / query too old
             await q.message.reply_text(i18n.t(lang, "link_expired"))
             return
         context.user_data[f"suburl_{dl_id}"] = sub_url  # keep for submode callbacks
@@ -3385,7 +3600,6 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                                   callback_data=f"subhelp|{dl_id}")],
         ])
         await q.answer()
-        await q.answer()
         await q.message.reply_text(
             "💬 چی میخوای؟\n\n"
             "🔥 **هاردساب:** زیرنویس روی خود ویدیو حک میشه (همیشه معلومه، تو هر پلیری)\n"
@@ -3398,7 +3612,10 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         _, dl_id, sublang, mode = parts
         sub_url = context.user_data.get(f"suburl_{dl_id}")
         if not sub_url:
-            await q.answer()
+            try:
+                await q.answer()
+            except Exception:
+                pass  # already answered above / query too old
             await q.message.reply_text(i18n.t(lang, "link_expired"))
             return
         try:
@@ -3546,6 +3763,25 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not dl_entry:
         await q.message.reply_text(i18n.t(lang, "link_expired"))
         return
+    # In-flight dedup: a second click on the SAME url+quality while the first
+    # download runs would start two yt-dlp processes writing the same file.
+    inflight_key = f"dling_{uid}_{dl_id}_{quality}"
+    if context.bot_data.get(inflight_key):
+        try:
+            await q.answer("⏳ همین دانلود در حال انجام است…", show_alert=True)
+        except Exception:
+            pass
+        return
+    context.bot_data[inflight_key] = True
+    try:
+        await _run_download(update, context, q, uid, lang, dl_id, quality, dl_entry)
+    finally:
+        context.bot_data.pop(inflight_key, None)
+
+
+async def _run_download(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                        q, uid, lang, dl_id, quality, dl_entry) -> None:
+    """Body of the dl| callback (split out so the in-flight guard can wrap it)."""
 
     url = dl_entry["url"]
     info = dl_entry["info"]
@@ -3558,21 +3794,37 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await q.answer("🎵 در حال بررسی آهنگ...")
         except Exception:
             pass
-        status2 = await q.message.reply_text(i18n.t(lang, "shazam_searching"))
+        status2 = await q.message.reply_text(
+            i18n.t(lang, "shazam_searching").format(elapsed="0s"))
+        set_stage, finish_status = await _shazam_status(status2, lang)
         out_audio = os.path.join(DOWNLOAD_DIR, f"shz_{uid}_{dl_id}.wav")
         dl.cleanup(out_audio)
-        # Download just the audio (bestaudio -> wav, 30s) for fingerprinting
-        ok_audio = await asyncio.to_thread(dl.download_audio_wav, url, out_audio)
+        # Download just the audio (bestaudio -> wav) for fingerprinting
         result = None
-        if ok_audio:
-            result = await recog.recognize_audio(out_audio)
+        try:
+            ok_audio = await asyncio.to_thread(dl.download_audio_wav, url, out_audio)
+            if ok_audio:
+
+                async def _progress(stage: str):
+                    set_stage(stage)
+
+                result = await recog.recognize_audio(out_audio, cache=True,
+                                                     progress=_progress)
+        except Exception as e:
+            log.error("shazam from link (user=%s): %s", uid, e)
+        finally:
             dl.cleanup(out_audio)
+            for suffix in (".wina.wav", ".winb.wav", ".winc.wav"):
+                dl.cleanup(out_audio + suffix)
+            await finish_status()
         if result and result.get("matched"):
             try:
                 await status2.delete()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("shazam status2 delete: %s", e)
             await _send_shazam_result(update, context, result, lang)
+        elif result and result.get("error") == "no_audio_stream":
+            await status2.edit_text(i18n.t(lang, "shazam_no_audio"))
         else:
             await status2.edit_text(i18n.t(lang, "shazam_no_match"))
         return
@@ -3661,9 +3913,9 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def on_bot_added(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """When the bot is added to a group/channel, greet with a setup hint.
-    Because of Telegram privacy mode, the bot only sees group messages when it's
-    a group admin — this message tells the admin exactly that."""
+    """When the bot is added to a group/channel (its OWN membership changed),
+    greet with a setup hint. Because of Telegram privacy mode, the bot only sees
+    group messages when it's a group admin — this tells the admin exactly that."""
     mc = update.my_chat_member
     if not mc or not mc.new_chat_member:
         return
@@ -3699,6 +3951,8 @@ async def startmsg_translate_cb(update: Update, context: ContextTypes.DEFAULT_TY
         await q.answer()
     except Exception:
         pass
+    if not q.message:
+        return
     lang = lang_of(update)
     uid = q.from_user.id
     new_text = context.user_data.pop("startmsg_new", None)
@@ -3780,7 +4034,10 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     app.add_handler(MessageHandler(filters.TEXT & filters.COMMAND, admin_input))
-    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_bot_added))
+    # my_chat_member updates (the BOT's own status changed — e.g. added to a
+    # group) are NOT messages, so MessageHandler can't carry them: use a
+    # TypeHandler in its own group. NEW_CHAT_MEMBERS stays with group_welcome.
+    app.add_handler(TypeHandler(Update, on_bot_added), group=1)
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, group_welcome))
     # Shazam: recognize song from audio/video files
     app.add_handler(MessageHandler(
@@ -3800,6 +4057,7 @@ def main():
     app.add_handler(CallbackQueryHandler(startmsg_translate_cb, pattern="^smt"))
     app.add_handler(CallbackQueryHandler(chapter_cb, pattern="^pl(dl|pg|noop|close)"))
     app.add_handler(CallbackQueryHandler(more_qualities, pattern="^more"))
+    app.add_handler(CallbackQueryHandler(shazam_retry_cb, pattern="^shzr"))
     app.add_handler(CallbackQueryHandler(button_click))
 
     app.add_error_handler(error_handler)

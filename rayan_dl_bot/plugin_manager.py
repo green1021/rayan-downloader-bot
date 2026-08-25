@@ -190,7 +190,12 @@ def call_plugin_chapters(meta, url):
         plugin = mod.Plugin()
         if not hasattr(plugin, "get_chapters"):
             return []
-        chapters = plugin.get_chapters(url)
+        timeout = float(meta.get("timeout", DEFAULT_PLUGIN_TIMEOUT))
+        try:
+            chapters = call_with_timeout(plugin.get_chapters, timeout, url)
+        except TimeoutError:
+            log.error("plugin %s get_chapters TIMEOUT after %ss", meta.get("name"), timeout)
+            return []
         return chapters or []
     except Exception as e:
         log.error("plugin %s get_chapters error: %s", meta.get("name"), e)
@@ -210,7 +215,12 @@ def call_plugin_detect_type(meta, url) -> str | None:
         plugin = mod.Plugin()
         if not hasattr(plugin, "detect"):
             return None
-        return plugin.detect(url)
+        timeout = float(meta.get("timeout", DEFAULT_PLUGIN_TIMEOUT))
+        try:
+            return call_with_timeout(plugin.detect, timeout, url)
+        except TimeoutError:
+            log.error("plugin %s detect TIMEOUT after %ss", meta.get("name"), timeout)
+            return None
     except Exception as e:
         log.error("plugin %s detect error: %s", meta.get("name"), e)
         return None
@@ -229,10 +239,15 @@ def call_plugin_download_chapter(meta, chapter_url, config=None):
         if not hasattr(mod, "Plugin"):
             return {"error": "plugin has no Plugin class"}
         plugin = mod.Plugin()
-        if hasattr(plugin, "download_chapter"):
-            return plugin.download_chapter(chapter_url, cfg)
-        # fallback: use handle() (resolves first chapter only)
-        return plugin.handle(chapter_url, cfg)
+        timeout = float(meta.get("timeout", DEFAULT_PLUGIN_TIMEOUT))
+        fn = getattr(plugin, "download_chapter", None) or getattr(plugin, "handle", None)
+        if fn is None:
+            return {"error": "plugin has no download_chapter() or handle() method"}
+        try:
+            return call_with_timeout(fn, timeout, chapter_url, cfg)
+        except TimeoutError:
+            log.error("plugin %s download_chapter TIMEOUT after %ss", meta.get("name"), timeout)
+            return {"error": "پلاگین بیش از حد طول کشید (timeout)"}
     except Exception as e:
         log.error("plugin %s download_chapter error: %s", meta.get("name"), e)
         return {"error": f"plugin error: {e}"}
@@ -243,9 +258,43 @@ MAX_ZIP_UNCOMPRESSED = 30 * 1024 * 1024  # 30 MB total extracted
 MAX_ZIP_ENTRIES = 200
 
 
+def _ip_is_forbidden(ip_str: str) -> bool:
+    """True for loopback/private/link-local/reserved/multicast/unspecified IPs,
+    including IPv4-mapped IPv6 (::ffff:10.0.0.1 → checks the embedded IPv4)."""
+    import ipaddress as _ipa
+    try:
+        ip = _ipa.ip_address(ip_str)
+    except ValueError:
+        return True  # unparseable → treat as unsafe
+    # Unwrap IPv4-mapped IPv6 so the embedded v4 range decides
+    if isinstance(ip, _ipa.IPv6Address) and getattr(ip, "ipv4_mapped", None):
+        mapped = ip.ipv4_mapped
+        if mapped is not None:
+            ip = mapped
+    return (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+def _host_resolves_public(host: str) -> bool:
+    """Resolve hostname and require EVERY returned address to be public.
+    This closes the non-canonical-literal bypass (2130706433, 127.1, 0x7f…),
+    plain IPv6 literals (fd00::1), and privately-resolving names."""
+    try:
+        import socket as _socket
+        infos = _socket.getaddrinfo(host, 443, proto=_socket.IPPROTO_TCP)
+    except Exception:
+        return False  # does not resolve → nothing public to talk to
+    if not infos:
+        return False
+    return all(not _ip_is_forbidden(info[4][0]) for info in infos)
+
+
 def _validate_install_url(url: str) -> str | None:
     """SSRF guard for admin-supplied install URLs. Returns error or None if OK.
-    Only https:// to public hosts; blocks file://, ftp://, private IPs, localhost."""
+    Only https:// to PUBLIC hosts; blocks file://, ftp://, private/loopback/
+    link-local addresses (v4 AND v6, any literal form) and non-public DNS.
+    NOTE: this resolves DNS itself; fetches must go through _safe_urlopen so
+    redirects are re-validated per hop (DNS-rebinding window otherwise)."""
     try:
         from urllib.parse import urlparse
         u = urlparse(url)
@@ -256,16 +305,35 @@ def _validate_install_url(url: str) -> str | None:
             return "URL بدون hostname"
         if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1") or host.endswith(".local"):
             return "دانلود از localhost مجاز نیست"
-        # block IP-literal hosts (private ranges)
-        import re as _re
-        if _re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", host):
-            parts = [int(p) for p in host.split(".")]
-            if parts[0] in (10, 127) or (parts[0] == 192 and parts[1] == 168) or \
-               (parts[0] == 172 and 16 <= parts[1] <= 31) or (parts[0] == 169 and parts[1] == 254):
-                return "دانلود از IP داخلی مجاز نیست"
+        if not _host_resolves_public(host):
+            return "دانلود از آدرس داخلی/خصوصی مجاز نیست"
         return None
     except Exception as e:
         return f"URL نامعتبر: {e}"
+
+
+class _SSRFRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Redirect handler that re-runs the full URL validation on EVERY hop,
+    so a public URL can't bounce us to an internal address."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        err = _validate_install_url(newurl)
+        if err:
+            log.warning("plugin install redirect blocked: %s → %s", req.full_url, newurl)
+            raise urllib.error.HTTPError(newurl, code, f"blocked redirect: {err}",
+                                         headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = None
+
+def _safe_urlopen(url: str, timeout: int):
+    """urlopen with per-hop SSRF validation on redirects."""
+    global _OPENER
+    if _OPENER is None:
+        _OPENER = urllib.request.build_opener(_SSRFRedirectHandler())
+    return _OPENER.open(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}),
+                        timeout=timeout)
 
 
 def _safe_extract(zf, tmp: str) -> str | None:
@@ -363,8 +431,7 @@ def _install_zip(url: str) -> dict:
     tmp = tempfile.mkdtemp(prefix="plugin_install_")
     zip_path = os.path.join(tmp, "plugin.zip")
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=60) as resp, open(zip_path, "wb") as f:
+        with _safe_urlopen(url, 60) as resp, open(zip_path, "wb") as f:
             remaining = MAX_ZIP_UNCOMPRESSED
             while True:
                 chunk = resp.read(65536)
@@ -391,21 +458,40 @@ def _install_zip(url: str) -> dict:
             return {"ok": False, "message": err}
         name = meta["name"]
         dest = os.path.join(PLUGINS_DIR, name)
+        # Atomic-ish install: stage into a sibling dir, then swap. A failed
+        # copy must not destroy the previously working version of the plugin.
+        staged = dest + ".staging"
+        if os.path.exists(staged):
+            shutil.rmtree(staged, ignore_errors=True)
+        shutil.copytree(root, staged)
         if os.path.exists(dest):
             shutil.rmtree(dest)
-        shutil.copytree(root, dest)
+        os.replace(staged, dest)
         shutil.rmtree(tmp, ignore_errors=True)
         return {"ok": True, "name": name, "message": f"plugin '{name}' installed"}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _validate_entry_code(code: str) -> str | None:
+    """Sanity-check fetched entry source before it lands on disk: must be valid
+    Python and declare a Plugin class. Catches truncated downloads / HTML error
+    pages being installed as plugin code. NOT a security boundary (plugins are
+    trusted code by design)."""
+    try:
+        compile(code, "<plugin-entry>", "exec")
+    except SyntaxError as e:
+        return f"پلاگین کد پایتون معتبر نیست: {e}"
+    if not re.search(r"^\s*class\s+Plugin\b", code, re.M):
+        return "کد پلاگین کلاس Plugin ندارد"
+    return None
+
+
 def _install_manifest(url: str) -> dict:
     """Install from a single raw plugin.json — the entry .py must be fetched
     from the same directory (GitHub raw)."""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        meta = json.loads(urllib.request.urlopen(req, timeout=30).read().decode("utf-8"))
+        meta = json.loads(_safe_urlopen(url, 30).read().decode("utf-8"))
         err = _validate_meta(meta)
         if err:
             return {"ok": False, "message": err}
@@ -413,19 +499,23 @@ def _install_manifest(url: str) -> dict:
         entry = meta.get("entry", "plugin")
         if not entry.endswith(".py"):
             entry += ".py"
-        # entry URL = same dir as manifest, with filename entry
+        # entry URL = same dir as manifest, with filename entry — validated too
         base = url.rsplit("/", 1)[0]
         entry_url = f"{base}/{entry}"
+        entry_data = _safe_urlopen(entry_url, 30).read()
+        err_entry = _validate_entry_code(entry_data.decode("utf-8", "replace"))
+        if err_entry:
+            return {"ok": False, "message": err_entry}
+        # Fetch BOTH files BEFORE touching disk: a failed entry fetch must not
+        # leave a registered-but-broken (phantom) plugin behind.
         dest = os.path.join(PLUGINS_DIR, name)
         os.makedirs(dest, exist_ok=True)
         with open(os.path.join(dest, MANIFEST), "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
-        entry_data = urllib.request.urlopen(
-            urllib.request.Request(entry_url, headers={"User-Agent": "Mozilla/5.0"}),
-            timeout=30).read()
         with open(os.path.join(dest, entry), "wb") as f:
             f.write(entry_data)
-        return {"ok": True, "name": name, "message": f"plugin '{name}' installed"}
+        return {"ok": True, "name": name, "entry_missing": False,
+                "message": f"plugin '{name}' installed"}
     except Exception as e:
         return {"ok": False, "message": f"manifest install error: {e}"}
 

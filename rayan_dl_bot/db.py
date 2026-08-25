@@ -137,8 +137,22 @@ def init_db():
     conn.close()
 
 
+class _SafeConn(sqlite3.Connection):
+    """Guarantees rollback+close even when a caller hits an exception path that
+    skips its conn.close(). CPython refcounting usually destroys the abandoned
+    connection anyway, but this makes cleanup explicit and independent of GC
+    timing (and rolls the pending transaction back deterministically)."""
+
+    def __del__(self):
+        try:
+            self.rollback()   # no-op when idle; raises if already closed — swallowed
+        except Exception:
+            pass
+        # base dealloc then closes the underlying sqlite handle
+
+
 def _conn():
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, factory=_SafeConn)
     # Speed: WAL + synchronous=NORMAL dramatically improves write throughput
     # (batches many small writes instead of fsync per transaction).
     c.execute("PRAGMA journal_mode=WAL")
