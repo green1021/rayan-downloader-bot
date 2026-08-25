@@ -30,6 +30,7 @@ import linkcache
 import dlqueue
 import cdncache
 import subtitle_translate
+import translation_engines as te
 import id3tag
 import downloader as dl
 import ig_tw as igtw
@@ -1146,7 +1147,8 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
          InlineKeyboardButton(i18n.t(lang, "adm_logs"), callback_data="adm|logs")],
         [InlineKeyboardButton(i18n.t(lang, "adm_plugins"), callback_data="adm|plugins"),
          InlineKeyboardButton(i18n.t(lang, "adm_botsettings"), callback_data="adm|botsettings")],
-        [InlineKeyboardButton(i18n.t(lang, "adm_broadcast"), callback_data="adm|broadcast")],
+        [InlineKeyboardButton(i18n.t(lang, "adm_trengines"), callback_data="adm|trengines"),
+         InlineKeyboardButton(i18n.t(lang, "adm_broadcast"), callback_data="adm|broadcast")],
         [InlineKeyboardButton(i18n.t(lang, "adm_ban"), callback_data="adm|ban")],
         [InlineKeyboardButton(i18n.t(lang, "adm_unban"), callback_data="adm|unban"),
          InlineKeyboardButton(i18n.t(lang, "adm_addchan"), callback_data="adm|addchan")],
@@ -1180,7 +1182,8 @@ async def _admin_menu_edit(q, lang: str):
          InlineKeyboardButton(i18n.t(lang, "adm_logs"), callback_data="adm|logs")],
         [InlineKeyboardButton(i18n.t(lang, "adm_plugins"), callback_data="adm|plugins"),
          InlineKeyboardButton(i18n.t(lang, "adm_botsettings"), callback_data="adm|botsettings")],
-        [InlineKeyboardButton(i18n.t(lang, "adm_broadcast"), callback_data="adm|broadcast")],
+        [InlineKeyboardButton(i18n.t(lang, "adm_trengines"), callback_data="adm|trengines"),
+         InlineKeyboardButton(i18n.t(lang, "adm_broadcast"), callback_data="adm|broadcast")],
         [InlineKeyboardButton(i18n.t(lang, "adm_ban"), callback_data="adm|ban")],
         [InlineKeyboardButton(i18n.t(lang, "adm_unban"), callback_data="adm|unban"),
          InlineKeyboardButton(i18n.t(lang, "adm_addchan"), callback_data="adm|addchan")],
@@ -1732,8 +1735,161 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data["adm_state"] = "unban"
         await q.message.edit_text(i18n.t(lang, "unban_prompt"),
                                   reply_markup=admin_back_keyboard(lang))
+    elif action == "trengines":
+        await _tr_engines_status(q, lang)
+    elif action == "trconfig":
+        await _tr_config_hub(q, lang)
+    elif action == "trchain":
+        await _tr_engines_chain(q, lang)
+    elif action == "trtoggle":
+        # parts: adm|trtoggle|<engine_id> — tap toggles in/out; tap order = chain order
+        if len(parts) >= 3 and parts[2] in te.ENGINES:
+            chain = list(te.get_chain())
+            eid = parts[2]
+            if eid in chain:
+                chain.remove(eid)          # out — also re-orders what remains
+            else:
+                chain.append(eid)          # in — goes to the END (latest tap = last resort)
+                if len(chain) > len(te.ENGINES):
+                    chain.pop(0)
+            te.save_chain(chain)
+        await _tr_engines_chain(q, lang)
+    elif action == "trcfg":
+        # parts: adm|trcfg|<engine_id> — per-engine config screen
+        if len(parts) >= 3 and parts[2] in te.ENGINES:
+            await _tr_engine_cfg(q, lang, parts[2])
+    elif action == "trfield":
+        # parts: adm|trfield|<engine_id>|<field> — prompt for one field's value
+        if len(parts) >= 4 and parts[2] in te.ENGINES \
+                and parts[3] in te.ENGINES[parts[2]]["needs"]:
+            context.user_data["adm_state"] = f"trfield|{parts[2]}|{parts[3]}"
+            label = te.ENGINES[parts[2]]["label_fa"]
+            current = te._cfg_for(parts[2]).get(parts[3], "")
+            shown = _mask_secret(parts[3], current)
+            await q.message.edit_text(
+                f"✏️ **{label}**\n\nمقدار جدید برای «{parts[3]}» رو بفرست:\n\n"
+                f"الان: `{shown}`\n\n"
+                f"برای لغو /cancel بزن.",
+                parse_mode="Markdown", reply_markup=admin_back_keyboard(
+                    lang, to=f"adm|trcfg|{parts[2]}"))
+    elif action == "trtest":
+        await _tr_engines_test(q, lang)
     elif action == "close":
         await q.message.delete()
+
+
+def _mask_secret(field: str, value: str) -> str:
+    """Panel display of a stored value — API keys show masked, URLs/models/email plain."""
+    v = str(value or "")
+    if not v:
+        return "(خالی)"
+    if field == "api_key":
+        return v[:4] + "••••" + v[-2:] if len(v) > 8 else "••••••"
+    return v
+
+
+async def _tr_engines_status(q, lang: str) -> None:
+    """S1: active chain as ordered chips + actions."""
+    chain = te.get_chain()
+    chips = " → ".join(f"**{i + 1}. {te.engine_label_fa(e)}**"
+                       for i, e in enumerate(chain)) or "—"
+    text = (
+        "🌍 **موتور ترجمه زیرنویس**\n\n"
+        "ترتیب فعلی (اگه اولی شکست خورد، بعدی امتحان می‌شه):\n"
+        f"{chips}\n\n"
+        "💡 «هوش مصنوعی لوکال» رایگان و بدون سقفه. "
+        "«MyMemory» رایگانه ولی روزانه سقف داره.")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔀 تغییر ترتیب", callback_data="adm|trchain"),
+         InlineKeyboardButton("🛠 پیکربندی موتورها", callback_data="adm|trconfig")],
+        [InlineKeyboardButton("🔌 تست اتصال", callback_data="adm|trtest")],
+        admin_back_keyboard(lang).inline_keyboard[0],
+    ])
+    try:
+        await q.message.edit_text(text, parse_mode="Markdown",
+                                  reply_markup=kb)
+    except Exception:
+        await q.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
+async def _tr_engines_chain(q, lang: str) -> None:
+    """S2: toggle engines into/out of the chain (✅/⬜); tap order = priority order."""
+    chain = te.get_chain()
+    lines = ["🔀 **ترتیب موتورهای ترجمه**\n",
+             "روی هر موتور بزن تا وارد/خارج بشه. ترتیب لمس = اولویت:\n"]
+    rows = []
+    for eid, meta in te.ENGINES.items():
+        mark = "✅" if eid in chain else "⬜"
+        pos = chain.index(eid) + 1 if eid in chain else ""
+        lines.append(f"{mark} {'%d. ' % pos if pos else ''}{meta['label_fa']}")
+        rows.append([InlineKeyboardButton(f"{mark} {meta['label_fa']}",
+                                          callback_data=f"adm|trtoggle|{eid}")])
+    rows.append([InlineKeyboardButton("✅ ذخیره و بازگشت", callback_data="adm|trengines"),
+                 InlineKeyboardButton(i18n.t(lang, "back"), callback_data="adm|trengines")])
+    await q.message.edit_text("\n".join(lines), parse_mode="Markdown",
+                              reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def _tr_engine_cfg(q, lang: str, engine_id: str) -> None:
+    """S3: config screen for ONE engine — only the fields it needs."""
+    meta = te.ENGINES[engine_id]
+    cfg = te._cfg_for(engine_id)
+    lines = [f"🛠 **پیکربندی: {meta['label_fa']}**\n"]
+    rows = []
+    for field in meta["needs"]:
+        lines.append(f"• `{field}`: {_mask_secret(field, cfg.get(field, ''))}")
+        rows.append([InlineKeyboardButton(
+            f"✏️ تغییر {field}", callback_data=f"adm|trfield|{engine_id}|{field}")])
+    rows.append([InlineKeyboardButton(i18n.t(lang, "back"), callback_data="adm|trconfig")])
+    await q.message.edit_text("\n".join(lines), parse_mode="Markdown",
+                              reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def _tr_config_hub(q, lang: str) -> None:
+    """Hub listing every engine → its own config screen."""
+    rows = [[InlineKeyboardButton(meta["label_fa"],
+                                  callback_data=f"adm|trcfg|{eid}")]
+            for eid, meta in te.ENGINES.items()]
+    rows.append([InlineKeyboardButton(i18n.t(lang, "back"), callback_data="adm|trengines"),
+                 InlineKeyboardButton(i18n.t(lang, "close"), callback_data="adm|close")])
+    await q.message.edit_text(
+        "🛠 **پیکربندی موتورها**\n\nیک موتور رو انتخاب کن:",
+        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def _tr_engines_test(q, lang: str) -> None:
+    """S4 «تست اتصال»: fixed sample sentence through EVERY configured engine
+    (independent of the chain) so the owner sees OK/FAIL before saving."""
+    SAMPLE = "Hello world. Subtitle line."
+    try:
+        await q.message.edit_text("🔌 در حال تست موتورها... کمی صبر کن.")
+    except Exception:
+        pass
+    lines = [f"🔌 **تست اتصال موتورها**\n", f"جمله نمونه: `{SAMPLE}`\n"]
+
+    def _run():
+        return [(eid, *te.test_engine(eid)) for eid in te.ENGINES]
+
+    results = await asyncio.to_thread(_run)
+    any_ok = False
+    for eid, ok, detail in results:
+        icon = "✅" if ok else "❌"
+        if ok:
+            any_ok = True
+        lines.append(f"{icon} {te.engine_label_fa(eid)}\n   └ {detail[:80] or '—'}")
+    lines.append("\n" + ("🎉 حداقل یک موتور آماده‌ست!" if any_ok
+                         else "⚠️ هیچ موتوری جواب نداد — پیکربندی رو چک کن."))
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(i18n.t(lang, "back"), callback_data="adm|trengines")],
+        admin_back_keyboard(lang).inline_keyboard[0]])
+    text = "\n".join(lines)
+    try:
+        await q.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+    except Exception:
+        await q.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
+
 
 
 async def plugin_file_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1942,6 +2098,26 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text(f"✅ حداکثر دانلود همزمان: **{v}** شد.")
         else:
             await update.message.reply_text("❌ فقط ۱ تا ۶ مجازه.")
+
+    elif state and state.startswith("trfield|"):
+        # parts: trfield|<engine_id>|<field> — one config value per message
+        context.user_data.pop("adm_state", None)
+        _, engine_id, field = state.split("|", 2)
+        if engine_id not in te.ENGINES or field not in te.ENGINES[engine_id]["needs"]:
+            await update.message.reply_text("❌ تنظیم نامعتبره.")
+            return
+        if len(text) > 500:
+            await update.message.reply_text("❌ خیلی طولانیه (حداکثر ۵۰۰ کاراکتر).")
+            return
+        if te.set_engine_cfg(engine_id, field, text):
+            shown = _mask_secret(field, text)
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+                "🛠 بازگشت به پیکربندی", callback_data=f"adm|trcfg|{engine_id}")]])
+            await update.message.reply_text(
+                f"✅ ذخیره شد: `{shown}`",
+                parse_mode="Markdown", reply_markup=kb)
+        else:
+            await update.message.reply_text("❌ ذخیره نشد — دوباره تلاش کن.")
 
     elif state == "plugin_install":
         context.user_data.pop("adm_state", None)
@@ -4473,7 +4649,9 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                                 srt, tr_path, target, sublang, video_id=vid_key)
                             if ok_tr:
                                 subtitle_translate.cache_put(vid_key, target, tr_path)
-                        except subtitle_translate.BudgetExhausted:
+                        except (subtitle_translate.BudgetExhausted,
+                                getattr(subtitle_translate, "TranslationFailed",
+                                        subtitle_translate.BudgetExhausted)):
                             ok_tr = False
                             tr_path = None
                             try:

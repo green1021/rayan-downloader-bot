@@ -5,8 +5,11 @@ Tables: users (lang, banned), links (status), downloads (per-attempt stats)
 """
 
 import os
+import re
+import secrets
 import sqlite3
 import logging
+import string
 from datetime import datetime
 
 log = logging.getLogger("rayan-dl-db")
@@ -95,11 +98,31 @@ CREATE TABLE IF NOT EXISTS bot_config (
     value TEXT,
     updated_at TEXT
 );
+CREATE TABLE IF NOT EXISTS referrals (
+    inviter_id INTEGER NOT NULL,
+    invited_id INTEGER NOT NULL UNIQUE,
+    created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS referral_credits (
+    user_id INTEGER PRIMARY KEY,
+    used INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS ref_codes (
+    user_id INTEGER PRIMARY KEY,
+    code TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS usage (
+    day TEXT,
+    user_id TEXT,
+    count INT DEFAULT 0,
+    PRIMARY KEY (day, user_id)
+);
 -- Indexes for hot query paths (avoid full-table scans as tables grow)
 CREATE INDEX IF NOT EXISTS idx_links_user ON links(user_id);
 CREATE INDEX IF NOT EXISTS idx_links_url ON links(url);
 CREATE INDEX IF NOT EXISTS idx_downloads_user ON downloads(user_id);
 CREATE INDEX IF NOT EXISTS idx_downloads_created ON downloads(created_at);
+CREATE INDEX IF NOT EXISTS idx_referrals_inviter ON referrals(inviter_id);
 """
 
 
@@ -131,10 +154,47 @@ def init_db():
         fcols = {r[1] for r in conn.execute("PRAGMA table_info(force_channels)")}
         if "chat_id" not in fcols:
             conn.execute("ALTER TABLE force_channels ADD COLUMN chat_id INTEGER")
+        # B3: downloads-library table lives beside the stats table (same name
+        # would collide) — dedicated table with file_id so entries can re-send.
+        conn.execute("""CREATE TABLE IF NOT EXISTS library (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            file_id TEXT NOT NULL,
+            caption TEXT,
+            created_at TEXT
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_library_user ON library(user_id)")
+        # B4: fast mode is its own flag, NOT a sentinel smuggled into default_audio
+        ucols = {r[1] for r in conn.execute("PRAGMA table_info(user_settings)")}
+        if "fast_mode" not in ucols:
+            conn.execute("ALTER TABLE user_settings ADD COLUMN fast_mode INTEGER DEFAULT 0")
+        _seed_translation_config(conn)
     except Exception as e:
         log.error("DB migrate: %s", e)
     conn.commit()
     conn.close()
+
+
+def _seed_translation_config(conn) -> None:
+    """Pluggable translation engines (2026-08-25): seed ONLY missing keys so
+    admin edits are never overwritten on restart. Additive — no schema change."""
+    import json as _json
+    seeds = {
+        "tr_engine_chain": _json.dumps(["gateway_ox", "mymemory"]),
+        "tr_cfg_gateway_ox": _json.dumps({
+            "base_url": "http://localhost:20128/v1",
+            "model": "ox-alpha-combo"}),
+        "tr_cfg_mymemory": _json.dumps({"email": "rayan.downloader.bot@gmail.com"}),
+        "tr_cfg_libre": _json.dumps({"base_url": "https://libretranslate.com"}),
+        "tr_cfg_custom_openai": _json.dumps({}),
+    }
+    now = datetime.utcnow().isoformat()
+    for key, value in seeds.items():
+        row = conn.execute("SELECT key FROM bot_config WHERE key=?", (key,)).fetchone()
+        if not row:
+            conn.execute(
+                "INSERT INTO bot_config (key, value, updated_at) VALUES (?,?,?)",
+                (key, str(value), now))
 
 
 class _SafeConn(sqlite3.Connection):
@@ -434,6 +494,13 @@ def record_download(user_id: int, url: str, site: str, quality: str, success: bo
                      (user_id, url, site, str(quality), 1 if success else 0, now))
         conn.commit()
         conn.close()
+        if success:
+            # C/B6 bookkeeping: EVERY successful delivery counts toward the
+            # user's daily total (incl. cache re-serves — a file sent is a
+            # file sent). WHO is actually limited is decided by the gate
+            # (bot._over_daily_limit): admins / referral holders / groups
+            # are exempt, so their counted usage is harmless.
+            bump_usage(user_id)
     except Exception as e:
         log.error("record_download: %s", e)
 
@@ -823,3 +890,360 @@ def all_config():
     except Exception as e:
         log.error("all_config: %s", e)
         return {}
+
+
+# ── Referral system (B1) ─────────────────────────────────────
+REFERRAL_CAP = 5          # max skip-the-queue credits an inviter can earn
+INVITEE_START_CREDIT = 1  # every invited user starts with one credit
+
+_B62 = string.digits + string.ascii_lowercase + string.ascii_uppercase
+
+
+def _b62(n: int) -> str:
+    """int → base62 string (>=1 char)."""
+    out = []
+    while n:
+        n, r = divmod(n, 62)
+        out.append(_B62[r])
+    return "".join(reversed(out)) or "0"
+
+
+def get_or_create_ref_code(user_id: int) -> str:
+    """Stable unique base62 referral code for a user (created on first call).
+    Collision-safe: retries with fresh random codes until UNIQUE accepts one."""
+    conn = _conn()
+    try:
+        row = conn.execute("SELECT code FROM ref_codes WHERE user_id = ?", (user_id,)).fetchone()
+        if row:
+            return row[0]
+        while True:
+            code = _b62(user_id) + "".join(secrets.choice(_B62) for _ in range(4))
+            try:
+                conn.execute("INSERT INTO ref_codes (user_id, code) VALUES (?, ?)",
+                             (user_id, code))
+                conn.commit()
+                return code
+            except sqlite3.IntegrityError:
+                continue  # code collision — draw again
+    except Exception as e:
+        log.error("get_or_create_ref_code: %s", e)
+        return ""
+    finally:
+        conn.close()
+
+
+def user_by_ref_code(code: str):
+    """Resolve a referral code to its owner's user_id (or None)."""
+    if not code or not re.fullmatch(r"[0-9A-Za-z]{2,16}", code):
+        return None
+    try:
+        conn = _conn()
+        row = conn.execute("SELECT user_id FROM ref_codes WHERE code = ?", (code,)).fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception as e:
+        log.error("user_by_ref_code: %s", e)
+        return None
+
+
+def record_referral(inviter_id: int, invited_id: int) -> bool:
+    """Register inviter→invited exactly once (UNIQUE invited_id).
+    Returns True if newly recorded. The invitee always lands; the INVITER's
+    earnable credits are capped by REFERRAL_CAP in earned_referral_credits()."""
+    if not inviter_id or not invited_id or inviter_id == invited_id:
+        return False  # no self-invite / bogus ids
+    conn = None
+    try:
+        conn = _conn()
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO referrals (inviter_id, invited_id, created_at) VALUES (?,?,?)",
+            (inviter_id, invited_id, datetime.utcnow().isoformat()))
+        conn.commit()
+        return cur.rowcount > 0
+    except Exception as e:
+        log.error("record_referral: %s", e)
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def earned_referral_credits(user_id: int) -> int:
+    """Credits EARNED from inviting others — capped at REFERRAL_CAP.
+    (Cap applied here rather than at insert time so raising the cap later,
+    or pre-cap rows, never grants more than the current policy allows.)"""
+    try:
+        conn = _conn()
+        row = conn.execute("SELECT COUNT(*) FROM referrals WHERE inviter_id = ?",
+                           (user_id,)).fetchone()
+        conn.close()
+        return min(int(row[0] or 0), REFERRAL_CAP)
+    except Exception as e:
+        log.error("earned_referral_credits: %s", e)
+        return 0
+
+
+def get_referral_credits(user_id: int) -> int:
+    """Skip-the-queue credits still available: earned (capped) + invitee bonus − used."""
+    try:
+        conn = _conn()
+        row = conn.execute("""
+            SELECT COALESCE((
+                SELECT MIN((SELECT COUNT(*) FROM referrals WHERE inviter_id = :u), :cap)
+                     + CASE WHEN EXISTS(SELECT 1 FROM referrals WHERE invited_id = :u)
+                            THEN :start ELSE 0 END
+                     - COALESCE((SELECT used FROM referral_credits WHERE user_id = :u), 0)
+            ), 0)
+        """, {"u": user_id, "cap": REFERRAL_CAP, "start": INVITEE_START_CREDIT}).fetchone()
+        conn.close()
+        return max(0, int(row[0] or 0)) if row else 0
+    except Exception as e:
+        log.error("get_referral_credits: %s", e)
+        return 0
+
+
+def consume_referral_credit(user_id: int) -> bool:
+    """Atomically spend one credit. The ledger row is ensured lazily, then a
+    single conditional UPDATE does the spend — two concurrent downloads racing
+    for the last credit cannot both win (SQLite serializes the writes and the
+    availability predicate is re-checked against committed state)."""
+    conn = None
+    try:
+        conn = _conn()
+        conn.execute("INSERT OR IGNORE INTO referral_credits (user_id, used) VALUES (?, 0)",
+                     (user_id,))
+        cur = conn.execute("""
+            UPDATE referral_credits SET used = used + 1
+            WHERE user_id = :u
+              AND used + 1 <= MIN((SELECT COUNT(*) FROM referrals WHERE inviter_id = :u), :cap)
+                        + CASE WHEN EXISTS(SELECT 1 FROM referrals WHERE invited_id = :u)
+                               THEN :start ELSE 0 END
+        """, {"u": user_id, "cap": REFERRAL_CAP, "start": INVITEE_START_CREDIT})
+        ok = cur.rowcount > 0
+        if ok:
+            conn.commit()
+        else:
+            conn.rollback()  # release the no-op transaction cleanly
+        conn.close()
+        return ok
+    except Exception as e:
+        log.error("consume_referral_credit: %s", e)
+        return False
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def count_referrals(user_id: int) -> int:
+    """How many friends this user has successfully invited."""
+    try:
+        conn = _conn()
+        row = conn.execute("SELECT COUNT(*) FROM referrals WHERE inviter_id = ?",
+                           (user_id,)).fetchone()
+        conn.close()
+        return row[0] if row else 0
+    except Exception as e:
+        log.error("count_referrals: %s", e)
+        return 0
+
+
+# ── Daily download limit (B6) ────────────────────────────────
+DAILY_LIMIT_KEY = "daily_download_limit"
+
+
+def daily_limit() -> int:
+    """Per-day download cap for non-allowed users (default 10)."""
+    try:
+        v = int(get_config(DAILY_LIMIT_KEY, 10) or 10)
+        return max(1, min(v, 1000))
+    except Exception:
+        return 10
+
+
+def set_daily_limit(n: int):
+    set_config(DAILY_LIMIT_KEY, int(n))
+
+
+def _usage_day() -> str:
+    """UTC day string — the counter resets naturally when this changes."""
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+
+def usage_today(user_id: int) -> int:
+    try:
+        conn = _conn()
+        row = conn.execute(
+            "SELECT count FROM usage WHERE day = ? AND user_id = ?",
+            (_usage_day(), str(user_id))).fetchone()
+        conn.close()
+        return int(row[0]) if row and row[0] is not None else 0
+    except Exception as e:
+        log.error("usage_today: %s", e)
+        return 0
+
+
+def bump_usage(user_id: int, n: int = 1):
+    """Add n to today's counter (upsert on the (day,user_id) key).
+    A new UTC day writes a fresh row → counter reset without any cron."""
+    try:
+        conn = _conn()
+        conn.execute(
+            "INSERT INTO usage (day, user_id, count) VALUES (?, ?, ?) "
+            "ON CONFLICT(day, user_id) DO UPDATE SET count = count + excluded.count",
+            (_usage_day(), str(user_id), int(n)))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.error("bump_usage: %s", e)
+
+
+def count_downloads_today(user_id: int) -> int:
+    """Successful downloads since midnight UTC (from the downloads log — used by /stats)."""
+    try:
+        today = datetime.utcnow().strftime("%Y-%m-%dT00:00:00")
+        conn = _conn()
+        row = conn.execute(
+            "SELECT COUNT(*) FROM downloads WHERE user_id = ? AND success = 1 AND created_at >= ?",
+            (user_id, today)).fetchone()
+        conn.close()
+        return row[0] if row else 0
+    except Exception as e:
+        log.error("count_downloads_today: %s", e)
+        return 0
+
+
+# ── Speed mode / fast mode toggle (B4) ───────────────────────
+def fast_mode_enabled(user_id: int) -> bool:
+    """True when the user turned /fast ON (own column — never touches default_audio)."""
+    try:
+        conn = _conn()
+        row = conn.execute("SELECT fast_mode FROM user_settings WHERE user_id = ?",
+                           (user_id,)).fetchone()
+        conn.close()
+        return bool(row and row[0])
+    except Exception as e:
+        log.error("fast_mode_enabled: %s", e)
+        return False
+
+
+def set_fast_mode(user_id: int, enabled: bool):
+    """Persist the per-user fast-mode flag. Upsert so a user with no settings
+    row yet still gets one."""
+    conn = None
+    try:
+        conn = _conn()
+        cur = conn.execute(
+            "INSERT INTO user_settings (user_id, default_quality, default_audio, fast_mode) "
+            "VALUES (?, 720, 0, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET fast_mode = excluded.fast_mode",
+            (user_id, 1 if enabled else 0))
+        conn.commit()
+        return cur.rowcount > 0
+    except Exception as e:
+        log.error("set_fast_mode: %s", e)
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+# ── Downloads library (B3) ───────────────────────────────────
+LIBRARY_TTL_DAYS = 7   # /downloads entries expire after this many days
+LIBRARY_KEEP = 10      # and only this many are kept per user
+
+
+def library_add(user_id: int, file_id: str, caption: str = "") -> bool:
+    """Remember a DELIVERED file by its Telegram file_id so the user can
+    re-send or delete it later via /downloads. Keeps at most the newest
+    LIBRARY_KEEP entries per user."""
+    if not file_id:
+        return False
+    try:
+        now = datetime.utcnow().isoformat()
+        conn = _conn()
+        conn.execute("INSERT INTO library (user_id, file_id, caption, created_at) VALUES (?,?,?,?)",
+                     (user_id, file_id, (caption or "")[:200], now))
+        # keep only the newest N for this user (lazy trim on every add)
+        conn.execute("""
+            DELETE FROM library WHERE user_id = ? AND id NOT IN (
+                SELECT id FROM library WHERE user_id = ? ORDER BY id DESC LIMIT ?
+            )
+        """, (user_id, user_id, LIBRARY_KEEP))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        log.error("library_add: %s", e)
+        return False
+
+
+def _library_cleanup_expired(conn) -> None:
+    """Lazy expiry: drop rows older than LIBRARY_TTL_DAYS. Runs inside the
+    caller's connection/transaction — no separate commit here."""
+    try:
+        from datetime import timedelta
+        cutoff = (datetime.utcnow() - timedelta(days=LIBRARY_TTL_DAYS)).isoformat()
+        conn.execute("DELETE FROM library WHERE created_at < ?", (cutoff,))
+    except Exception as e:
+        log.error("library cleanup: %s", e)
+
+
+def get_library(user_id: int, limit: int = 10, days: int = LIBRARY_TTL_DAYS):
+    """Newest `limit` unexpired entries for a user. Expired rows are deleted
+    lazily on every access (no cron needed). Returns [(id, file_id, caption, created_at)]."""
+    try:
+        from datetime import timedelta
+        conn = _conn()
+        _library_cleanup_expired(conn)
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        rows = conn.execute("""
+            SELECT id, file_id, caption, created_at FROM library
+            WHERE user_id = ? AND created_at >= ?
+            ORDER BY id DESC LIMIT ?
+        """, (user_id, cutoff, limit)).fetchall()
+        conn.commit()
+        conn.close()
+        return rows
+    except Exception as e:
+        log.error("get_library: %s", e)
+        return []
+
+
+def get_library_entry(user_id: int, entry_id: int):
+    """One owned, unexpired entry → (id, file_id, caption, created_at) or None.
+    Used by the re-send button (ownership-checked)."""
+    try:
+        from datetime import timedelta
+        conn = _conn()
+        _library_cleanup_expired(conn)
+        cutoff = (datetime.utcnow() - timedelta(days=LIBRARY_TTL_DAYS)).isoformat()
+        row = conn.execute("""
+            SELECT id, file_id, caption, created_at FROM library
+            WHERE id = ? AND user_id = ? AND created_at >= ?
+        """, (entry_id, user_id, cutoff)).fetchone()
+        conn.commit()
+        conn.close()
+        return row
+    except Exception as e:
+        log.error("get_library_entry: %s", e)
+        return None
+
+
+def delete_library_entry(user_id: int, entry_id: int) -> bool:
+    """Remove one of THIS user's library entries ('delete-for-me').
+    The ownership check is in the WHERE clause — users can never delete
+    someone else's row."""
+    try:
+        conn = _conn()
+        cur = conn.execute("DELETE FROM library WHERE id = ? AND user_id = ?",
+                           (entry_id, user_id))
+        removed = cur.rowcount > 0
+        conn.commit()
+        conn.close()
+        return removed
+    except Exception as e:
+        log.error("delete_library_entry: %s", e)
+        return False

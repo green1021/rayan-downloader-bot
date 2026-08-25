@@ -1,30 +1,35 @@
-"""Translate .srt subtitles to a target language via MyMemory free API.
+"""Translate .srt subtitles through the PLUGGABLE ENGINE CHAIN.
 
-Strategy:
+History & strategy:
 - Parse the SRT into cue blocks (index / timecode / text)
-- Batch cues (~4500 chars per request, MyMemory limit 500) with numbering
-  so translations stay aligned; reassemble with original timecodes → valid .srt
+- Batch cues (~20 per request) and run each batch through the admin-chosen
+  engine chain (translation_engines.translate_batch_via_chain): first engine
+  that returns an aligned translation wins; failures fall through to the
+  next engine; a batch whose chain fully fails keeps its ORIGINAL text.
+- Reassemble with original indices/timecodes → valid .srt
 
 Hardening after the 2026-08-25 429 storm (dozens of "mymemory: HTTP Error 429"
 in one minute — the old cue-by-cue fallback multiplied the damage):
-- DAILY BUDGET: words are estimated BEFORE any call and checked against a
-  persisted per-day counter (db config key mymemory_words_used_<date>,
-  budget 900). Over budget → skip translation entirely, caller sends the
-  original srt with a one-line notice.
-- BACKOFF: on the FIRST 429 sleep 30s once and retry that batch once; a
-  SECOND 429 aborts the WHOLE translation (BudgetExhausted) — no per-cue storm.
+- DAILY BUDGET (budgeted engines only — MyMemory): words are estimated
+  BEFORE any call; a budgeted engine is SKIPPED when the day's counter
+  (db config key mymemory_words_used_<date>, budget 900) has no room.
+  When NO engine in the chain is eligible → BudgetExhausted, caller sends
+  the original srt with a one-line notice. Unlimited engines (gateways)
+  never touch the counter and are never blocked by it.
+- NO RETRY STORM: each engine gets ONE attempt per batch (30s timeout);
+  there is deliberately no cue-by-cue or per-engine retry loop.
 - CACHE: translated srt is cached by (video_id, lang) hash in cache/ for 7
   days — repeat requests are instant and free.
-
-MyMemory: free anon ~5,000 chars/day (with 'de' email param ~50k/day).
+- WALL CLOCK: the whole file translation stops starting NEW engine attempts
+  after 180s; remaining batches keep originals instead of hanging.
 """
 import hashlib
 import logging
 import os
 import re
 import time
-import urllib.parse
-import urllib.request
+
+import translation_engines as te
 
 log = logging.getLogger("rayan-dl")
 
@@ -32,11 +37,11 @@ _CUE_RE = re.compile(
     r"(\d+)\s*\n(\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{3})\n(.*?)(?=\n\s*\n|\Z)",
     re.DOTALL)
 
-CONTACT_EMAIL = "rayan.downloader.bot@gmail.com"  # raises MyMemory daily quota
-
 # ── Daily word budget (C1: free tier ≈1000 words/day/IP — stay under it) ──
 DAILY_WORD_BUDGET = 900
 _BUDGET_KEY_PREFIX = "mymemory_words_used_"
+
+WALL_CLOCK_S = te.CHAIN_WALL_CLOCK_S  # 180s cap for the WHOLE file
 
 # ── Translation cache ─────────────────────────────────────────
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
@@ -44,8 +49,14 @@ CACHE_TTL_S = 7 * 24 * 3600
 
 
 class BudgetExhausted(Exception):
-    """Raised when MyMemory is out of budget for today (or hard-429'd).
+    """No engine in the chain may translate today (budgeted engines are out
+    of budget and no unlimited engine is configured).
     Caller must fall back to the ORIGINAL srt + notice, never retry."""
+
+
+class TranslationFailed(Exception):
+    """Every eligible engine failed on EVERY batch — nothing was translated.
+    Caller must fall back to the ORIGINAL srt + notice."""
 
 
 def _today_key() -> str:
@@ -138,48 +149,31 @@ def parse_srt(text: str):
     return cues
 
 
-class _RateLimited(Exception):
-    """HTTP 429 from MyMemory — caller retries once, then aborts."""
-
-
-def _is_http_429(e: BaseException) -> bool:
-    return isinstance(e, urllib.error.HTTPError) and getattr(e, "code", 0) == 429
-
-
-def _translate_batch(text: str, sl: str, tl: str) -> str | None:
-    """One MyMemory request. Returns None on other failures; raises
-    _RateLimited specifically on HTTP 429 (caller decides retry vs abort)."""
-    q = urllib.parse.urlencode({"q": text, "langpair": f"{sl}|{tl}",
-                                "de": CONTACT_EMAIL})
-    u = f"https://api.mymemory.translated.net/get?{q}"
-    try:
-        req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=25) as r:
-            d = json_loads(r.read().decode())
-        out = (d.get("responseData") or {}).get("translatedText")
-        if out and "MYMEMORY WARNING" not in out:
-            return out
-        # quota warning embedded — still may contain usable text
-        return out.split("QUERY LENGTH LIMIT")[0].strip() or None
-    except Exception as e:
-        if _is_http_429(e):
-            raise _RateLimited(str(e)) from e
-        log.warning("mymemory batch: %s", e)
-        return None
-
-
-def json_loads(b):
-    import json
-    return json.loads(b)
+def _eligible_engines(est_words: int, db_mod=None) -> list:
+    """Chain entries that MAY run this file now: unlimited engines always;
+    budgeted engines only when today's remaining budget fits the estimate."""
+    chain = te.get_chain(db_mod=db_mod)
+    eligible = []
+    for eid in chain:
+        if eid in te.BUDGETED_ENGINES and \
+                not budget_has_room(est_words, db_mod=db_mod):
+            log.info("skipping budgeted engine %s — daily budget can't fit ~%s words",
+                     eid, est_words)
+            continue
+        eligible.append(eid)
+    return eligible
 
 
 def translate_srt_file(src_path: str, dst_path: str, target_lang: str = "fa",
                        source_lang: str = "en",
-                       video_id: str = "", db_mod=None) -> bool:
+                       video_id: str = "", db_mod=None,
+                       chain=None) -> bool:
     """Translate an .srt file (writes dst_path). True on success.
 
-    Raises BudgetExhausted when today's word budget is gone or MyMemory
-    hard-429s twice — callers send the original srt with a short fa notice.
+    Runs every batch through the admin-configured engine chain. Raises
+    BudgetExhausted when only budgeted engines are configured and today's
+    budget is gone; TranslationFailed when engines ran but produced nothing
+    usable. Callers send the original srt with a short fa notice either way.
     Timecode preservation is untouched by all of this."""
     try:
         raw = open(src_path, encoding="utf-8", errors="ignore").read()
@@ -190,55 +184,45 @@ def translate_srt_file(src_path: str, dst_path: str, target_lang: str = "fa",
     if not cues:
         return False
 
-    # C3a: estimate the spend FIRST — over budget → abort before ANY call.
+    # C3a (carried over): with ONLY budgeted engines in play, predict spend
+    # BEFORE any call — over budget → abort without touching the network.
     est = estimate_words(cues)
-    if not budget_has_room(est, db_mod=db_mod):
-        log.info("mymemory budget exhausted (%s words used, need ~%s) — skipping translation",
+    eligible = _eligible_engines(est, db_mod=db_mod) if chain is None \
+        else [e for e in chain
+              if e not in te.BUDGETED_ENGINES or budget_has_room(est, db_mod=db_mod)]
+    if not eligible:
+        log.info("no eligible engine (%s used today, need ~%s) — skipping translation",
                  budget_words_used(db_mod=db_mod), est)
         raise BudgetExhausted(f"need~{est}")
 
-    # Build batches of full cue texts joined by separator markers
-    SEP = " ||| "
+    deadline = time.monotonic() + WALL_CLOCK_S
     texts = [" ".join(lines) for _, _, lines in cues]
-    batches, cur, cur_len = [], [], 0
-    for t in texts:
-        if cur_len + len(t) + len(SEP) > 4400 or len(cur) >= 80:
-            batches.append(cur)
-            cur, cur_len = [], 0
-        cur.append(t)
-        cur_len += len(t) + len(SEP)
-    if cur:
-        batches.append(cur)
+    batches = te.make_batches(texts)
 
     translated = []
+    any_engine_ok = False
     for bi, batch in enumerate(batches):
-        joined = SEP.join(batch)
-        n_sep = len(batch) - 1
-        res = None
-        try:
-            res = _translate_batch(joined, source_lang, target_lang)
-            if not (res and res.count(SEP) == n_sep):
-                # ONE polite retry after 30s (C3b) — covers a transient single
-                # 429 / truncation. A SECOND 429 raises _RateLimited and aborts
-                # the whole translation immediately: no cue-by-cue storm.
-                time.sleep(30)
-                res = _translate_batch(joined, source_lang, target_lang)
-        except _RateLimited as first_429:
-            try:
-                time.sleep(30)  # single backoff, then exactly ONE retry
-                res = _translate_batch(joined, source_lang, target_lang)
-            except _RateLimited:
-                raise BudgetExhausted(
-                    f"hard 429 at batch {bi + 1}/{len(batches)}") from None
-        if res and res.count(SEP) == n_sep:
-            parts = [p.strip() for p in res.split(SEP)]
-            translated.extend(parts)
-        else:
-            # misaligned/failed batch → keep ORIGINAL text for these cues;
-            # NEVER fan out into per-cue calls (that's what caused C1).
-            log.warning("mymemory batch %s/%s unusable — keeping originals", bi + 1, len(batches))
+        if time.monotonic() > deadline:
+            log.warning("wall clock cap after %s/%s batches — keeping originals",
+                        bi, len(batches))
             translated.extend(batch)
-        budget_add_words(len(" ".join(batch).split()), db_mod=db_mod)
+            continue
+        out, used = te.translate_batch_via_chain(
+            batch, source_lang, target_lang,
+            deadline=deadline, db_mod=db_mod, chain=eligible)
+        if out is None:
+            # whole chain failed for THIS batch → keep originals, never fan
+            # out per-cue (the C1 storm rule still holds).
+            translated.extend(batch)
+        else:
+            any_engine_ok = True
+            translated.extend(out)
+            if used in te.BUDGETED_ENGINES:
+                budget_add_words(len(" ".join(batch).split()), db_mod=db_mod)
+
+    if not any_engine_ok:
+        log.warning("all engines failed on every batch")
+        raise TranslationFailed("chain produced nothing")
 
     # Reassemble — original indices and timecodes, byte-for-byte structure
     out_lines = []
