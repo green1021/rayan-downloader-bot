@@ -4025,7 +4025,48 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     tw_type = info.get("tw_type")
     is_tw = info.get("is_tw")
 
-    # Priority: quote > thread > photos > text
+    # ── MULTI-VIDEO TWEET: 2+ videos in one tweet → download ALL as album ──
+    if is_tw and tw_type == "video" and len(tw_full.get("video_urls") or []) > 1:
+        v_urls = (tw_full.get("video_urls") or [])[:4]
+        await status_msg.edit_text(i18n.t(lang, "downloading").format(
+            title=(tw_full.get("text") or "Tweet")[:60], quality=f"{len(v_urls)} videos"),
+            parse_mode="Markdown")
+        media = []
+        for i, v_url in enumerate(v_urls):
+            v_path = os.path.join(DOWNLOAD_DIR, f"twmv_{uid}_{i}_{int(time.time())}.mp4")
+            ok_v = await asyncio.to_thread(igtw.download_twitter, url, "best", v_path, v_url)
+            if ok_v and os.path.exists(v_path) and os.path.getsize(v_path) > 0:
+                media.append(("video", v_path))
+        if not media:
+            await status_msg.edit_text(i18n.t(lang, "error_generic"))
+            return
+        cap = i18n.t(lang, "tw_tweet_header").format(
+            name=dl._esc_md(tw_full.get("user_name") or ""),
+            screen=dl._esc_md(tw_full.get("user_screen") or ""),
+            text=dl._esc_md((tw_full.get("text") or "")[:300]),
+            likes=tw_full.get("favorite_count") or 0,
+            rts=tw_full.get("retweet_count") or 0)
+        try:
+            await _send_album(context, update.effective_chat.id, media, cap)
+        except Exception as e:
+            log.warning("multivideo album failed, singles fallback: %s", e)
+            for kind, pth in media:
+                if kind != "video":
+                    continue
+                async def _sf():
+                    return context.bot.send_video(
+                        update.effective_chat.id, video=open(pth, "rb"),
+                        caption=cap, supports_streaming=True, read_timeout=120,
+                        write_timeout=120, connect_timeout=60)
+                try:
+                    await _send_media_retry(_sf)
+                except Exception as e2:
+                    log.warning("single video send failed: %s", e2)
+        for _, pth in media:
+            dl.cleanup(pth)
+        return
+
+# Priority: quote > thread > photos > text
     # Quote tweet: show both tweets cleanly FIRST (most informative)
     if is_tw and tw_type == "quote" and tw_full.get("quoted"):
         q = tw_full["quoted"]
