@@ -252,6 +252,28 @@ def get_twitter_full(url: str) -> dict:
     return get_twitter_info(url)
 
 
+def _metric(v) -> int:
+    """Normalize a fxtwitter metric to an int. fxtwitter has shipped two
+    shapes over time: a plain number (42) and a metric object
+    ({count: 42, formatted: "4.2K"}). Return 0 for anything unparseable."""
+    if isinstance(v, bool):
+        return 0
+    if isinstance(v, (int, float)):
+        return int(v)
+    if isinstance(v, dict):
+        v = v.get("count", v.get("value"))
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return int(v)
+        try:
+            return int(str(v).replace(",", ""))
+        except (TypeError, ValueError):
+            return 0
+    try:
+        return int(str(v).replace(",", "")) if v is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
 def _build_from_fxtwitter(fx: dict, url: str, twid: str) -> dict:
     """Build result from the NEW fxtwitter API shape."""
     media = fx.get("media") or {}
@@ -293,9 +315,9 @@ def _build_from_fxtwitter(fx: dict, url: str, twid: str) -> dict:
         "user_name": au.get("name", ""),
         "user_screen": au.get("screen_name", ""),
         "created_at": fx.get("created_at", ""),
-        "favorite_count": fx.get("likes"),
-        "reply_count": fx.get("replies"),
-        "retweet_count": fx.get("retweets"),
+        "favorite_count": _metric(fx.get("likes")),
+        "reply_count": _metric(fx.get("replies")),
+        "retweet_count": _metric(fx.get("retweets")),
         "lang": fx.get("lang"),
         "webpage_url": url,
         "photos": photos,

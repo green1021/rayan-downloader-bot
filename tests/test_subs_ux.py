@@ -578,6 +578,95 @@ def test_answer_retry_never_raises():
     assert Dead.calls == 2, "attempts=2 (one retry after 2s)"
 
 
+def test_more_callback_on_media_message_edits_reply_markup():
+    """Video messages have text=None; more_qualities must edit reply markup without error."""
+    sent = {}
+
+    class MediaMsg:
+        text = None
+
+        async def edit_reply_markup(self, reply_markup=None):
+            sent["markup"] = reply_markup
+
+        async def edit_text(self, *a, **kw):
+            raise RuntimeError("BadRequest: There is no text in the message to edit")
+
+    class Q:
+        data = "more|testdl12|0"
+        from_user = type("U", (), {"id": 123456})()
+        message = MediaMsg()
+
+        async def answer(self, *a, **k):
+            pass
+
+    ud = {"dl_testdl12": {"url": "https://example.com/v", "info": {},
+                          "heights": [1080, 720, 480, 360, 240, 144]}}
+    update = mock.MagicMock()
+    update.callback_query = Q()
+    ctx = mock.MagicMock()
+    ctx.user_data = ud
+    ctx.bot_data = {}
+
+    async def run():
+        with mock.patch.object(rbot, "lang_of", lambda u: "fa"):
+            await rbot.more_qualities(update, ctx)
+
+    asyncio.run(run())
+    assert sent.get("markup") is not None
+    datas = [b.callback_data for row in sent["markup"].inline_keyboard for b in row]
+    assert "dl|testdl12|360" in datas
+    assert "dl|testdl12|240" in datas
+    assert "dl|testdl12|144" in datas
+    assert "backdl|testdl12" in datas
+
+
+def test_backdl_callback_restores_main_menu():
+    """backdl| callback restores the main options under the video."""
+    sent = {}
+
+    class MediaMsg:
+        text = None
+
+        async def edit_reply_markup(self, reply_markup=None):
+            sent["markup"] = reply_markup
+
+    class Q:
+        data = "backdl|testdl12"
+        from_user = type("U", (), {"id": 123456})()
+        message = MediaMsg()
+
+        async def answer(self, *a, **k):
+            pass
+
+    dummy_main_kb = [
+        [rbot.InlineKeyboardButton("🎥 1080p", callback_data="dl|testdl12|1080")],
+        [rbot.InlineKeyboardButton("🎥 کیفیت‌های دیگر", callback_data="more|testdl12|0")],
+        [rbot.InlineKeyboardButton("🎵 فقط صدا", callback_data="dl|testdl12|audio")],
+    ]
+    ud = {
+        "more_testdl12": dummy_main_kb,
+        "dl_testdl12": {"url": "https://example.com/v", "info": {},
+                        "heights": [1080, 720, 480, 360, 240, 144]}
+    }
+    update = mock.MagicMock()
+    update.callback_query = Q()
+    ctx = mock.MagicMock()
+    ctx.user_data = ud
+    ctx.bot_data = {}
+
+    async def run():
+        with mock.patch.object(rbot, "lang_of", lambda u: "fa"):
+            await rbot.button_click(update, ctx)
+
+    asyncio.run(run())
+    assert sent.get("markup") is not None
+    datas = [b.callback_data for row in sent["markup"].inline_keyboard for b in row]
+    assert "dl|testdl12|1080" in datas
+    assert "more|testdl12|0" in datas
+    assert "dl|testdl12|audio" in datas
+
+
+
 # ------------------------------------------------------------------
 if __name__ == "__main__":
     fns = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]

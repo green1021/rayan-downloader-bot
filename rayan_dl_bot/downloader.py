@@ -10,6 +10,7 @@ import os
 import re
 import json
 import time
+import asyncio
 import logging
 import subprocess
 import importlib.util
@@ -24,6 +25,100 @@ JS_RUNTIME = ["--js-runtimes", "node:/usr/bin/node"]
 FFMPEG = "/usr/bin/ffmpeg"
 WARP_PROXY = "socks5://127.0.0.1:40000"
 TOR_PROXY = "socks5h://127.0.0.1:9050"
+
+# ── Size pre-gate ─────────────────────────────────────────────
+# yt-dlp aborts BEFORE transferring when the format reports a size above this.
+# bot.py syncs its own MAX_FILE_SIZE_MB here at import; the post-download
+# check stays as backstop for hosts that don't report sizes.
+MAX_FILESIZE_BYTES = 1900 * 1024 * 1024
+
+
+def set_max_filesize_bytes(n: int) -> None:
+    global MAX_FILESIZE_BYTES
+    try:
+        MAX_FILESIZE_BYTES = max(0, int(n))
+    except (TypeError, ValueError):
+        pass
+
+
+def _size_gate() -> list:
+    """[--max-filesize N] args, empty when the gate is disabled (0)."""
+    return ["--max-filesize", str(MAX_FILESIZE_BYTES)] if MAX_FILESIZE_BYTES > 0 else []
+
+
+# ── Transient (network-ish) errors — B7 auto-retry ────────────
+class TransientError(Exception):
+    """A retryable, network-ish failure from an external process/HTTP call.
+
+    Deliberately NOT raised for: user cancellation (asyncio.CancelledError),
+    validation errors (bad URL / bad arguments), or permanent extractor
+    failures ("Unsupported URL", login walls) — callers must let those
+    propagate/fail fast instead of burning retries on them."""
+
+
+# stderr markers that mean the failure was the NETWORK, not the input.
+# Everything else (unsupported URL, missing format, auth wall...) fails fast.
+_TRANSIENT_MARKERS = (
+    "timed out", "timeout", "temporary failure", "connection reset",
+    "connection refused", "connection error", "connection aborted",
+    "network", "getaddrinfo", "name or service not known",
+    "unable to download", "http error 5", "http error 429",
+    "remote end closed", "eof occurred", "ssl:", "chunked",
+    "giving up after", "readerror", "connecterror", "proxy",
+)
+
+
+def looks_transient(err_text: str) -> bool:
+    """True when an error string smells like a network hiccup (retryable)."""
+    t = (err_text or "").lower()
+    return any(m in t for m in _TRANSIENT_MARKERS)
+
+
+def classify_failure(exc: BaseException) -> bool:
+    """True if exc is worth retrying. NEVER retries CancelledError
+    (user-cancel) — that must propagate immediately."""
+    if isinstance(exc, asyncio.CancelledError):
+        return False
+    if isinstance(exc, TransientError):
+        return True
+    # subprocess timeouts are network-ish by nature
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return True
+    msg = str(exc)
+    return looks_transient(msg)
+
+
+def _retry_run(cmd: list, *, timeout: float, attempts: int = 3,
+               base_delay: float = 1.0, ok=None):
+    """Run cmd with exponential backoff on network-ish failures.
+
+    ok(returncode, proc) lets callers add success conditions beyond rc==0.
+    Non-retryable failures raise immediately (validation errors must not
+    burn retries); CancelledError always propagates untouched.
+    NOTE: process stderr is carried in a PLAIN Exception — classify_failure
+    must judge it by its TEXT (markers), not by a pre-decided type."""
+    last_exc = None
+    for attempt in range(max(1, attempts)):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout)
+            if r.returncode == 0 or (ok and ok(r.returncode, r)):
+                return r
+            last_exc = Exception((r.stderr or r.stdout or "")[-300:])
+        except subprocess.TimeoutExpired as e:
+            last_exc = e
+        except asyncio.CancelledError:
+            raise  # user-cancel: never swallowed, never retried
+        except Exception as e:
+            last_exc = e
+        # only sleep+retry when the NEXT attempt exists AND failure is retryable
+        if attempt < attempts - 1 and classify_failure(last_exc):
+            time.sleep(base_delay * (2 ** attempt))  # 1s, 2s, 4s...
+            continue
+        break
+    if isinstance(last_exc, Exception):
+        raise last_exc
+    raise TransientError("command failed")
 
 # Load pornhub helper
 _SPEC = importlib.util.spec_from_file_location("ph", "/root/hermes-workspace/scripts/ph_downloader.py")
@@ -317,21 +412,16 @@ def get_video_info(url: str) -> dict:
     # -N 8: concurrent fragment downloads; --no-check-certificates for speed on some hosts
     cmd = [YTDLP, *JS_RUNTIME, *proxy, "-J", "--no-warnings", "--skip-download",
            "--no-check-certificates", url]
-    # TikTok's API rate-limits aggressively: retry a few times with a small backoff
-    attempts = 4 if is_tiktok(url) else 1
-    last_err = ""
-    for attempt in range(attempts):
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-            if r.returncode == 0:
-                break
-            last_err = (r.stderr or r.stdout)[-300:]
-        except Exception as e:
-            last_err = str(e)
-        if attempt < attempts - 1:
-            time.sleep(2 + attempt * 3)
-    else:
-        return {"error": last_err}
+    # B7: network-ish failures auto-retry with backoff; bad URLs / login walls
+    # fail fast. TikTok's API rate-limits aggressively → one extra attempt.
+    attempts = 4 if is_tiktok(url) else 3
+    try:
+        r = _retry_run(cmd, timeout=120, attempts=attempts, base_delay=2.0,
+                       # success needs a real JSON object on stdout — some
+                       # failures exit 1 yet still print ("null", b"")
+                       ok=lambda rc, proc: (proc.stdout or "").lstrip().startswith("{"))
+    except Exception as e:
+        return {"error": str(e)[-300:]}
     try:
         d = json.loads(r.stdout)
 
@@ -444,7 +534,9 @@ def download_url_audio(url: str, out_file: str) -> bool:
     try:
         r = subprocess.run(
             ["/usr/local/bin/yt-dlp", *JS_RUNTIME, "-f", "bestaudio[ext=m4a]/bestaudio", "--no-playlist",
-             "--no-check-certificates", "--force-overwrites", "-o", out, url],
+             "--no-check-certificates", "--force-overwrites",
+             *_size_gate(),
+             "-o", out, url],
             capture_output=True, text=True, timeout=240,
         )
         if r.returncode != 0:
@@ -472,6 +564,7 @@ def download_song(title: str, artist: str, out_file: str, want_mp3: bool = False
                 r = subprocess.run(
                     ["/usr/local/bin/yt-dlp", *JS_RUNTIME, "-f", "bestaudio[ext=m4a]/bestaudio", "--no-playlist",
                      "--no-check-certificates", "--force-overwrites",
+                     *_size_gate(),
                      "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
                      "-o", os.path.join(d, stem), query],
                     capture_output=True, text=True, timeout=200,
@@ -486,6 +579,7 @@ def download_song(title: str, artist: str, out_file: str, want_mp3: bool = False
                 r = subprocess.run(
                     ["/usr/local/bin/yt-dlp", *JS_RUNTIME, "-f", "bestaudio[ext=m4a]/bestaudio", "--no-playlist",
                      "--no-check-certificates", "--force-overwrites",
+                     *_size_gate(),
                      "-o", out, query],
                     capture_output=True, text=True, timeout=200,
                 )
@@ -551,7 +645,9 @@ def download_audio_wav(url: str, out_wav: str, seconds: int = 30) -> bool:
     try:
         r = subprocess.run(
             ["/usr/local/bin/yt-dlp", *JS_RUNTIME, "-f", "bestaudio/best", "--no-playlist",
-             "--no-check-certificates", "-N", "8", "-o", tmp, url],
+             "--no-check-certificates",
+             *_size_gate(),
+             "-N", "8", "-o", tmp, url],
             capture_output=True, text=True, timeout=180,
         )
         if r.returncode != 0:
@@ -625,6 +721,7 @@ def download_video(url: str, quality: str, is_audio: bool, out_path: str) -> boo
 
     if is_audio:
         cmd = [YTDLP, *JS_RUNTIME, *proxy, "-x", "--audio-format", "mp3", "-f", "bestaudio",
+               *_size_gate(),
                "--no-check-certificates", "-N", "8",
                "-o", out_path, "--no-warnings", url]
     else:
@@ -637,31 +734,45 @@ def download_video(url: str, quality: str, is_audio: bool, out_path: str) -> boo
             fmt = f"bv[height<={quality}]+ba/b[height<={quality}]"
         cmd = [YTDLP, *JS_RUNTIME, *proxy, "-f", fmt,
                "--merge-output-format", "mp4",
+               *_size_gate(),
                "--no-check-certificates", "-N", "8",
                "--no-playlist",
                "-o", out_path, "--no-warnings", url]
     try:
-        # TikTok rate-limits: retry the whole download a few times
-        attempts = 4 if is_tiktok(url) else 1
+        attempts = 4 if is_tiktok(url) else 3
+        last_err = None
         for attempt in range(attempts):
             # clean partial file between attempts
             if attempt > 0:
                 dl.cleanup(out_path)
                 for cand in (out_path + ".mp4", out_path + ".mp3", out_path + ".mkv", out_path + ".webm"):
                     dl.cleanup(cand)
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
-            ok = os.path.exists(out_path) and os.path.getsize(out_path) > 0
-            if not ok:
-                # yt-dlp may append .mp4/.mp3 if out_path has no proper ext
-                for cand in (out_path + ".mp4", out_path + ".mp3", out_path + ".mkv", out_path + ".webm"):
-                    if os.path.exists(cand) and os.path.getsize(cand) > 0:
-                        ok = True
-                        break
-            if ok:
-                break
-            if attempt < attempts - 1:
-                time.sleep(2 + attempt * 3)
-        return ok
+                # B7: only sleep when the LAST failure was network-ish — a
+                # permanent extractor error must fail fast, not wait out backoff
+                if last_err is not None and not classify_failure(last_err):
+                    break
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+                ok = os.path.exists(out_path) and os.path.getsize(out_path) > 0
+                if not ok:
+                    # yt-dlp may append .mp4/.mp3 if out_path has no proper ext
+                    for cand in (out_path + ".mp4", out_path + ".mp3", out_path + ".mkv", out_path + ".webm"):
+                        if os.path.exists(cand) and os.path.getsize(cand) > 0:
+                            ok = True
+                            break
+                if ok:
+                    return True
+                err_text = ((r.stderr or "") + "\n" + (r.stdout or ""))[-400:]
+            except subprocess.TimeoutExpired as e:
+                err_text = str(e)          # timeout = network-ish → retryable
+            except asyncio.CancelledError:
+                raise                       # user-cancel propagates untouched
+            except Exception as e:
+                err_text = f"{type(e).__name__}: {e}"
+            last_err = TransientError(err_text)
+            if attempt < attempts - 1 and classify_failure(last_err):
+                time.sleep(1.0 * (2 ** attempt))   # 1s, 2s, 4s...
+        return False
     except Exception as e:
         log.error("download error: %s", e)
         return False
@@ -722,6 +833,7 @@ def download_video_with_subs(url: str, lang: str, out_path: str,
     cmd = [YTDLP, *JS_RUNTIME, *proxy,
            "--embed-subs", "--write-subs", "--sub-langs", lang,
            "--merge-output-format", "mkv",
+           *_size_gate(),
            "-f", vf, "--no-playlist", "--no-check-certificates",
            "-o", stem, url]
     try:
@@ -797,6 +909,7 @@ def download_playlist(url: str, out_dir: str) -> int:
     os.makedirs(out_dir, exist_ok=True)
     cmd = [YTDLP, *JS_RUNTIME, *proxy, "-f", "best[height<=720]+bestaudio/best[height<=720]",
            "--merge-output-format", "mp4",
+           *_size_gate(),
            "--no-check-certificates", "-N", "8",
            "-o", os.path.join(out_dir, "%(title).80s.%(ext)s"),
            "--no-warnings", url]

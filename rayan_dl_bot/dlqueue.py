@@ -1,19 +1,27 @@
 """Download queue for Rayan Downloader bot.
 
-Simple, correct design:
-- ONE global asyncio.Semaphore shared by every download (the old code made a
-  fresh one per call, so the cap never actually applied — fixed here).
+Design:
+- ONE global pool of `max_concurrent_downloads` permits, granted to waiters
+  in PRIORITY order: skip-lane jobs (referral credits, B1) first, then FIFO.
+  Plain asyncio.Semaphore cannot do this — it wakes waiters strictly in
+  arrival order, so a "skip the queue" feature would have no effect.
 - Waiting counter gives exact queue position for user messages.
-- Per-user concurrency cap (default 2) so a single user can't hog the queue.
-- Admin changes max_concurrent_downloads → next acquire picks the new size.
+- Admin changes max_concurrent_downloads apply on the next grant/release
+  (no swap dance needed — the pool is a counter, not an object).
 """
 import asyncio
+import heapq
+import itertools
 
-_sem: asyncio.Semaphore | None = None
-_sem_size = 0
-_waiting = 0                      # jobs currently waiting on the semaphore
-_per_user = {}                    # uid -> running count
-USER_CAP = 2
+_free = 0              # permits available (synced to config on first use)
+_sem_size = 0          # configured size we last synced to
+# NOTE: both start at 0 so the FIRST _resize_if_needed() brings _free up to
+# exactly max_concurrent_downloads. Starting _free nonzero here would double-
+# count against the first resize and silently raise the real cap.
+_waiting_total = 0     # jobs currently waiting on a permit
+_heap = []             # (pri, seq, future) — pri 0 = skip lane, 1 = normal FIFO
+_seq = itertools.count()
+_per_user = {}         # uid -> running count
 
 
 def _configured() -> int:
@@ -25,43 +33,64 @@ def _configured() -> int:
         return 2
 
 
-def _get_sem() -> asyncio.Semaphore:
-    global _sem, _sem_size
+def _resize_if_needed():
+    """Apply admin-side concurrency changes: shift _free by the delta."""
+    global _free, _sem_size
     want = _configured()
-    if _sem is None or want != _sem_size:
-        # Swap in a new semaphore at the new size. Jobs holding permits from an
-        # old semaphore release to that old one; steady state converges quickly.
-        _sem = asyncio.Semaphore(want)
+    if want != _sem_size:
+        _free += want - _sem_size
         _sem_size = want
-    return _sem
+
+
+def _grant_ready():
+    """Grant free permits to the best-priority waiters (then oldest first)."""
+    global _free
+    while _free > 0 and _heap:
+        _, _, fut = heapq.heappop(_heap)
+        if fut.done():
+            continue  # waiter was cancelled while queued — skip stale entry
+        _free -= 1
+        fut.set_result(None)
 
 
 def queue_position() -> int:
     """How many jobs are waiting (not yet running)."""
-    return _waiting
+    return _waiting_total
 
 
 def running_for(uid: int) -> int:
     return _per_user.get(uid, 0)
 
 
-class QueueSlot:
-    """async-with slot: waits for a download permit, tracks per-user usage."""
+def total_running() -> int:
+    return sum(_per_user.values())
 
-    def __init__(self, uid: int):
+
+class QueueSlot:
+    """async-with slot: waits for a download permit, tracks per-user usage.
+
+    skip=True (referral credit spent) puts the job in the fast lane: it is
+    granted the next free permit ahead of all normal-waiting jobs."""
+
+    def __init__(self, uid: int, skip: bool = False):
         self.uid = uid
+        self.pri = 0 if skip else 1
 
     async def wait(self) -> int:
-        """Acquire a permit; returns queue position we waited at (0 = ran immediately)."""
-        global _waiting
-        pos_at_arrival = _waiting  # position snapshot before we join the wait
-        _waiting += 1
+        """Acquire a permit; returns queue position we waited at."""
+        global _waiting_total
+        _resize_if_needed()
+        pos_at_arrival = _waiting_total  # position snapshot before we join the wait
+        fut = asyncio.get_running_loop().create_future()
+        heapq.heappush(_heap, (self.pri, next(_seq), fut))
+        _waiting_total += 1
+        _grant_ready()  # a permit may be free right now (or we jumped the line)
         try:
-            await _get_sem().acquire()
-            return pos_at_arrival
+            await fut
         finally:
-            _waiting -= 1
-            _per_user[self.uid] = _per_user.get(self.uid, 0) + 1
+            _waiting_total = max(0, _waiting_total - 1)
+        _per_user[self.uid] = _per_user.get(self.uid, 0) + 1
+        return pos_at_arrival
 
     def done(self):
         _per_user[self.uid] = max(0, _per_user.get(self.uid, 1) - 1)
@@ -74,12 +103,7 @@ class QueueSlot:
 
     async def __aexit__(self, exc_type, exc, tb):
         self.done()
-        try:
-            _get_sem().release()
-        except Exception:
-            pass
+        global _free
+        _free += 1
+        _grant_ready()  # hand the freed permit to the next (highest-priority) waiter
         return False
-
-
-def total_running() -> int:
-    return sum(_per_user.values())

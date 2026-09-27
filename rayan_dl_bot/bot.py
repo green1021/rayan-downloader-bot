@@ -201,15 +201,62 @@ async def _send_media_retry(factory, attempts: int = 3):
         raise
 
 
+async def _edit_reply_markup_retry(msg, reply_markup=None):
+    """edit_reply_markup with retry on transient failures. Never raises."""
+    try:
+        if hasattr(msg, "edit_reply_markup"):
+            return await _retry_async(lambda: msg.edit_reply_markup(reply_markup=reply_markup),
+                                      attempts=2, base_delay=2.0)
+        return None
+    except Exception as e:
+        err_str = str(e).lower()
+        if "message is not modified" in err_str:
+            return msg
+        log.warning("edit_reply_markup_retry: %s", str(e)[:160])
+        return None
+
+
 async def _edit_retry(msg, *args, **kwargs):
     """edit_text with ONE retry after 2s on transient failures (C2: a single
     flaky local-bot-api «Timed out» killed a subtitle-flow transition). NEVER
     raises — a dead edit is logged, not allowed to take the flow down.
-    Validation errors (BadRequest) still fail fast via _is_retryable."""
+    Validation errors (BadRequest) still fail fast via _is_retryable.
+    Automatically handles media messages (video/animation/photo/audio)
+    by falling back to edit_caption or edit_reply_markup when there is no text.
+    """
     try:
-        return await _retry_async(lambda: msg.edit_text(*args, **kwargs),
-                                  attempts=2, base_delay=2.0)
+        if getattr(msg, "text", None) is not None or not hasattr(msg, "edit_caption"):
+            return await _retry_async(lambda: msg.edit_text(*args, **kwargs),
+                                      attempts=2, base_delay=2.0)
+        # Media message fallback (q.message is a video/photo/audio without text)
+        caption = kwargs.pop("caption", None) or kwargs.pop("text", None)
+        if not caption and args:
+            caption = args[0]
+            args = args[1:]
+        if caption:
+            kwargs["caption"] = caption
+            try:
+                return await _retry_async(lambda: msg.edit_caption(*args, **kwargs),
+                                          attempts=2, base_delay=2.0)
+            except Exception as e:
+                err_str = str(e).lower()
+                if "message is not modified" in err_str:
+                    return msg
+                rm = kwargs.get("reply_markup")
+                if rm and hasattr(msg, "edit_reply_markup"):
+                    return await _retry_async(lambda: msg.edit_reply_markup(reply_markup=rm),
+                                              attempts=2, base_delay=2.0)
+                raise
+        else:
+            rm = kwargs.get("reply_markup")
+            if hasattr(msg, "edit_reply_markup"):
+                return await _retry_async(lambda: msg.edit_reply_markup(reply_markup=rm),
+                                          attempts=2, base_delay=2.0)
+            return None
     except Exception as e:
+        err_str = str(e).lower()
+        if "message is not modified" in err_str:
+            return msg
         log.warning("edit_retry: %s", str(e)[:160])
         return None
 
@@ -4025,7 +4072,48 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     tw_type = info.get("tw_type")
     is_tw = info.get("is_tw")
 
-    # Priority: quote > thread > photos > text
+    # ── MULTI-VIDEO TWEET: 2+ videos in one tweet → download ALL as album ──
+    if is_tw and tw_type == "video" and len(tw_full.get("video_urls") or []) > 1:
+        v_urls = (tw_full.get("video_urls") or [])[:4]
+        await status_msg.edit_text(i18n.t(lang, "downloading").format(
+            title=(tw_full.get("text") or "Tweet")[:60], quality=f"{len(v_urls)} videos"),
+            parse_mode="Markdown")
+        media = []
+        for i, v_url in enumerate(v_urls):
+            v_path = os.path.join(DOWNLOAD_DIR, f"twmv_{uid}_{i}_{int(time.time())}.mp4")
+            ok_v = await asyncio.to_thread(igtw.download_twitter, url, "best", v_path, v_url)
+            if ok_v and os.path.exists(v_path) and os.path.getsize(v_path) > 0:
+                media.append(("video", v_path))
+        if not media:
+            await status_msg.edit_text(i18n.t(lang, "error_generic"))
+            return
+        cap = i18n.t(lang, "tw_tweet_header").format(
+            name=dl._esc_md(tw_full.get("user_name") or ""),
+            screen=dl._esc_md(tw_full.get("user_screen") or ""),
+            text=dl._esc_md((tw_full.get("text") or "")[:300]),
+            likes=tw_full.get("favorite_count") or 0,
+            rts=tw_full.get("retweet_count") or 0)
+        try:
+            await _send_album(context, update.effective_chat.id, media, cap)
+        except Exception as e:
+            log.warning("multivideo album failed, singles fallback: %s", e)
+            for kind, pth in media:
+                if kind != "video":
+                    continue
+                async def _sf():
+                    return context.bot.send_video(
+                        update.effective_chat.id, video=open(pth, "rb"),
+                        caption=cap, supports_streaming=True, read_timeout=120,
+                        write_timeout=120, connect_timeout=60)
+                try:
+                    await _send_media_retry(_sf)
+                except Exception as e2:
+                    log.warning("single video send failed: %s", e2)
+        for _, pth in media:
+            dl.cleanup(pth)
+        return
+
+# Priority: quote > thread > photos > text
     # Quote tweet: show both tweets cleanly FIRST (most informative)
     if is_tw and tw_type == "quote" and tw_full.get("quoted"):
         q = tw_full["quoted"]
@@ -4299,6 +4387,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 if est and est < (MAX_FILE_SIZE_MB - 5) * 1024 * 1024:
                     best = h
                     break
+    context.user_data[f"dl_{dl_id}"]["best_q"] = best
 
     # Quality buttons — MAIN PAGE: ONLY 1080p/720p/480p (user-mandated cleanup);
     # every other height moves behind «🎥 کیفیت‌های دیگر» (paginated ≤8/page,
@@ -4326,10 +4415,12 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # FAST: still no second yt-dlp call — everything comes from the info dict.
     # Callback routes into the EXISTING sub|… flow unchanged.
     if site == "youtube":
-        sub_rows = sub_picker_rows(dl_id, info, lang)
-        if sub_rows:
-            for row in sub_rows:
-                keyboard.append([InlineKeyboardButton(lbl, callback_data=cb) for lbl, cb in row])
+        has_subs = bool(build_sub_choices(info, lang)) or \
+                   bool(info.get("subtitles") or info.get("auto_captions")
+                        or info.get("auto_caption_langs"))
+        if has_subs:
+            keyboard.append([InlineKeyboardButton(
+                "🌍 ترجمه زیرنویس", callback_data=f"subt|{dl_id}")])
             context.user_data[f"suburl_{dl_id}"] = url
 
     await status_msg.edit_text(i18n.t(lang, "downloading").format(title=info.get("title", "")[:80], quality=f"{best}p"),
@@ -4369,6 +4460,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     reply_markup=InlineKeyboardMarkup(keyboard))
             except Exception as e:
                 log.debug("cdn follow-up kb: %s", e)
+            context.user_data[f"more_{dl_id}"] = keyboard
             try:
                 await status_msg.delete()
             except Exception:
@@ -4419,9 +4511,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             parse_mode="Markdown",
             supports_streaming=True,
             thumbnail=thumb_fh,
-            reply_markup=InlineKeyboardMarkup(keyboard + [
-                [InlineKeyboardButton(i18n.t(lang, "more_qualities"), callback_data=f"more|{dl_id}|0")]
-            ]),
+            reply_markup=InlineKeyboardMarkup(keyboard),
         )
 
     try:
@@ -4479,7 +4569,10 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     lang = lang_of(update)
 
     if data == "cancel":
-        await q.message.edit_text(i18n.t(lang, "cancelled"))
+        if getattr(q.message, "text", None) is not None:
+            await _edit_retry(q.message, i18n.t(lang, "cancelled"))
+        else:
+            await _edit_reply_markup_retry(q.message, reply_markup=None)
         return
 
     if data == "help":
@@ -4510,6 +4603,55 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     parts = data.split("|")
+    if len(parts) >= 2 and parts[0] == "backdl":
+        dl_id = parts[1]
+        orig_kb = context.user_data.get(f"more_{dl_id}")
+        if not orig_kb:
+            entry = context.user_data.get(f"dl_{dl_id}")
+            if entry:
+                heights = entry.get("heights") or []
+                info = entry.get("info") or {}
+                sizes = info.get("sizes", {})
+                fmt_sub_heights = info.get("format_sub_heights") or []
+                main_heights, other_pages = split_qualities(heights)
+                orig_kb = []
+                best = entry.get("best_q")
+                for h in main_heights:
+                    if h != best:
+                        est = sizes.get(str(h))
+                        lbl = f"🎥 {h}p" + (f" ({dl.human_size(est)})" if est else "")
+                        lbl = quality_sub_badge(lbl, h, fmt_sub_heights)
+                        orig_kb.append([InlineKeyboardButton(lbl, callback_data=f"dl|{dl_id}|{h}")])
+                if other_pages:
+                    orig_kb.append([InlineKeyboardButton("🎥 کیفیت‌های دیگر", callback_data=f"more|{dl_id}|0")])
+                orig_kb.append([InlineKeyboardButton(i18n.t(lang, "mp3_only"), callback_data=f"dl|{dl_id}|audio")])
+                orig_kb.append([InlineKeyboardButton("🎵 تشخیص آهنگ", callback_data=f"dl|{dl_id}|shazam")])
+                if dl.detect_site(entry.get("url", "")) == "youtube":
+                    has_subs = bool(build_sub_choices(info, lang)) or bool(info.get("subtitles") or info.get("auto_captions") or info.get("auto_caption_langs"))
+                    if has_subs:
+                        orig_kb.append([InlineKeyboardButton("🌍 ترجمه زیرنویس", callback_data=f"subt|{dl_id}")])
+        if orig_kb:
+            markup = InlineKeyboardMarkup(orig_kb)
+            if q.message and getattr(q.message, "text", None) is None and hasattr(q.message, "edit_reply_markup"):
+                await _edit_reply_markup_retry(q.message, reply_markup=markup)
+            elif q.message:
+                await _edit_retry(q.message, i18n.t(lang, "more_options"), reply_markup=markup)
+        else:
+            await _answer_retry(q, i18n.t(lang, "link_expired"), show_alert=True)
+        return
+    if len(parts) >= 2 and parts[0] == "subt":
+        # ── Simplified flow STEP 1: «🌍 ترجمه زیرنویس» → target-language picker.
+        dl_id = parts[1]
+        sub_url = context.user_data.get(f"suburl_{dl_id}")
+        if not sub_url:
+            await _answer_retry(q, i18n.t(lang, "link_expired"), show_alert=True)
+            return
+        rows = translate_target_rows(dl_id, [])
+        await _answer_retry(q)
+        await _edit_retry(q.message,
+                          "🌍 به کدوم زبان ترجمه بشه؟",
+                          reply_markup=InlineKeyboardMarkup(rows))
+        return
     if len(parts) >= 3 and parts[0] == "sub":
         # ── Subtitle flow STEP 1→2: language chosen → QUALITY picker.
         # Only the qualities the MAIN menu offered (1080/720/480 trio, or all
@@ -4940,13 +5082,18 @@ async def more_qualities(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     total = quality_others_page(heights, sizes, 0)[1]
     if page > 0:
         nav.append(InlineKeyboardButton("◀️", callback_data=f"more|{dl_id}|{page - 1}"))
+    nav.append(InlineKeyboardButton("🔙 بازگشت", callback_data=f"backdl|{dl_id}"))
     nav.append(InlineKeyboardButton("❌", callback_data="cancel"))
     if page < total - 1:
         nav.append(InlineKeyboardButton("▶️", callback_data=f"more|{dl_id}|{page + 1}"))
     rows.append(nav)
     try:
-        await _edit_retry(q.message, i18n.t(lang, "choose_quality"),
-                          reply_markup=InlineKeyboardMarkup(rows))
+        markup = InlineKeyboardMarkup(rows)
+        if q.message and getattr(q.message, "text", None) is None and hasattr(q.message, "edit_reply_markup"):
+            await _edit_reply_markup_retry(q.message, reply_markup=markup)
+        elif q.message:
+            await _edit_retry(q.message, i18n.t(lang, "choose_quality"),
+                              reply_markup=markup)
     except Exception:
         # Message may have been deleted or the bot restarted — don't crash the loop
         try:
@@ -5142,3 +5289,14 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def translate_target_rows(dl_id: str, native_langs: list) -> list:
+    """Step 1 of the simplified flow: TRANSLATION TARGET language.
+    fa highlighted as default; only langs are offered here (no quality info).
+    Callback continues into existing sub|{id}|{lang} chain."""
+    metas = [("fa", "🇮🇷 فارسی (پیش‌فرض)"), ("en", "🇬🇧 انگلیسی"),
+             ("ar", "🇸🇦 عربی"), ("de", "🇩🇪 آلمانی"),
+             ("es", "🇪🇸 اسپانیایی"), ("fr", "🇫🇷 فرانسوی")]
+    btns = [(lbl, f"sub|{dl_id}|{code}") for code, lbl in metas]
+    return [btns[i:i + 2] for i in range(0, len(btns), 2)]

@@ -571,21 +571,31 @@ def build_plugin(name: str, site: str, ctype: str, pattern: str) -> dict:
 
 
 def test_pattern(site_url: str, pattern: str) -> dict:
-    """Fetch the sample URL and count matches. Returns {ok, matches, sample?}."""
+    """Fetch the sample URL and count matches. Returns {ok, matches, sample?}.
+    The fetch goes through the SAME SSRF validation + safe-opener used for
+    plugin installs (_validate_install_url / _safe_urlopen) so this can never
+    be aimed at localhost/private-range/metadata endpoints."""
+    # lazy import: plugin_manager does not import us at load time.
+    # Works in BOTH import contexts this module sees: as rayan_dl_bot.plugin_builder
+    # (entry point) and as flat `plugin_builder` (bot.py's sys.path.insert).
     try:
-        req = urllib.request.Request(
-            site_url, headers={"User-Agent":
-                               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        from .plugin_manager import _validate_install_url, _safe_urlopen
+    except ImportError:
+        from plugin_manager import _validate_install_url, _safe_urlopen
+    err = _validate_install_url(site_url)
+    if err:
+        return {"ok": False, "message": f"لینک مجاز نیست: {err}"}
+    try:
+        with _safe_urlopen(site_url, 30) as resp:
             html = resp.read().decode("utf-8", "ignore")
-        try:
-            pat = re.compile(pattern)
-        except re.error as e:
-            return {"ok": False, "message": f"regex نامعتبر: {e}"}
-        found = pat.findall(html)
-        if not found:
-            return {"ok": False, "message": "هیچ مقداری با الگو پیدا نشد"}
-        sample = found[0] if isinstance(found[0], str) else str(found[0])
-        return {"ok": True, "matches": len(found), "sample": sample[:120]}
     except Exception as e:
         return {"ok": False, "message": f"خطا در دریافت صفحه: {e}"}
+    try:
+        pat = re.compile(pattern)
+    except re.error as e:
+        return {"ok": False, "message": f"regex نامعتبر: {e}"}
+    found = pat.findall(html)
+    if not found:
+        return {"ok": False, "message": "هیچ مقداری با الگو پیدا نشد"}
+    sample = found[0] if isinstance(found[0], str) else str(found[0])
+    return {"ok": True, "matches": len(found), "sample": sample[:120]}
