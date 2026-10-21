@@ -3746,14 +3746,15 @@ async def _handle_batch_links(update: Update, context: ContextTypes.DEFAULT_TYPE
                                           else await _fetch_thumb(info, url))
                             thumb_fh = open(thumb_path, "rb") if thumb_path else None
                             try:
-                                sent = await context.bot.send_video(
-                                    chat_id=chat_id,
-                                    video=open(out_path, "rb"),
-                                    caption=caption,
-                                    parse_mode="Markdown",
-                                    supports_streaming=True,
-                                    thumbnail=thumb_fh,
-                                )
+                                with open(out_path, "rb") as video_fh:
+                                    sent = await context.bot.send_video(
+                                        chat_id=chat_id,
+                                        video=video_fh,
+                                        caption=caption,
+                                        parse_mode="Markdown",
+                                        supports_streaming=True,
+                                        thumbnail=thumb_fh,
+                                    )
                                 ok_item = bool(sent)
                                 fid = getattr(getattr(sent, "video", None), "file_id", None)
                                 if fid:
