@@ -123,6 +123,12 @@ CREATE TABLE IF NOT EXISTS usage (
     count INT DEFAULT 0,
     PRIMARY KEY (day, user_id)
 );
+CREATE TABLE IF NOT EXISTS reservations (
+    day TEXT,
+    user_id TEXT,
+    reserved INT DEFAULT 0,
+    PRIMARY KEY (day, user_id)
+);
 -- Indexes for hot query paths (avoid full-table scans as tables grow)
 CREATE INDEX IF NOT EXISTS idx_links_user ON links(user_id);
 CREATE INDEX IF NOT EXISTS idx_links_url ON links(url);
@@ -1157,6 +1163,51 @@ def count_referrals(user_id: int) -> int:
 # ── Daily download limit (B6) ────────────────────────────────
 DAILY_LIMIT_KEY = "daily_download_limit"
 
+
+def reserve_quota(user_id: int, n: int = 1) -> int:
+    """Atomic reservation: Return number of slots actually reserved (<= n)."""
+    try:
+        conn = _conn()
+        with conn: # Atomic transaction
+            # Cleanup stale reservations
+            conn.execute("DELETE FROM reservations WHERE day != ?", (_usage_day(),))
+            
+            usage = usage_today(user_id)
+            row = conn.execute("SELECT reserved FROM reservations WHERE day = ? AND user_id = ?",
+                               (_usage_day(), str(user_id))).fetchone()
+            reserved = row[0] if row else 0
+            
+            available = max(0, daily_limit() - (usage + reserved))
+            to_reserve = min(n, available)
+            
+            if to_reserve > 0:
+                conn.execute(
+                    "INSERT INTO reservations (day, user_id, reserved) VALUES (?, ?, ?) "
+                    "ON CONFLICT(day, user_id) DO UPDATE SET reserved = reserved + excluded.reserved",
+                    (_usage_day(), str(user_id), to_reserve))
+                return to_reserve
+            return 0
+    except Exception as e:
+        log.error("reserve_quota: %s", e)
+        return 0
+
+def settle_reservation(user_id: int, n: int, success: bool):
+    """Settle: either bump usage and release reservation (success), or just release (failure)."""
+    try:
+        conn = _conn()
+        with conn:
+            # Always release reservation
+            conn.execute("UPDATE reservations SET reserved = reserved - ? WHERE day = ? AND user_id = ?",
+                         (n, _usage_day(), str(user_id)))
+            
+            if success:
+                # Actual usage bump, same connection
+                conn.execute(
+                    "INSERT INTO usage (day, user_id, count) VALUES (?, ?, ?) "
+                    "ON CONFLICT(day, user_id) DO UPDATE SET count = count + excluded.count",
+                    (_usage_day(), str(user_id), int(n)))
+    except Exception as e:
+        log.error("settle_reservation: %s", e)
 
 def daily_limit() -> int:
     """Per-day download cap for non-allowed users (default 10)."""
