@@ -140,7 +140,8 @@ def _retry_run(cmd: list, *, timeout: float, attempts: int = 3,
 # Load the optional pornhub helper. It is a local, non-packaged add-on: on a
 # fresh deployment it may be absent, and that must not take the whole bot down.
 ph = None
-_PH_PATH = "/root/hermes-workspace/scripts/ph_downloader.py"
+import os
+_PH_PATH = os.environ.get("RAYAN_PH_DOWNLOADER_PATH", "/root/hermes-workspace/scripts/ph_downloader.py")
 if os.path.isfile(_PH_PATH):
     try:
         _SPEC = importlib.util.spec_from_file_location("ph", _PH_PATH)
