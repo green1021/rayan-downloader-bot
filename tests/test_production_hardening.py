@@ -602,6 +602,40 @@ class ApplicationTests(unittest.TestCase):
         self.assertFalse(rbot.rate_limited(1, seconds=60))
         rbot._rate.clear()
 
+    def test_batch_rate_limit_enforced(self):
+        from rayan_dl_bot import bot as rbot
+        rbot._rate.clear()
+        
+        # Mocking update/context/etc is complex, let's see if we can trigger the logic
+        # by calling handle_link directly with a mocked update.
+        from unittest.mock import AsyncMock, MagicMock
+        
+        update = AsyncMock()
+        update.effective_user.id = 1
+        update.effective_chat.id = 100
+        update.message.text = "https://t.co/a https://t.co/b"
+        
+        context = MagicMock()
+        
+        # Initial call should pass and record rate
+        # We need to make _handle_batch_links a mock to verify it's called or not
+        with unittest.mock.patch('rayan_dl_bot.bot._handle_batch_links', new_callable=AsyncMock) as mocked_batch:
+            # Need to patch dependencies to avoid side effects
+            with unittest.mock.patch('rayan_dl_bot.bot.is_admin', return_value=False), \
+                 unittest.mock.patch('rayan_dl_bot.bot._ensure_membership', return_value=True), \
+                 unittest.mock.patch('rayan_dl_bot.bot.db.is_banned', return_value=False), \
+                 unittest.mock.patch('rayan_dl_bot.bot.check_daily_limit', return_value=True):
+                 
+                asyncio.run(rbot.handle_link(update, context))
+                self.assertEqual(mocked_batch.call_count, 1)
+                
+                # Second call immediately should be rate limited
+                asyncio.run(rbot.handle_link(update, context))
+                self.assertEqual(mocked_batch.call_count, 1) # Should NOT have increased
+                update.message.reply_text.assert_called_with(rbot.i18n.t(rbot.lang_of(update), "rate_limit"))
+        
+        rbot._rate.clear()
+
     def test_upload_cap_matches_local_bot_api(self):
         from rayan_dl_bot import bot as rbot
         cap = rbot.upload_cap_mb()
