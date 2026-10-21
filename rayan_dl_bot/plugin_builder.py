@@ -89,9 +89,11 @@ PATTERN = re.compile(PATTERN_PLACEHOLDER)
 
 
 def _fetch(url, timeout=60):
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+    # netguard is preloaded by plugin_host: it blocks private/loopback targets,
+    # pins the validated IP and caps the response body.
+    import netguard
+    return netguard.fetch(url, max_bytes=8 * 1024 * 1024, timeout=timeout,
+                          total_timeout=timeout * 2).body
 
 
 def _abs(page_url, m):
@@ -169,9 +171,11 @@ PATTERN = re.compile(PATTERN_PLACEHOLDER)
 
 
 def _fetch(url, timeout=60):
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+    # netguard is preloaded by plugin_host: it blocks private/loopback targets,
+    # pins the validated IP and caps the response body.
+    import netguard
+    return netguard.fetch(url, max_bytes=8 * 1024 * 1024, timeout=timeout,
+                          total_timeout=timeout * 2).body
 
 
 def _abs(page_url, m):
@@ -218,9 +222,11 @@ PATTERN = re.compile(PATTERN_PLACEHOLDER)
 
 
 def _fetch(url, timeout=60):
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+    # netguard is preloaded by plugin_host: it blocks private/loopback targets,
+    # pins the validated IP and caps the response body.
+    import netguard
+    return netguard.fetch(url, max_bytes=8 * 1024 * 1024, timeout=timeout,
+                          total_timeout=timeout * 2).body
 
 
 def _abs(page_url, m):
@@ -278,9 +284,11 @@ PATTERN = re.compile(PATTERN_PLACEHOLDER, re.DOTALL)
 
 
 def _fetch(url, timeout=60):
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+    # netguard is preloaded by plugin_host: it blocks private/loopback targets,
+    # pins the validated IP and caps the response body.
+    import netguard
+    return netguard.fetch(url, max_bytes=8 * 1024 * 1024, timeout=timeout,
+                          total_timeout=timeout * 2).body
 
 
 def _abs(page_url, m):
@@ -323,9 +331,11 @@ PATTERN = re.compile(PATTERN_PLACEHOLDER)
 
 
 def _fetch(url, timeout=60):
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+    # netguard is preloaded by plugin_host: it blocks private/loopback targets,
+    # pins the validated IP and caps the response body.
+    import netguard
+    return netguard.fetch(url, max_bytes=8 * 1024 * 1024, timeout=timeout,
+                          total_timeout=timeout * 2).body
 
 
 def _abs(page_url, m):
@@ -376,9 +386,11 @@ PATTERN = re.compile(PATTERN_PLACEHOLDER)
 
 
 def _fetch(url, timeout=60):
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+    # netguard is preloaded by plugin_host: it blocks private/loopback targets,
+    # pins the validated IP and caps the response body.
+    import netguard
+    return netguard.fetch(url, max_bytes=8 * 1024 * 1024, timeout=timeout,
+                          total_timeout=timeout * 2).body
 
 
 def _abs(page_url, m):
@@ -425,8 +437,13 @@ class Plugin:
             if dtype == "video" and vids:
                 vurl = _abs(url, vids[0])
                 out = os.path.join(workdir, f"plm_{int(__import__('time').time())}.mp4")
-                subprocess.run(["curl", "-s", "-L", "--max-time", "300", "-A", UA,
-                                "-o", out, vurl], capture_output=True, text=True, timeout=320)
+                import netguard
+                try:
+                    netguard.fetch_to_file(vurl, out, max_bytes=1900 * 1024 * 1024,
+                                           timeout=30, total_timeout=320,
+                                           headers={"User-Agent": UA})
+                except netguard.NetGuardError:
+                    pass
                 if os.path.exists(out) and os.path.getsize(out) > 0:
                     return {"type": "video", "title": SITE_RULE_PLACEHOLDER, "path": out,
                             "text": "🎬 " + SITE_RULE_PLACEHOLDER}
@@ -436,13 +453,12 @@ class Plugin:
                 paths = []
 
                 def _dl(u, p):
-                    req = urllib.request.Request(_abs(url, u), headers={"User-Agent": UA})
-                    with urllib.request.urlopen(req, timeout=40) as resp:
-                        data = resp.read()
-                    if len(data) < 100:
+                    import netguard
+                    n = netguard.fetch_to_file(_abs(url, u), p, max_bytes=100 * 1024 * 1024,
+                                               timeout=40, total_timeout=120,
+                                               headers={"User-Agent": UA})
+                    if n < 100:
                         raise ValueError("tiny")
-                    with open(p, "wb") as f:
-                        f.write(data)
 
                 if dtype == "photos" and len(imgs) < 8:
                     photos = []

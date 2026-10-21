@@ -10,11 +10,13 @@ Run:
   /root/hermes-workspace/venv/bin/python3 /root/hermes-workspace/tests/test_sub_picker.py
 """
 import asyncio
+import os
 import sys
 import unittest.mock as mock
 
-sys.path.insert(0, "/root/hermes-workspace/scripts")
-BOT_DIR = "/root/hermes-workspace/scripts/rayan_dl_bot"
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO_ROOT)
+BOT_DIR = os.path.join(REPO_ROOT, "rayan_dl_bot")
 sys.path.insert(0, BOT_DIR)
 
 from rayan_dl_bot import bot as rbot  # noqa: E402

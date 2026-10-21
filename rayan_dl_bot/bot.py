@@ -24,6 +24,8 @@ from telegram.ext import (
     CallbackQueryHandler, TypeHandler, filters, ContextTypes,
 )
 
+import config
+import netguard
 import i18n
 import db
 import linkcache
@@ -40,31 +42,33 @@ import plugin_builder as pb
 import auto_detect as adetect
 
 # ── Config ────────────────────────────────────────────────────
-def _load_token() -> str:
-    """Load bot token: from env first, else from the legacy bot file."""
-    t = os.environ.get("TG_BOT_TOKEN", "")
-    if t and "***" not in t:
-        return t
-    try:
-        with open("/root/hermes-workspace/scripts/rayan_dl_bot.py") as f:
-            src = f.read()
-        m = re.search(r'BOT_TOKEN = os\.environ\.get\("TG_BOT_TOKEN", "([^"]+)"\)', src)
-        if m and "***" not in m.group(1):
-            return m.group(1)
-    except Exception:
-        pass
-    return ""
-
-
-BOT_TOKEN = _load_token()
-DOWNLOAD_DIR = dl.DOWNLOAD_DIR
-API_STORAGE = "/var/lib/tg-bot-api"
-DB_PATH = "/root/hermes-workspace/data/rayan.db"
-DISK_LIMIT_GB = 2
-MAX_FILE_SIZE_MB = 1900  # local Bot API allows up to 2GB
+# All paths, limits and the token now come from config.py (validated, single
+# source of truth). Defaults are the historical ones, so an existing .env keeps
+# working unchanged; a bad value raises ConfigError at startup instead of
+# failing deep inside a download.
+BOT_TOKEN = config.BOT_TOKEN
+DOWNLOAD_DIR = config.DOWNLOAD_DIR
+API_STORAGE = config.API_STORAGE
+DB_PATH = config.DB_PATH
+DISK_LIMIT_GB = config.DISK_LIMIT_GB
+MAX_FILE_SIZE_MB = config.MAX_FILE_SIZE_MB
 # Keep yt-dlp's --max-filesize pre-gate in sync with our post-download check so
 # oversized files abort BEFORE wasting bandwidth/disk (post-check stays as backstop).
 dl.set_max_filesize_bytes(MAX_FILE_SIZE_MB * 1024 * 1024)
+
+# Free space that must stay available for the OS, SQLite and the Bot API
+# store. Cleanup starts before the disk is actually full, not after.
+MIN_FREE_BYTES = 700 * 1024 * 1024
+
+
+def _md_escape(text) -> str:
+    """Escape a remote-controlled string for Telegram's legacy Markdown.
+
+    Titles come from site metadata; an unescaped ``_``/``*``/``[`` makes
+    Telegram reject the whole message ("can't parse entities"), so the video
+    that just downloaded was never delivered.
+    """
+    return re.sub(r"([_*`\[\]])", r"\\\1", str(text or ""))
 
 
 def upload_cap_mb() -> int:
@@ -73,14 +77,12 @@ def upload_cap_mb() -> int:
     # Sends gate on this so an oversized file shows a clear "too big"
     # message instead of a 413 upload whose body PTB buffers fully in RAM
     # (that OOM-killed this 2 GB box at a 417 MB video).
-    return MAX_FILE_SIZE_MB if os.environ.get("TG_API_BASE", "").strip() else 49
+    return config.max_file_size_mb_effective()
 
 # Admin IDs — initial owners from env (used for first-run bootstrap).
 # Additional admins are stored in DB (admins table) so ANY server deployment
 # can define its own admins. The DB is gitignored (never committed).
-ADMIN_IDS = [int(x) for x in os.environ.get("TG_ADMIN_IDS", "").split(",") if x.strip()]
-
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+ADMIN_IDS = config.ADMIN_IDS
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger("rayan-dl")
@@ -351,35 +353,82 @@ def folder_size(path: str) -> int:
 
 
 def enforce_disk_limit():
+    """Keep both the configured quota AND real free space under control.
+
+    The old version only compared the download folder against DISK_LIMIT_GB, so
+    on a small VPS the filesystem could fill up (logs, bot-api store, other
+    services) while the quota still looked fine — downloads then failed with
+    ENOSPC.  Free space is now a first-class trigger.
+    """
     try:
-        dirs = [DOWNLOAD_DIR, API_STORAGE]
+        # The marker is created by config.ensure_dirs() at startup. Refusing to
+        # delete without it means a typo in RAYAN_DOWNLOAD_DIR (e.g. "/home")
+        # cannot turn disk cleanup into a destructive sweep of another tree.
+        if not os.path.isfile(os.path.join(DOWNLOAD_DIR, ".rayan-owned")):
+            log.error("disk cleanup skipped: %s has no .rayan-owned marker", DOWNLOAD_DIR)
+            return
+        # Only the bot's own download area may be pruned. The local Bot API
+        # store is counted towards the budget but NEVER deleted from: those
+        # blobs are referenced by Telegram file_ids and the server owns their
+        # retention — removing one breaks re-sends of already-shared files.
+        dirs = [DOWNLOAD_DIR]
+        now = time.time()
+        urgent = False
+        try:
+            urgent = shutil.disk_usage(DOWNLOAD_DIR).free < 200 * 1024 * 1024
+        except OSError:
+            pass
+        min_age = 600 if urgent else 3600  # a 2 GB send can outlive 5 minutes
         all_files = []
+        stale_aux = []
         for d in dirs:
-            if os.path.isdir(d):
-                for dirpath, _, filenames in os.walk(d):
-                    for f in filenames:
-                        fp = os.path.join(dirpath, f)
-                        try:
-                            mtime = os.path.getmtime(fp)
-                            size = os.path.getsize(fp)
-                        except Exception:
-                            continue
-                        if time.time() - mtime < 300:
-                            continue
-                        all_files.append((mtime, size, fp))
+            if not os.path.isdir(d):
+                continue
+            for dirpath, _, filenames in os.walk(d):
+                for f in filenames:
+                    fp = os.path.join(dirpath, f)
+                    try:
+                        mtime = os.path.getmtime(fp)
+                        size = os.path.getsize(fp)
+                    except Exception:
+                        continue
+                    base = os.path.basename(fp)
+                    # Temporary/auxiliary files never belong to a finished job.
+                    if base.startswith("thumb_") and now - mtime > 86400:
+                        stale_aux.append((mtime, size, fp))
+                        continue
+                    if (base.endswith((".raw", ".part", ".ytdl")) and
+                            now - mtime > 3600):
+                        stale_aux.append((mtime, size, fp))
+                        continue
+                    if now - mtime < min_age:
+                        continue  # may still be downloading or uploading
+                    all_files.append((mtime, size, fp))
 
         total = folder_size(DOWNLOAD_DIR) + folder_size(API_STORAGE)
         limit = DISK_LIMIT_GB * 1024 * 1024 * 1024
-        if total <= limit:
+        try:
+            free = shutil.disk_usage(DOWNLOAD_DIR).free
+        except OSError:
+            free = 0
+        if total <= limit and free >= MIN_FREE_BYTES:
+            # still drop stale thumbnails/partials so they cannot accumulate
+            for mtime, size, fp in stale_aux[:200]:
+                try:
+                    os.remove(fp)
+                except OSError:
+                    pass
             return
+
         all_files.sort()
-        for mtime, size, fp in all_files:
-            if total <= limit:
+        for mtime, size, fp in stale_aux + all_files:
+            if total <= limit and free >= MIN_FREE_BYTES:
                 break
             try:
                 os.remove(fp)
                 total -= size
-                log.info("Disk cleanup: removed %s", fp)
+                free += size
+                log.info("Disk cleanup: removed %s (%d bytes)", fp, size)
             except Exception:
                 pass
     except Exception as e:
@@ -398,10 +447,16 @@ async def _fetch_thumb(info: dict, url: str) -> str | None:
             return tpath  # cached thumb
         raw = tpath + ".raw"
         def _dl():
-            r = subprocess.run(
-                ["curl", "-s", "-L", "--max-time", "25", "-A",
-                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "-o", raw, thumb_url],
-                capture_output=True, text=True, timeout=30)
+            # The thumbnail URL comes from site metadata, i.e. it is remote
+            # input: fetch it through netguard with a hard size cap.
+            try:
+                netguard.fetch_to_file(
+                    thumb_url, raw, max_bytes=10 * 1024 * 1024,
+                    timeout=25, total_timeout=35,
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            except netguard.NetGuardError as exc:
+                log.debug("thumbnail blocked: %s", exc)
+                return False
             if not (os.path.exists(raw) and os.path.getsize(raw) > 1000):
                 return False
             # Telegram send_video thumbnails MUST be JPEG — many sites serve WebP/PNG.
@@ -3870,9 +3925,15 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 ext = "mp4" if kind == "video" else "jpg"
                 p = os.path.join(DOWNLOAD_DIR, f"igc_{uid}_{i}_{int(time.time())}.{ext}")
                 def _dl_ig(u=m_url, o=p):
-                    rr = subprocess.run(["curl", "-s", "-L", "--max-time", "120", "-A",
-                                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "-o", o, u],
-                                        capture_output=True, text=True, timeout=130)
+                    cap = (MAX_FILE_SIZE_MB * 1024 * 1024 if kind == "video"
+                           else 50 * 1024 * 1024)
+                    try:
+                        netguard.fetch_to_file(
+                            u, o, max_bytes=cap, timeout=30, total_timeout=140,
+                            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+                    except netguard.NetGuardError as exc:
+                        log.debug("carousel item blocked: %s", exc)
+                        return False
                     return os.path.exists(o) and os.path.getsize(o) > 5000
                 ok_m = await asyncio.to_thread(_dl_ig)
                 if ok_m:
@@ -4848,7 +4909,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 with open(mkv, "rb") as fh:
                     await q.message.reply_document(
                         document=fh, filename=doc_name,
-                        caption=f"🎬 **{vtitle}**\n💬 زیرنویس {sublang} داخل فایل — تو VLC/MX Player میتونی خاموش/رونش کنی",
+                        caption=f"🎬 **{_md_escape(vtitle)}**\n💬 زیرنویس {sublang} داخل فایل — تو VLC/MX Player میتونی خاموش/رونش کنی",
                         parse_mode="Markdown")
                 db.record_download(uid, sub_url, "youtube", f"subs-embedded:{sublang}", True)
                 dl.cleanup(mkv)
@@ -4889,7 +4950,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 with open(hard_out, "rb") as fh:
                     await q.message.reply_document(
                         document=fh, filename=doc_name,
-                        caption=f"🔥 **{vtitle}**\n💬 زیرنویس {sublang} روی تصویر حک شده",
+                        caption=f"🔥 **{_md_escape(vtitle)}**\n💬 زیرنویس {sublang} روی تصویر حک شده",
                         parse_mode="Markdown")
                 db.record_download(uid, sub_url, "youtube", f"hardsub:{sublang}", True)
                 dl.cleanup(hard_out)
@@ -5217,9 +5278,15 @@ async def _register_commands(app) -> None:
         ]
         _all = private_cmds + [BotCommand("admin", "🛡 Admin panel")]
         await app.bot.set_my_commands(_all, scope=BotCommandScopeDefault())
-        # Admin sees /admin in their private chat
-        await app.bot.set_my_commands(
-            _all, scope=BotCommandScopeChat(chat_id=ADMIN_IDS[0]))
+        # Admin sees /admin in their private chat. ADMIN_IDS may legitimately
+        # be empty (admins can also live only in the DB), and indexing [0] on
+        # an empty tuple crashed post_init — i.e. the bot "started" then died.
+        for _admin_id in ADMIN_IDS:
+            try:
+                await app.bot.set_my_commands(
+                    _all, scope=BotCommandScopeChat(chat_id=_admin_id))
+            except Exception as exc:
+                log.warning("set_my_commands for admin %s failed: %s", _admin_id, exc)
         log.info("registered command menu (private + admin)")
     except Exception as e:
         log.warning("set_my_commands failed: %s", e)
@@ -5263,14 +5330,36 @@ def _install_local_file_passthrough(_app) -> None:
 
 
 def main():
+    # Fail fast (and safely) on unusable configuration: a clear message beats
+    # a traceback from deep inside a download, and the message never contains
+    # the token itself.
+    try:
+        warnings = config.validate(startup=True)
+    except config.ConfigError as exc:
+        logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s",
+                            level=logging.INFO)
+        log.critical("configuration error: %s", exc)
+        raise SystemExit(2) from None
+    for warning in warnings:
+        log.warning("config: %s", warning)
+    config.ensure_dirs()
+
     db.init_db()
-    cdncache.install_db_helpers()
+    ok, detail = db.check_integrity()
+    if not ok:
+        log.critical("database integrity check failed: %s", detail)
+        raise SystemExit(3)
+    db.backup_database()
     cdncache.ensure_table()
-    _builder = ApplicationBuilder().token(BOT_TOKEN)
+    # Timeouts are explicit: PTB's 5 s read default aborts slow sends on a
+    # busy VPS, and a stuck socket without a connect timeout wedges a worker.
+    _builder = (ApplicationBuilder().token(BOT_TOKEN)
+                .connect_timeout(20).read_timeout(60).write_timeout(180)
+                .pool_timeout(30))
     # Local Bot API server (2 GB uploads) is optional — set TG_API_BASE to
     # e.g. http://127.0.0.1:8081/bot when one is running, otherwise the
     # official Telegram API is used (50 MB upload cap).
-    _api_base = os.environ.get("TG_API_BASE", "").strip()
+    _api_base = config.TG_API_BASE
     if _api_base:
         # Local Bot API server, run with --local: local_mode turns local file
         # paths into file:// URIs so the server reads media from disk — the

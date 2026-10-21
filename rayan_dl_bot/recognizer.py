@@ -23,6 +23,11 @@ import re
 import subprocess
 import urllib.parse
 
+try:  # package import (production) vs flat import (tests/scripts)
+    from . import netguard
+except ImportError:  # pragma: no cover
+    import netguard
+
 log = logging.getLogger("rayan-dl")
 
 # The WARP SOCKS5 proxy — Shazam blocks our datacenter IP directly (403),
@@ -309,11 +314,9 @@ def _acoustid_lookup(duration, fingerprint) -> list:
         "fingerprint": fingerprint, "meta": "recordings+releasegroups",
     })
     try:
-        sub = subprocess.run(
-            ["curl", "-s", "--max-time", "30",
-             f"https://api.acoustid.org/v2/lookup?{params}"],
-            capture_output=True, text=True, timeout=40)
-        d = json.loads(sub.stdout)
+        d = netguard.fetch_json(
+            f"https://api.acoustid.org/v2/lookup?{params}",
+            max_bytes=4 * 1024 * 1024, timeout=30, total_timeout=40)
         if d.get("status") != "ok":
             log.warning("acoustid status=%s", d.get("status"))
             return []
@@ -347,14 +350,18 @@ def _acoustid_lookup(duration, fingerprint) -> list:
 def _coverart_url(rg_id: str) -> str:
     """Cover Art Archive front image for a releasegroup, verified reachable.
     Empty string when unavailable (never blocks recognition for long)."""
+    # rg_id comes from a remote API response — only a MusicBrainz UUID shape
+    # is allowed, so it cannot smuggle a different host/path into the URL.
+    rg_id = re.sub(r"[^0-9a-fA-F-]", "", str(rg_id or ""))[:64]
     if not rg_id:
         return ""
     url = f"https://coverartarchive.org/release-group/{rg_id}/front-250"
     try:
-        r = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-                            "-L", "--max-time", "8", url],
-                           capture_output=True, text=True, timeout=12)
-        return url if r.stdout.strip().startswith("2") else ""
+        res = netguard.probe(url, method="GET", timeout=8, max_redirects=3)
+        return url if 200 <= res.status < 300 else ""
+    except netguard.NetGuardError as e:
+        log.warning("coverart probe: %s", e)
+        return ""
     except Exception as e:
         log.warning("coverart probe: %s", e)
         return ""

@@ -20,8 +20,9 @@ import sys
 import tempfile
 import unittest.mock as mock
 
-sys.path.insert(0, "/root/hermes-workspace/scripts")
-BOT_DIR = "/root/hermes-workspace/scripts/rayan_dl_bot"
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO_ROOT)
+BOT_DIR = os.path.join(REPO_ROOT, "rayan_dl_bot")
 # the bot modules import each other flat (`import db`) — bot.py puts its own
 # dir on sys.path at runtime; tests mirror that
 sys.path.insert(0, BOT_DIR)

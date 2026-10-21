@@ -478,7 +478,13 @@ def _gt_translate(text: str, srclang: str, tgtlang: str, timeout: int = 30) -> s
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            d = json.loads(resp.read().decode("utf-8"))
+            try:
+                raw = resp.read(4 * 1024 * 1024 + 1)
+            except TypeError:  # test doubles may not accept a size argument
+                raw = resp.read()
+            if len(raw) > 4 * 1024 * 1024:
+                return None
+            d = json.loads(raw.decode("utf-8"))
         return "".join(part[0] or "" for part in d[0])
     except Exception as e:
         log = None

@@ -5,10 +5,24 @@ ig_tw.py — Instagram + Twitter downloaders for Rayan Downloader Bot
 - Twitter: yt-dlp with syndication fallback (works for public video tweets)
 """
 
+import os
 import re
 import json
 import logging
 import subprocess
+
+try:  # package import
+    from . import config
+    from . import netguard
+except ImportError:
+    try:  # flat import: package dir is on sys.path (legacy entry points)
+        import config
+        import netguard
+    except ImportError:
+        # loaded by file path as a top-level module ("igtw") from downloader.py:
+        # there is no parent package and the package dir is not on sys.path.
+        from rayan_dl_bot import config
+        from rayan_dl_bot import netguard
 
 log = logging.getLogger("rayan-igtw")
 
@@ -16,7 +30,11 @@ log = logging.getLogger("rayan-igtw")
 IG_UA = "Mozilla/5.0"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
-YTDLP = "/usr/local/bin/yt-dlp"
+try:
+    YTDLP = config.resolve_ytdlp()
+except config.ConfigError:
+    YTDLP = "yt-dlp"
+TLS_OPTS = ["--no-check-certificates"] if config.TLS_INSECURE else []
 
 
 # ── Instagram ─────────────────────────────────────────────────
@@ -24,11 +42,9 @@ def extract_ig_video_url(post_url: str) -> str | None:
     """Fetch the embed page and extract the direct video URL (logged-out)."""
     embed_url = post_url.rstrip("/") + "/embed/"
     try:
-        r = subprocess.run(
-            ["curl", "-s", "-L", "--max-time", "25", "-A", IG_UA, embed_url],
-            capture_output=True, text=True, timeout=30,
-        )
-        html = r.stdout
+        html = netguard.fetch_text(embed_url, max_bytes=4 * 1024 * 1024,
+                                   timeout=25, total_timeout=35,
+                                   headers={"User-Agent": IG_UA})
         if not html:
             return None
 
@@ -91,11 +107,9 @@ def extract_ig_carousel(post_url: str) -> dict:
     display_url (image) / video_url, so we unescape and scan it."""
     embed_url = post_url.rstrip("/") + "/embed/"
     try:
-        r = subprocess.run(
-            ["curl", "-s", "-L", "--max-time", "25", "-A", IG_UA, embed_url],
-            capture_output=True, text=True, timeout=30,
-        )
-        html = r.stdout or ""
+        html = netguard.fetch_text(embed_url, max_bytes=4 * 1024 * 1024,
+                                   timeout=25, total_timeout=35,
+                                   headers={"User-Agent": IG_UA})
         if not html:
             return {"carousel": False}
         # Unescape the layered JSON escapes to a flat string we can regex over
@@ -146,10 +160,8 @@ def download_instagram(url: str, out_path: str) -> bool:
     if not video_url:
         return False
     try:
-        r = subprocess.run(
-            ["curl", "-s", "-f", "-L", "--max-time", "300", "-A", UA, "-o", out_path, video_url],
-            capture_output=True, text=True, timeout=320,
-        )
+        netguard.fetch_to_file(video_url, out_path, max_bytes=1900 * 1024 * 1024,
+                               total_timeout=320, headers={"User-Agent": UA})
         return os_path_exists(out_path) and os_path_size(out_path) > 0
     except Exception as e:
         log.error("ig download error: %s", e)
@@ -173,13 +185,11 @@ def _syndication(twid) -> dict | None:
     twid = int(twid)
     token = str(int((twid / 1e15) * math.pi)).translate(str.maketrans('', '', '0.'))
     try:
-        r = subprocess.run(
-            ["curl", "-s", "--max-time", "15", "-A", "Googlebot",
-             f"https://cdn.syndication.twimg.com/tweet-result?id={twid}&token={token}"],
-            capture_output=True, text=True, timeout=20)
-        if not r.stdout.strip():
-            return None
-        return json.loads(r.stdout)
+        d = netguard.fetch_json(
+            f"https://cdn.syndication.twimg.com/tweet-result?id={twid}&token={token}",
+            max_bytes=4 * 1024 * 1024, timeout=15,
+            headers={"User-Agent": "Googlebot"})
+        return d if d else None
     except Exception as e:
         log.error("syndication error: %s", e)
         return None
@@ -188,12 +198,10 @@ def _syndication(twid) -> dict | None:
 def _fxtwitter(twid) -> dict | None:
     """Fetch tweet via fxtwitter API — gives FULL text (syndication truncates long tweets)."""
     try:
-        r = subprocess.run(
-            ["curl", "-s", "--max-time", "15", f"https://api.fxtwitter.com/status/{twid}"],
-            capture_output=True, text=True, timeout=20)
-        if not r.stdout.strip():
+        d = netguard.fetch_json(f"https://api.fxtwitter.com/status/{twid}",
+                                max_bytes=4 * 1024 * 1024, timeout=15)
+        if not d:
             return None
-        d = json.loads(r.stdout)
         tw = d.get("tweet")
         if not tw:
             return None
@@ -206,10 +214,7 @@ def _fxtwitter(twid) -> dict | None:
 def _resolve_short_url(url: str) -> str:
     """Follow redirects for twitter short links (t.co, tinyurl, etc.) to get the real tweet URL."""
     try:
-        r = subprocess.run(
-            ["curl", "-s", "-L", "-o", "/dev/null", "-w", "%{url_effective}", "--max-time", "15", url],
-            capture_output=True, text=True, timeout=20)
-        final = (r.stdout or "").strip()
+        final = netguard.probe(url, method="HEAD", timeout=15).url
         if final and "status" in final and final != url:
             return final
     except Exception:
@@ -434,7 +439,7 @@ def _build_from_syndication(d: dict, url: str, twid: str) -> dict:
 def get_twitter_info(url: str) -> dict:
     """Fallback info via yt-dlp (force syndication — works for public video tweets)."""
     cmd = [YTDLP, "--extractor-args", "twitter:api=syndication",
-           "-J", "--no-warnings", "--skip-download", "--no-check-certificates", url]
+           "-J", "--no-warnings", "--skip-download", *TLS_OPTS, url]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
         if r.returncode != 0:
@@ -467,10 +472,10 @@ def download_twitter(url: str, quality: str, out_path: str, direct_url: str = No
     # Fast path: direct mp4 from fxtwitter metadata
     if direct_url:
         try:
-            r = subprocess.run(
-                ["curl", "-s", "-f", "-L", "--max-time", "300", "-A",
-                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "-o", out_path, direct_url],
-                capture_output=True, text=True, timeout=320)
+            netguard.fetch_to_file(
+                direct_url, out_path, max_bytes=1900 * 1024 * 1024,
+                total_timeout=320,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
             if os_path_exists(out_path) and os_path_size(out_path) > 0:
                 return True
         except Exception as e:
@@ -481,7 +486,7 @@ def download_twitter(url: str, quality: str, out_path: str, direct_url: str = No
         fmt = "best"
     cmd = [YTDLP, "--extractor-args", "twitter:api=syndication",
            "-f", fmt, "--merge-output-format", "mp4",
-           "--no-check-certificates", "-N", "8", "--no-playlist",
+           *TLS_OPTS, "-N", "8", "--no-playlist",
            "-o", out_path, "--no-warnings", url]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -500,9 +505,11 @@ def download_twitter(url: str, quality: str, out_path: str, direct_url: str = No
 def download_twitter_photo(url: str, out_path: str) -> bool:
     """Download a single Twitter photo (direct pbs.twimg.com URL)."""
     try:
-        r = subprocess.run(
-            ["curl", "-s", "-f", "-L", "--max-time", "60", "-A", UA, "-o", out_path, url],
-            capture_output=True, text=True, timeout=70)
+        if netguard.parse_target(url).host.endswith("twimg.com"):
+            netguard.fetch_to_file(url, out_path, max_bytes=30 * 1024 * 1024,
+                                   total_timeout=70, headers={"User-Agent": UA})
+        else:
+            raise netguard.DestinationBlocked("photo host is not twimg.com")
         ok = os_path_exists(out_path) and os_path_size(out_path) > 0
         if not ok:
             # don't leave zero-byte/partial files in DOWNLOAD_DIR on failure

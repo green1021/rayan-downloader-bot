@@ -15,13 +15,30 @@ import logging
 import subprocess
 import importlib.util
 
+try:  # package import
+    from . import config
+    from . import netguard
+except ImportError:  # flat import (production sys.path contains the package dir)
+    import config
+    import netguard
+
 log = logging.getLogger("rayan-dl")
 
-DOWNLOAD_DIR = "/root/hermes-workspace/tmp/downloads"
-YTDLP = "/usr/local/bin/yt-dlp"
+DOWNLOAD_DIR = config.DOWNLOAD_DIR
+
+try:
+    YTDLP = config.resolve_ytdlp()
+except config.ConfigError as _ytdlp_error:  # keep importable for tests/tools
+    log.warning("yt-dlp not found: %s", _ytdlp_error)
+    YTDLP = "yt-dlp"
 # Node is available — use it as the JS runtime so yt-dlp can extract all
 # YouTube formats (without a JS runtime some formats/qualities are missing).
 JS_RUNTIME = ["--js-runtimes", "node:/usr/local/bin/node"]
+# Certificate verification is ON. Historically every yt-dlp call passed
+# --no-check-certificates "for speed", which silently disabled TLS validation
+# for all downloads and let a network attacker substitute content. An operator
+# can opt back in explicitly for a genuinely broken host; never by default.
+TLS_OPTS = ["--no-check-certificates"] if config.TLS_INSECURE else []
 FFMPEG = "/usr/bin/ffmpeg"
 WARP_PROXY = "socks5://127.0.0.1:40000"
 TOR_PROXY = "socks5h://127.0.0.1:9050"
@@ -120,10 +137,19 @@ def _retry_run(cmd: list, *, timeout: float, attempts: int = 3,
         raise last_exc
     raise TransientError("command failed")
 
-# Load pornhub helper
-_SPEC = importlib.util.spec_from_file_location("ph", "/root/hermes-workspace/scripts/ph_downloader.py")
-ph = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(ph)
+# Load the optional pornhub helper. It is a local, non-packaged add-on: on a
+# fresh deployment it may be absent, and that must not take the whole bot down.
+ph = None
+_PH_PATH = "/root/hermes-workspace/scripts/ph_downloader.py"
+if os.path.isfile(_PH_PATH):
+    try:
+        _SPEC = importlib.util.spec_from_file_location("ph", _PH_PATH)
+        ph = importlib.util.module_from_spec(_SPEC)
+        _SPEC.loader.exec_module(ph)
+    except Exception as exc:  # noqa: BLE001 - optional component
+        log.warning("pornhub helper unavailable: %s", exc)
+else:
+    log.info("pornhub helper not installed (%s); PH links will use yt-dlp", _PH_PATH)
 
 # Load Instagram/Twitter helper
 _SPEC2 = importlib.util.spec_from_file_location("igtw", os.path.join(os.path.dirname(os.path.abspath(__file__)), "ig_tw.py"))
@@ -189,14 +215,11 @@ def resolve_short_url(url: str) -> str:
     """Follow redirects for short links (vt.tiktok.com, t.co, etc.) so yt-dlp/extractors
     get the REAL URL. TikTok's mobile short links often break its own extractor."""
     try:
-        r = subprocess.run(
-            ["curl", "-s", "-L", "-o", "/dev/null", "-w", "%{url_effective}", "--max-time", "15", url],
-            capture_output=True, text=True, timeout=20)
-        final = (r.stdout or "").strip()
+        final = netguard.probe(url, method="HEAD", timeout=15).url
         if final and final != url and ("tiktok.com" in final or "twitter.com" in final or "x.com" in final):
             return fix_tiktok_url(final)
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("resolve_short_url(%s): %s", url, exc)
     return fix_tiktok_url(url)
 
 
@@ -249,6 +272,12 @@ def _warp_can_reach(url: str, timeout: float = 6.0) -> bool:
     """Cheap check: can WARP reach this site? Cached per-domain for 60s."""
     from urllib.parse import urlparse
     domain = urlparse(url).netloc
+    # The netloc comes from user input (it may even carry a port), so refuse
+    # anything netguard would refuse before it is pasted into a request URL.
+    try:
+        netguard.parse_target(url)
+    except netguard.NetGuardError:
+        return False
     now = __import__("time").time()
     with _warp_lock:
         cached = _warp_check_cache.get(domain)
@@ -409,9 +438,9 @@ def get_video_info(url: str) -> dict:
         url = resolve_short_url(url)
 
     proxy = get_proxy_args(url)
-    # -N 8: concurrent fragment downloads; --no-check-certificates for speed on some hosts
+    # -N 8: concurrent fragment downloads
     cmd = [YTDLP, *JS_RUNTIME, *proxy, "-J", "--no-warnings", "--skip-download",
-           "--no-check-certificates", url]
+           *TLS_OPTS, url]
     # B7: network-ish failures auto-retry with backoff; bad URLs / login walls
     # fail fast. TikTok's API rate-limits aggressively → one extra attempt.
     attempts = 4 if is_tiktok(url) else 3
@@ -494,8 +523,7 @@ def search_youtube(query: str, limit: int = 30) -> list:
     Filters out channels/non-video entries; includes enough results for paging."""
     try:
         r = subprocess.run(
-            ["/usr/local/bin/yt-dlp", *JS_RUNTIME, "--flat-playlist", "-J", "--no-check-certificates",
-             f"ytsearch{limit}:{query}"],
+            [YTDLP, *JS_RUNTIME, "--flat-playlist", "-J", *TLS_OPTS, f"ytsearch{limit}:{query}"],
             capture_output=True, text=True, timeout=60,
         )
         if r.returncode != 0:
@@ -533,8 +561,8 @@ def download_url_audio(url: str, out_file: str) -> bool:
     out = os.path.join(d, stem + ".m4a")
     try:
         r = subprocess.run(
-            ["/usr/local/bin/yt-dlp", *JS_RUNTIME, "-f", "bestaudio[ext=m4a]/bestaudio", "--no-playlist",
-             "--no-check-certificates", "--force-overwrites",
+            [YTDLP, *JS_RUNTIME, "-f", "bestaudio[ext=m4a]/bestaudio", "--no-playlist",
+             *TLS_OPTS, "--force-overwrites",
              *_size_gate(),
              "-o", out, url],
             capture_output=True, text=True, timeout=240,
@@ -562,8 +590,8 @@ def download_song(title: str, artist: str, out_file: str, want_mp3: bool = False
         try:
             if want_mp3:
                 r = subprocess.run(
-                    ["/usr/local/bin/yt-dlp", *JS_RUNTIME, "-f", "bestaudio[ext=m4a]/bestaudio", "--no-playlist",
-                     "--no-check-certificates", "--force-overwrites",
+                    [YTDLP, *JS_RUNTIME, "-f", "bestaudio[ext=m4a]/bestaudio", "--no-playlist",
+                     *TLS_OPTS, "--force-overwrites",
                      *_size_gate(),
                      "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
                      "-o", os.path.join(d, stem), query],
@@ -577,8 +605,8 @@ def download_song(title: str, artist: str, out_file: str, want_mp3: bool = False
                 # Fast path: download m4a (aac) directly, no re-encode
                 out = os.path.join(d, stem + ".m4a")
                 r = subprocess.run(
-                    ["/usr/local/bin/yt-dlp", *JS_RUNTIME, "-f", "bestaudio[ext=m4a]/bestaudio", "--no-playlist",
-                     "--no-check-certificates", "--force-overwrites",
+                    [YTDLP, *JS_RUNTIME, "-f", "bestaudio[ext=m4a]/bestaudio", "--no-playlist",
+                     *TLS_OPTS, "--force-overwrites",
                      *_size_gate(),
                      "-o", out, query],
                     capture_output=True, text=True, timeout=200,
@@ -624,10 +652,13 @@ def download_audio_wav(url: str, out_wav: str, seconds: int = 30) -> bool:
             if not video_url:
                 return False
             src = out_wav + ".ig.mp4"
-            r = subprocess.run(
-                ["curl", "-s", "-L", "--max-time", "120", "-A", igtw.UA, "-o", src, video_url],
-                capture_output=True, text=True, timeout=140,
-            )
+            try:
+                netguard.fetch_to_file(video_url, src, max_bytes=200 * 1024 * 1024,
+                                       total_timeout=140,
+                                       headers={"User-Agent": igtw.UA})
+            except netguard.NetGuardError as exc:
+                log.warning("ig audio fetch blocked: %s", exc)
+                return False
             if not (os.path.exists(src) and os.path.getsize(src) > 0):
                 return False
             ok = _ffmpeg_wav(src)
@@ -644,9 +675,8 @@ def download_audio_wav(url: str, out_wav: str, seconds: int = 30) -> bool:
     tmp = out_wav + ".raw"
     try:
         r = subprocess.run(
-            ["/usr/local/bin/yt-dlp", *JS_RUNTIME, "-f", "bestaudio/best", "--no-playlist",
-             "--no-check-certificates",
-             *_size_gate(),
+            [YTDLP, *JS_RUNTIME, "-f", "bestaudio/best", "--no-playlist",
+             *TLS_OPTS, *_size_gate(),
              "-N", "8", "-o", tmp, url],
             capture_output=True, text=True, timeout=180,
         )
@@ -685,10 +715,10 @@ def download_video(url: str, quality: str, is_audio: bool, out_path: str) -> boo
         if not video_url:
             return False
         try:
-            r = subprocess.run(
-                ["curl", "-s", "-L", "--max-time", "300", "-A", igtw.UA, "-o", out_path, video_url],
-                capture_output=True, text=True, timeout=320,
-            )
+            netguard.fetch_to_file(video_url, out_path,
+                                   max_bytes=MAX_FILESIZE_BYTES or 1900 * 1024 * 1024,
+                                   total_timeout=320,
+                                   headers={"User-Agent": igtw.UA})
             ok = os.path.exists(out_path) and os.path.getsize(out_path) > 0
             if not ok:
                 for cand in (out_path + ".mp4",):
@@ -722,7 +752,7 @@ def download_video(url: str, quality: str, is_audio: bool, out_path: str) -> boo
     if is_audio:
         cmd = [YTDLP, *JS_RUNTIME, *proxy, "-x", "--audio-format", "mp3", "-f", "bestaudio",
                *_size_gate(),
-               "--no-check-certificates", "-N", "8",
+               *TLS_OPTS, "-N", "8",
                "-o", out_path, "--no-warnings", url]
     else:
         if quality == "audio":
@@ -735,7 +765,7 @@ def download_video(url: str, quality: str, is_audio: bool, out_path: str) -> boo
         cmd = [YTDLP, *JS_RUNTIME, *proxy, "-f", fmt,
                "--merge-output-format", "mp4",
                *_size_gate(),
-               "--no-check-certificates", "-N", "8",
+               *TLS_OPTS, "-N", "8",
                "--no-playlist",
                "-o", out_path, "--no-warnings", url]
     try:
@@ -785,7 +815,7 @@ def list_available_subs(url: str) -> dict | None:
     try:
         r = subprocess.run(
             [YTDLP, *JS_RUNTIME, *proxy, "--list-subs", "--skip-download",
-             "--no-warnings", "--no-check-certificates", url],
+             "--no-warnings", *TLS_OPTS, url],
             capture_output=True, text=True, timeout=45)
         out = r.stdout or ""
         if not out or "has no subtitles" in out.lower():
@@ -834,8 +864,7 @@ def download_video_with_subs(url: str, lang: str, out_path: str,
            "--embed-subs", "--write-subs", "--sub-langs", lang,
            "--merge-output-format", "mkv",
            *_size_gate(),
-           "-f", vf, "--no-playlist", "--no-check-certificates",
-           "-o", stem, url]
+           "-f", vf, "--no-playlist", *TLS_OPTS, "-o", stem, url]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
         for cand in sorted(_glob.glob(stem + "*.mkv")):
@@ -890,8 +919,7 @@ def download_subtitle(url: str, lang: str, out_path: str) -> str | None:
         r = subprocess.run(
             [YTDLP, *JS_RUNTIME, *proxy, "--write-subs", "--write-auto-subs",
              "--sub-langs", lang, "--sub-format", "srt/vtt/best", "--skip-download",
-             "--no-warnings", "--no-check-certificates",
-             "-o", os.path.join(d, stem), url],
+             "--no-warnings", *TLS_OPTS, "-o", os.path.join(d, stem), url],
             capture_output=True, text=True, timeout=90)
         # yt-dlp names it <stem>.<lang>.srt (or .vtt)
         for f in sorted(glob.glob(os.path.join(d, stem + "*.srt"))) or \
@@ -910,7 +938,7 @@ def download_playlist(url: str, out_dir: str) -> int:
     cmd = [YTDLP, *JS_RUNTIME, *proxy, "-f", "best[height<=720]+bestaudio/best[height<=720]",
            "--merge-output-format", "mp4",
            *_size_gate(),
-           "--no-check-certificates", "-N", "8",
+           *TLS_OPTS, "-N", "8",
            "-o", os.path.join(out_dir, "%(title).80s.%(ext)s"),
            "--no-warnings", url]
     try:

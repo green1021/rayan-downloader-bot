@@ -12,9 +12,10 @@ import py_compile
 import sys
 import unittest.mock as mock
 
-sys.path.insert(0, "/root/hermes-workspace/scripts")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO_ROOT)
 
-BOT_DIR = "/root/hermes-workspace/scripts/rayan_dl_bot"
+BOT_DIR = os.path.join(REPO_ROOT, "rayan_dl_bot")
 MODULES = ("bot", "db", "downloader", "recognizer", "i18n", "i18n_extra",
            "ig_tw", "plugin_manager", "plugin_builder", "auto_detect",
            "dlqueue", "linkcache", "cdncache", "subtitle_translate")
@@ -135,7 +136,10 @@ def test_install_paths_use_safe_urlopen():
     manifest_start = s.find("def _install_manifest")
     raw_start = s.find("def _install_raw")
     install_bodies = s[body_start:raw_start if raw_start > manifest_start else len(s)]
-    assert "_safe_urlopen(url" in install_bodies
+    # The install path now goes through netguard (pinned DNS, scheme allow-list,
+    # byte caps, redirect revalidation); _safe_urlopen is only a compat shim.
+    assert ("netguard.fetch_to_file(" in install_bodies
+            or "_safe_urlopen(url" in install_bodies)
     assert "urllib.request.urlopen(req" not in install_bodies
 
 
@@ -149,7 +153,12 @@ def test_plugin_callers_use_call_with_timeout():
         i = s.find(f"def {fname}")
         j = s.find("\ndef ", i + 1)
         body = s[i:j]
-        assert "call_with_timeout" in body, f"{fname} lacks timeout enforcement"
+        # All three dispatch through _invoke(), which applies _timeout_for():
+        # a hard subprocess timeout in isolated mode and call_with_timeout()
+        # when RAYAN_PLUGIN_ISOLATION=0.
+        assert "_invoke(" in body, f"{fname} does not use the bounded dispatcher"
+    k = s.find("def _invoke")
+    assert "_timeout_for(meta)" in s[k:s.find("\ndef ", k + 1)]
 
 
 # ------------------------------------------------------------------
@@ -159,6 +168,7 @@ def test_db_conn_uses_safe_factory(tmpdir=None):
     import importlib
     import rayan_dl_bot.db as db
     importlib.reload(db)
+    db.init_db()  # production calls ensure_dirs()+init_db before any _conn()
     conn = db._conn()
     try:
         assert type(conn).__name__ == "_SafeConn"
@@ -234,7 +244,9 @@ def test_curl_downloads_use_fail_flag():
         i = s.find(f"def {fname}")
         j = s.find("\ndef ", i + 1)
         body = s[i:j]
-        assert '"-f"' in body or "-sf" in body.replace('"', ""), f"{fname} missing curl -f"
+        # curl -f was replaced by netguard, which raises on any non-2xx
+        # response instead of writing the error page to disk.
+        assert "netguard." in body, f"{fname} bypasses the netguard downloader"
 
 
 # ------------------------------------------------------------------
@@ -313,7 +325,7 @@ def test_inflight_download_dedup_present():
 
 
 def test_i18n_extra_group_settings_has_media_rows():
-    sys.path.insert(0, "/root/hermes-workspace/scripts")
+    sys.path.insert(0, REPO_ROOT)
     from rayan_dl_bot import i18n
     kwargs = dict(quality=720, auto="on", silent="off", media="x", filter_="all")
     for lang in ("tr", "ru", "de", "es"):

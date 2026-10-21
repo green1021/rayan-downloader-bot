@@ -53,8 +53,35 @@ export TG_ADMIN_IDS="YOUR_TELEGRAM_USER_ID" # numeric ID from @userinfobot
 python3 rayan_dl_bot_main.py
 ```
 
-> The bot reads its token from `TG_BOT_TOKEN`, or falls back to a legacy token file. Tokens are **never** committed.
-> **Admins:** initial admins come from `TG_ADMIN_IDS`. More can be added at runtime via `/admin` → «➕ Add admin» and are stored in the local SQLite DB — which is **never committed**.
+> The bot reads its token from `TG_BOT_TOKEN` (or `BOT_TOKEN`, or the first
+> line of `RAYAN_TOKEN_FILE`). The old legacy-script scraping fallback was
+> removed. Tokens are **never** committed or logged.
+> **Admins:** initial admins come from `TG_ADMIN_IDS`. More can be added at runtime via `/admin` → «➕ Add admin» and are stored in the local SQLite DB — which is **never** committed.
+
+### Configuration
+
+All values are optional; defaults reproduce the historical layout. Invalid
+values stop startup with one operator-safe message (never a token).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TG_BOT_TOKEN` / `BOT_TOKEN` | — (required) | BotFather token |
+| `RAYAN_TOKEN_FILE` | — | Alternative: file whose first line is the token |
+| `TG_ADMIN_IDS` | empty | Comma-separated numeric admin IDs (bootstrap) |
+| `RAYAN_DATA_DIR` | `/root/hermes-workspace/data` | Data directory, holds DB + backups |
+| `RAYAN_DB_PATH` | `<data>/rayan.db` | SQLite database |
+| `RAYAN_DOWNLOAD_DIR` | `/root/hermes-workspace/tmp/downloads` | Scratch downloads (safe to prune) |
+| `RAYAN_PLUGINS_DIR` | `<package>/plugins` | Plugin store |
+| `TG_API_BASE` | official API | Local Bot API base, e.g. `http://127.0.0.1:8081/bot` |
+| `RAYAN_API_STORAGE` | disabled | Local Bot API file store; counted, **never deleted** |
+| `RAYAN_DISK_LIMIT_GB` | `2` | Download-area budget |
+| `RAYAN_MAX_FILE_SIZE_MB` | `1900` | Per-file cap; also passed to yt-dlp |
+| `RAYAN_TLS_INSECURE` | `0` | **Escape hatch only**: `1` disables TLS verification |
+| `RAYAN_PLUGIN_ISOLATION` | `1` | `0` runs plugins in-process (less safe) |
+| `RAYAN_YTDLP` | auto-detect | yt-dlp executable |
+
+`python3 rayan_dl_bot_main.py` validates configuration and creates the data,
+download and plugin directories before starting the bot.
 
 ### Optional extras
 | Feature | Needs |
@@ -81,7 +108,10 @@ Plugins handle sites the core doesn't (comics → PDF, galleries, custom extract
 2. Send either:
    - a `.zip` containing `plugin.json` + code (≤ 30 MB, ≤ 200 files), or
    - a raw GitHub URL to `plugin.json`
-3. Validated (https-only, public hosts, safe paths) and installed automatically
+3. Fetched through the egress guard (https-only, public hosts, size cap), the
+   archive is inspected **before** extraction (traversal, symlinks, entry
+   count, expansion), then installed into a fresh temp directory and moved
+   into place. A failed upgrade leaves the previous version working.
 
 ### Write your own plugin
 ```
@@ -115,18 +145,97 @@ rayan_dl_bot/
 ├── ig_tw.py          # Instagram + Twitter (photos/text/threads/quotes/carousels/GIFs)
 ├── recognizer.py     # Shazam-style recognition (multi-offset + AcoustID)
 ├── auto_detect.py    # Unknown-site two-stage detection
-├── plugin_manager.py # Plugin loader (sandboxed install, timeouts, module cache)
+├── plugin_manager.py # Plugin install/validation/dispatch (isolated subprocess)
 ├── plugin_builder.py # Guided plugin creation from the admin panel
 ├── i18n.py           # Translations (fa/en full)
 └── i18n_extra.py     # tr/ru/de/es packs
 ```
 
 ## 🔒 Security Notes
-- Bot token never hardcoded — env vars only
-- Plugin installs: https-only, public-host SSRF guard, Zip-Slip protection, size caps, execution timeout
-- Site routing by parsed **hostname**, not substring matching (no `notinstagram.com` surprises)
-- Files deleted after sending; force-join confirmations expire after 24 h
-- DB and tokens are git-ignored
+
+- Bot token never hardcoded, never logged; env/file only.
+- **One outbound egress path** (`rayan_dl_bot/netguard.py`): scheme allow-list,
+  DNS resolution once, every resolved address validated, connection pinned to
+  the validated IP (no validate-then-reconnect TOCTOU), redirects revalidated
+  on every hop, connect/total timeouts, and response-size caps. Blocks
+  loopback, private, link-local, IPv4-mapped IPv6 and `file://`/`gopher://`
+  destinations; fails closed on mixed DNS answers.
+- **TLS verification is on by default.** `RAYAN_TLS_INSECURE=1` is a narrowly
+  scoped, documented escape hatch and logs a startup warning.
+- Plugin installs are treated as untrusted input: fetched through netguard,
+  manifest size capped, archive inspected before extraction (traversal,
+  symlinks, entry count, expansion), entry path contained via `realpath`.
+- Plugin **execution** uses one subprocess per call with a scrubbed
+  environment, rlimits and a private `TMPDIR`. This is process separation and
+  resource limiting — **not a security sandbox**. A plugin still runs with the
+  bot user's privileges and network access. Install only plugins you trust.
+- Site routing by parsed **hostname**, not substring matching.
+- Files deleted after sending; force-join confirmations expire after 24 h.
+- DB, backups and tokens are git-ignored.
+
+## 🧪 Tests
+
+The suite is stdlib `unittest` — no pytest, no extra dependencies:
+
+```bash
+./venv/bin/python tests/test_production_hardening.py -v   # queue, SQLite, plugins, SSRF, disk
+for f in tests/test_*.py; do echo "== $f"; ./venv/bin/python "$f"; done
+```
+
+Tests use temporary data/plugin directories and loopback HTTP fixtures. They
+never touch the production database, token or Telegram API. The public-HTTPS
+check skips itself when the host has no outbound network.
+
+## 💾 Backup and restore
+
+Backups use SQLite's online backup API, are written to `<data>/backups/`, keep
+the newest 7, and never stop the bot on failure. An automatic backup runs at
+most once a day; admins can also download one from `/admin`.
+
+```bash
+# manual backup (bot stopped or running — both are safe)
+sqlite3 /root/hermes-workspace/data/rayan.db ".backup '/root/backups/rayan-manual.db'"
+# verify
+sqlite3 /root/backups/rayan-manual.db "PRAGMA quick_check; SELECT COUNT(*) FROM users;"
+
+# restore (stop the bot first)
+systemctl stop tg-download-bot
+cp /root/hermes-workspace/data/rayan.db /root/backups/rayan-before-restore.db
+cp <backup.db> /root/hermes-workspace/data/rayan.db
+rm -f /root/hermes-workspace/data/rayan.db-wal /root/hermes-workspace/data/rayan.db-shm
+systemctl start tg-download-bot
+```
+
+## ↩️ Rollback
+
+Code rollback (before or after a controlled restart):
+
+```bash
+cd /root/rayan-downloader-bot
+git switch audit/production-hardening     # or the previous release branch
+git log --oneline -5                      # pick the last known-good commit
+git switch --detach <known-good-commit>   # inspect; do not discard user work
+systemctl restart tg-download-bot
+systemctl is-active tg-download-bot
+journalctl -u tg-download-bot -n 50 --no-pager
+```
+
+Database rollback uses the verified backup above. Keep the pre-deploy backup
+until the new version has served real requests successfully.
+
+### Safe upgrade sequence (documented, not executed by the audit)
+
+1. Back up the tree and DB: `git bundle`/`tar` + `sqlite3 .backup`; verify the
+   backup opens and `PRAGMA quick_check` returns `ok`.
+2. `git fetch && git switch <release-commit>`; `./venv/bin/pip install -r requirements.txt`
+   only if dependencies changed.
+3. Run `./venv/bin/python tests/test_production_hardening.py` and the rest of
+   `tests/` — every file must exit 0.
+4. `systemctl restart tg-download-bot`; poll `systemctl is-active` and
+   `journalctl -u tg-download-bot -n 50` for a clean startup line.
+5. Send one real download request and confirm delivery.
+6. If anything fails: restore the DB backup, check out the previous commit,
+   restart, and re-verify.
 
 ## 🔄 Staying healthy
 YouTube frequently changes internals that break old yt-dlp releases. Schedule an update:

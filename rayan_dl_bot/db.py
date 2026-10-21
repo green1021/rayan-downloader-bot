@@ -12,9 +12,15 @@ import logging
 import string
 from datetime import datetime
 
+try:  # package import
+    from . import config
+except ImportError:  # flat import (production sys.path contains the package dir)
+    import config
+
 log = logging.getLogger("rayan-dl-db")
 
-DB_PATH = "/root/hermes-workspace/data/rayan.db"
+# Single source of truth; the default in config.py is the historical path.
+DB_PATH = config.DB_PATH
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -128,7 +134,13 @@ CREATE INDEX IF NOT EXISTS idx_referrals_inviter ON referrals(inviter_id);
 
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    # Journal mode is a database-wide property: set it ONCE here instead of on
+    # every short-lived connection (re-issuing it needs a lock and could make
+    # concurrent writers fail with "database is locked" during an online
+    # backup, which holds a read transaction).
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SCHEMA)
     # Migrate legacy tables (add missing columns if they exist without them)
     try:
@@ -212,13 +224,105 @@ class _SafeConn(sqlite3.Connection):
 
 
 def _conn():
-    c = sqlite3.connect(DB_PATH, factory=_SafeConn)
-    # Speed: WAL + synchronous=NORMAL dramatically improves write throughput
-    # (batches many small writes instead of fsync per transaction).
-    c.execute("PRAGMA journal_mode=WAL")
+    # ``timeout`` is SQLite's busy handler; WAL is enabled once in init_db().
+    # ``synchronous`` is per-connection and does not need a write lock.
+    c = sqlite3.connect(DB_PATH, timeout=30, factory=_SafeConn)
     c.execute("PRAGMA synchronous=NORMAL")
-    c.execute("PRAGMA busy_timeout=5000")
+    c.execute("PRAGMA busy_timeout=30000")
     return c
+
+
+def execute(sql: str, args=()) -> int:
+    """Run one write statement on a short-lived connection; return rowcount."""
+    conn = _conn()
+    try:
+        cur = conn.execute(sql, args)
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+def query_one(sql: str, args=()):
+    """Run one SELECT and return the first row (or ``None``)."""
+    conn = _conn()
+    try:
+        return conn.execute(sql, args).fetchone()
+    finally:
+        conn.close()
+
+
+def ensure_fileid_cache() -> None:
+    """Create the Telegram file_id cache table if it does not exist."""
+    conn = _conn()
+    try:
+        conn.execute("""CREATE TABLE IF NOT EXISTS fileid_cache (
+            url_hash TEXT PRIMARY KEY,
+            url TEXT,
+            file_id TEXT,
+            kind TEXT,
+            caption TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )""")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def check_integrity() -> tuple[bool, str]:
+    """Cheap structural check (``quick_check``) before the bot starts writing."""
+    try:
+        conn = _conn()
+        try:
+            row = conn.execute("PRAGMA quick_check").fetchone()
+        finally:
+            conn.close()
+        result = (row[0] if row else "no result") or ""
+        return result.lower() == "ok", result
+    except sqlite3.Error as exc:
+        return False, str(exc)
+
+
+def backup_database(keep: int = 7, force: bool = False) -> str | None:
+    """Consistent online backup via SQLite's backup API (safe while WAL is hot).
+
+    Runs at most once per day unless ``force``; keeps the newest ``keep``
+    copies.  A failed backup is logged and must never stop the bot.
+    """
+    import datetime as _dt
+
+    backup_dir = os.path.join(os.path.dirname(DB_PATH) or ".", "backups")
+    try:
+        os.makedirs(backup_dir, exist_ok=True)
+        today = _dt.date.today().isoformat()
+        existing = sorted(f for f in os.listdir(backup_dir)
+                          if f.startswith("rayan-") and f.endswith(".db"))
+        if not force and any(f.startswith(f"rayan-{today}") for f in existing):
+            return None
+        dest = os.path.join(backup_dir, f"rayan-{today}.db")
+        if os.path.exists(dest):
+            dest = os.path.join(backup_dir,
+                                f"rayan-{today}-{int(_dt.datetime.now().timestamp())}.db")
+        src = sqlite3.connect(DB_PATH, timeout=30)
+        try:
+            dst = sqlite3.connect(dest, timeout=30)
+            try:
+                src.backup(dst)
+                dst.execute("PRAGMA journal_mode=DELETE")
+            finally:
+                dst.close()
+        finally:
+            src.close()
+        for name in existing[:max(0, len(existing) - keep + 1)]:
+            try:
+                os.remove(os.path.join(backup_dir, name))
+            except OSError:
+                pass
+        log.info("database backup written: %s", dest)
+        return dest
+    except Exception as exc:  # noqa: BLE001 - backups must not be fatal
+        log.error("database backup failed: %s", exc)
+        return None
 
 
 def record_user(update) -> int:

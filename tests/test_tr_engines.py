@@ -21,13 +21,15 @@ Run:
 """
 import asyncio
 import json
+import os
 import sys
 import types
 import unittest.mock as mock
 import urllib.error
 
-sys.path.insert(0, "/root/hermes-workspace/scripts")
-BOT_DIR = "/root/hermes-workspace/scripts/rayan_dl_bot"
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO_ROOT)
+BOT_DIR = os.path.join(REPO_ROOT, "rayan_dl_bot")
 sys.path.insert(0, BOT_DIR)
 
 # FLAT import: subtitle_translate resolves `import translation_engines` to the

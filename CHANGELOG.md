@@ -2,6 +2,42 @@
 
 All notable changes to the Rayan Downloader Bot.
 
+## [Unreleased] - production hardening (audit)
+
+### Security
+- New `netguard.py` egress layer replaces every `curl`/`urlopen` call that
+  consumed remote input: pinned validated IPs, redirect revalidation, timeouts,
+  byte caps, blocks loopback/private/link-local/IPv4-mapped IPv6/`file://`.
+- TLS verification is the default; `--no-check-certificates` now only appears
+  when `RAYAN_TLS_INSECURE=1` is explicitly set.
+- Plugin install: netguard fetch, pre-extraction archive inspection, manifest
+  size cap, `realpath` entry containment; failed upgrade preserves the old
+  plugin.
+- Plugins execute one call per subprocess with scrubbed env, rlimits and a
+  private TMPDIR (documented as process separation, **not a sandbox**).
+
+### Fixed
+- Queue: per-user cap and fair-share scheduling; cancellation/timeout/exception
+  paths release permits; no lost `_waiting_total` accounting.
+- SQLite: WAL set once at init instead of on every connection; 30 s busy
+  timeout; online backups are openable/queryable under concurrent writes;
+  retention and failure handling verified.
+- Disk cleanup now checks real free space as well as quota, never deletes the
+  local Bot API store, and keeps files younger than 10–60 minutes.
+- Telegram Markdown captions escape remote titles (`_ * [ ] `` ` ``), so a
+  successful download is not lost to an entity parse error.
+- `post_init` no longer crashes on an empty admin list.
+- IPv6 HTTP `Host` header is a valid authority.
+- Plugin site routing no longer falls back to substring matching for domain
+  rules (`instagram.com` vs `notinstagram.com`), with a regression test.
+
+### Added
+- `config.py` single source of truth with fail-fast validation.
+- `tests/test_production_hardening.py`: 44 stdlib tests covering queue
+  fairness/cancellation, SQLite integrity/backup/WAL/restore, plugin archive
+  attacks/timeout kill/env scrub, SSRF matrix/DNS rebinding/size caps, disk
+  cleanup and TLS defaults.
+
 ## [1.1.0] - 2026-08-22
 
 ### Added

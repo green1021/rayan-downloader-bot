@@ -13,14 +13,27 @@ support), this module fetches the page and decides what kind of content it has:
 It's heuristic by design: for unknown sites there are no guarantees, so the bot
 warns the user that support is automatic and may be buggy.
 """
+import html as _html
 import logging
 import os
 import re
 import time as _time
 import urllib.parse
-import urllib.request
+
+try:  # package import
+    from . import netguard
+except ImportError:  # flat import (production sys.path)
+    import netguard
 
 log = logging.getLogger("rayan-dl")
+
+# Every page/media fetch in this module handles a URL chosen by an arbitrary
+# Telegram user, so it goes through netguard: scheme allow-list, public-only
+# destinations, DNS-pinned connections and a hard byte cap. A plain urlopen
+# here would let any user make the server fetch 127.0.0.1 / cloud metadata.
+PAGE_MAX_BYTES = 4 * 1024 * 1024
+IMAGE_MAX_BYTES = 25 * 1024 * 1024
+VIDEO_MAX_BYTES = 2 * 1024 * 1024 * 1024
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
@@ -47,9 +60,9 @@ SKIP_PAT = re.compile(
 
 
 def fetch_page(url: str, timeout: int = 25) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode("utf-8", "ignore")
+    response = netguard.fetch(url, max_bytes=PAGE_MAX_BYTES, timeout=timeout,
+                              total_timeout=timeout * 2, headers={"User-Agent": UA})
+    return response.body.decode("utf-8", "ignore")
 
 
 def extract_text(url: str, limit: int = 3800) -> str:
@@ -186,13 +199,11 @@ def auto_download(url: str, dtype: str, workdir: str, samples=None) -> dict:
         return {"error": f"خطا در دریافت صفحه: {e}"}
 
     def _dl_img(u, p):
-        req = urllib.request.Request(_resolve(url, u), headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=40) as resp:
-            data = resp.read()
-        if len(data) < 100:
-            raise ValueError(f"too small ({len(data)}B)")
-        with open(p, "wb") as f:
-            f.write(data)
+        written = netguard.fetch_to_file(
+            _resolve(url, u), p, max_bytes=IMAGE_MAX_BYTES, timeout=40,
+            total_timeout=90, headers={"User-Agent": UA})
+        if written < 100:
+            raise ValueError(f"too small ({written}B)")
 
     try:
         if dtype == "comic":
@@ -242,8 +253,14 @@ def auto_download(url: str, dtype: str, workdir: str, samples=None) -> dict:
                 return {"error": "لینک ویدیو پیدا نشد"}
             vurl = _resolve(url, videos[0])
             out = os.path.join(workdir, f"ad_{int(_time.time())}.mp4")
-            r = subprocess.run(["curl", "-s", "-L", "--max-time", "300", "-A", UA,
-                                "-o", out, vurl], capture_output=True, text=True, timeout=320)
+            # curl was used here with -L and no protocol/size limits: it would
+            # follow a redirect to file:// or an internal host and fill the disk.
+            try:
+                netguard.fetch_to_file(vurl, out, max_bytes=VIDEO_MAX_BYTES,
+                                       timeout=45, total_timeout=300,
+                                       headers={"User-Agent": UA})
+            except netguard.NetGuardError as exc:
+                return {"error": f"دانلود ویدیو مسدود شد: {exc}"}
             if os.path.exists(out) and os.path.getsize(out) > 0:
                 return {"type": "video", "path": out, "text": "🎬 ویدیو خودکار", "auto": True}
             return {"error": "دانلود ویدیو ناموفق بود"}
@@ -284,20 +301,20 @@ def smart_detect(url: str, probe_timeout: int = 18) -> dict:
     import json as _json
     import subprocess as _sp
     try:
-        from downloader import YTDLP as _YTDLP, JS_RUNTIME as _JSR
+        from downloader import YTDLP as _YTDLP, JS_RUNTIME as _JSR, TLS_OPTS as _TLS
     except ImportError:  # standalone/testing
-        _YTDLP, _JSR = "/usr/local/bin/yt-dlp", []
+        _YTDLP, _JSR, _TLS = "/usr/local/bin/yt-dlp", [], []
     try:
         r = _sp.run(
             [_YTDLP, *_JSR, "-J", "--no-warnings",
-             "--skip-download", "--no-check-certificates", "--socket-timeout", "8",
+             "--skip-download", *_TLS, "--socket-timeout", "8",
              "--js-runtimes", "node:/usr/local/bin/node", url],
             capture_output=True, text=True, timeout=probe_timeout)
         if r.returncode != 0 or not (r.stdout or "").strip():
             # RETRY with generic extractor forced + referer (some sites need it)
             r = _sp.run(
                 [_YTDLP, *_JSR, "-J", "--no-warnings",
-                 "--skip-download", "--no-check-certificates", "--socket-timeout", "8",
+                 "--skip-download", *_TLS, "--socket-timeout", "8",
                  "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
                  url],
                 capture_output=True, text=True, timeout=probe_timeout)

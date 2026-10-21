@@ -149,6 +149,19 @@ def set_engine_cfg(engine_id: str, key: str, value: str, db_mod=None) -> bool:
 
 
 # ── HTTP helper ─────────────────────────────────────────────────
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024  # translation JSON is small; cap abuse/DoS
+
+
+def _read_capped(resp) -> bytes:
+    try:
+        data = resp.read(MAX_RESPONSE_BYTES + 1)
+    except TypeError:  # test doubles / file-like objects without a size arg
+        data = resp.read()
+    if len(data) > MAX_RESPONSE_BYTES:
+        raise EngineError("translation response too large")
+    return data
+
+
 def _post_json(url: str, payload: dict | None = None, timeout: int = ENGINE_TIMEOUT_S):
     """POST JSON, return parsed body as dict. Raises EngineError on failure."""
     data = json.dumps(payload).encode() if payload is not None else b""
@@ -156,7 +169,7 @@ def _post_json(url: str, payload: dict | None = None, timeout: int = ENGINE_TIME
     req = urllib.request.Request(url, data=data, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode())
+            return json.loads(_read_capped(r).decode())
     except urllib.error.HTTPError as e:
         raise EngineError(f"HTTP {e.code}") from e
     except Exception as e:
@@ -167,7 +180,7 @@ def _get_json(url: str, timeout: int = ENGINE_TIMEOUT_S):
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode())
+            return json.loads(_read_capped(r).decode())
     except urllib.error.HTTPError as e:
         raise EngineError(f"HTTP {e.code}") from e
     except Exception as e:
@@ -196,7 +209,7 @@ def _llm_chat(base_url: str, model: str, prompt: str,
         headers={"Content-Type": "application/json", **headers})
     try:
         with urllib.request.urlopen(body, timeout=timeout) as r:
-            raw = r.read().decode()
+            raw = _read_capped(r).decode()
     except urllib.error.HTTPError as e:
         raise EngineError(f"HTTP {e.code}") from e
     except Exception as e:
@@ -280,7 +293,7 @@ def _translate_mymemory(texts, src, dst, cfg):
     req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
     try:
         with urllib.request.urlopen(req, timeout=ENGINE_TIMEOUT_S) as r:
-            d = json.loads(r.read().decode())
+            d = json.loads(_read_capped(r).decode())
     except urllib.error.HTTPError as e:
         if e.code == 429:
             raise EngineError("429 quota") from e
