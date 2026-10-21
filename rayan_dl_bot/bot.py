@@ -341,11 +341,14 @@ async def setlimit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ── Disk management ───────────────────────────────────────────
 def folder_size(path: str) -> int:
     total = 0
-    if os.path.isdir(path):
+    if path and os.path.isdir(path):
         for dirpath, _, filenames in os.walk(path):
             for f in filenames:
                 fp = os.path.join(dirpath, f)
                 try:
+                    # Don't follow symlinks
+                    if os.path.islink(fp):
+                        continue
                     total += os.path.getsize(fp)
                 except Exception:
                     pass
