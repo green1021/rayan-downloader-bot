@@ -15,6 +15,15 @@ import shutil
 import hashlib
 import subprocess
 import uuid
+from contextlib import contextmanager
+
+@contextmanager
+def safe_upload(path):
+    fh = open(path, "rb")
+    try:
+        yield fh
+    finally:
+        fh.close()
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -2561,8 +2570,9 @@ async def _send_plugin_result(update: Update, context, result: dict, lang: str,
         if typ == "pdf" or typ == "document":
             path = result.get("path")
             if path and os.path.exists(path):
-                await context.bot.send_document(chat_id=chat_id, document=open(path, "rb"),
-                                                caption=caption, filename=os.path.basename(path))
+                with safe_upload(path) as fh:
+                    await context.bot.send_document(chat_id=chat_id, document=fh,
+                                                    caption=caption, filename=os.path.basename(path))
                 db.record_download(update.effective_user.id, result.get("source_url", ""),
                                    "plugin", typ, True)
                 dl.cleanup(path)
@@ -2571,8 +2581,9 @@ async def _send_plugin_result(update: Update, context, result: dict, lang: str,
         elif typ == "video":
             path = result.get("path")
             if path and os.path.exists(path):
-                await context.bot.send_video(chat_id=chat_id, video=open(path, "rb"),
-                                             caption=caption, supports_streaming=True)
+                with safe_upload(path) as fh:
+                    await context.bot.send_video(chat_id=chat_id, video=fh,
+                                                 caption=caption, supports_streaming=True)
                 dl.cleanup(path)
             else:
                 await status_msg.edit_text(i18n.t(lang, "download_failed"))
@@ -2580,8 +2591,10 @@ async def _send_plugin_result(update: Update, context, result: dict, lang: str,
             photos = result.get("photos") or []
             if photos:
                 from telegram import InputMediaPhoto
-                media = [InputMediaPhoto(open(p, "rb")) for p in photos]
-                await context.bot.send_media_group(chat_id=chat_id, media=media)
+                from contextlib import ExitStack
+                with ExitStack() as stack:
+                    media = [InputMediaPhoto(stack.enter_context(open(p, "rb"))) for p in photos]
+                    await context.bot.send_media_group(chat_id=chat_id, media=media)
                 for p in photos:
                     dl.cleanup(p)
             else:
@@ -2589,8 +2602,9 @@ async def _send_plugin_result(update: Update, context, result: dict, lang: str,
         elif typ == "audio":
             path = result.get("path")
             if path and os.path.exists(path):
-                await context.bot.send_audio(chat_id=chat_id, audio=open(path, "rb"),
-                                             caption=caption)
+                with safe_upload(path) as fh:
+                    await context.bot.send_audio(chat_id=chat_id, audio=fh,
+                                                 caption=caption)
                 dl.cleanup(path)
             else:
                 await status_msg.edit_text(i18n.t(lang, "download_failed"))
