@@ -3822,6 +3822,16 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # Extract URLs from the message (handles "@bot" mentions, extra text, etc.)
     raw_text = update.message.text.strip()
+    has_link = bool(re.search(r'https?://[^\s]+', raw_text))
+
+    if has_link:
+        # Rate limit only applies to actual link messages (not normal chat)
+        if rate_limited(uid):
+            await update.message.reply_text(i18n.t(lang, "rate_limit"))
+            return
+        # Group-wide pacing (private chats unaffected)
+        if is_group and chat_rate_limited(chat.id):
+            return  # silently skip — no spam in the group
 
     # ── C/B6: DAILY LIMIT — non-allowed users in private chat get a per-day
     # download cap (default 10). Groups are exempt. Batch path checks its own.
@@ -3854,14 +3864,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         await update.message.reply_text(i18n.t(lang, "invalid_url"), parse_mode="Markdown")
         return
-
-    # Rate limit only applies to actual link messages (not normal chat)
-    if rate_limited(uid):
-        await update.message.reply_text(i18n.t(lang, "rate_limit"))
-        return
-    # Group-wide pacing (private chats unaffected)
-    if is_group and chat_rate_limited(chat.id):
-        return  # silently skip — no spam in the group
 
     site = dl.detect_site(url)
 
