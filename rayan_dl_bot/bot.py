@@ -3856,11 +3856,26 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not is_group:
         if not await check_daily_limit(update, uid, lang):
             return
+        
+        # P1: Atomic quota reservation for single link
+        if not await asyncio.to_thread(db.reserve_quota, uid, 1):
+            await update.message.reply_text(i18n.t(lang, "daily_limit_reached").format(limit=db.daily_limit()))
+            return
 
     # ── C/B5: BATCH LINKS — 2-5 URLs in ONE private message → queue them all,
     # deliver one by one + a summary. Groups keep the single-link behavior.
     urls = [] if is_group else _extract_urls(raw_text)
     if len(urls) >= BATCH_MIN_URLS:
+        # P1: Atomic quota reservation for batch
+        if not is_group:
+            reserved = await asyncio.to_thread(db.reserve_quota, uid, len(urls))
+            if reserved < len(urls):
+                # Release what we couldn't use if partial reservation
+                if reserved > 0:
+                    await asyncio.to_thread(db.settle_reservation, uid, reserved, False)
+                await update.message.reply_text(i18n.t(lang, "daily_limit_reached").format(limit=db.daily_limit()))
+                return
+        
         await _handle_batch_links(update, context, urls, lang)
         return
 
