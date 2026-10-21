@@ -291,7 +291,7 @@ def smart_detect(url: str, probe_timeout: int = 18) -> dict:
         r = _sp.run(
             [_YTDLP, *_JSR, "-J", "--no-warnings",
              "--skip-download", "--no-check-certificates", "--socket-timeout", "8",
-             "--js-runtimes", "node:/usr/bin/node", url],
+             "--js-runtimes", "node:/usr/local/bin/node", url],
             capture_output=True, text=True, timeout=probe_timeout)
         if r.returncode != 0 or not (r.stdout or "").strip():
             # RETRY with generic extractor forced + referer (some sites need it)

@@ -21,7 +21,7 @@ DOWNLOAD_DIR = "/root/hermes-workspace/tmp/downloads"
 YTDLP = "/usr/local/bin/yt-dlp"
 # Node is available — use it as the JS runtime so yt-dlp can extract all
 # YouTube formats (without a JS runtime some formats/qualities are missing).
-JS_RUNTIME = ["--js-runtimes", "node:/usr/bin/node"]
+JS_RUNTIME = ["--js-runtimes", "node:/usr/local/bin/node"]
 FFMPEG = "/usr/bin/ffmpeg"
 WARP_PROXY = "socks5://127.0.0.1:40000"
 TOR_PROXY = "socks5h://127.0.0.1:9050"

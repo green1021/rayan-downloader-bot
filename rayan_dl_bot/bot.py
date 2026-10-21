@@ -66,6 +66,15 @@ MAX_FILE_SIZE_MB = 1900  # local Bot API allows up to 2GB
 # oversized files abort BEFORE wasting bandwidth/disk (post-check stays as backstop).
 dl.set_max_filesize_bytes(MAX_FILE_SIZE_MB * 1024 * 1024)
 
+
+def upload_cap_mb() -> int:
+    # Cloud Bot API caps bot uploads at 50 MB; only the local Bot API server
+    # (TG_API_BASE + --local) allows the full MAX_FILE_SIZE_MB (~2 GB).
+    # Sends gate on this so an oversized file shows a clear "too big"
+    # message instead of a 413 upload whose body PTB buffers fully in RAM
+    # (that OOM-killed this 2 GB box at a 417 MB video).
+    return MAX_FILE_SIZE_MB if os.environ.get("TG_API_BASE", "").strip() else 49
+
 # Admin IDs — initial owners from env (used for first-run bootstrap).
 # Additional admins are stored in DB (admins table) so ANY server deployment
 # can define its own admins. The DB is gitignored (never committed).
@@ -1066,7 +1075,7 @@ async def search_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         song = os.path.join(DOWNLOAD_DIR, f"srch_{uid}_{int(time.time())}.m4a")
         dl.cleanup(song)
         ok = await asyncio.to_thread(dl.download_url_audio, r["url"], song)
-        if ok and os.path.getsize(song) < MAX_FILE_SIZE_MB * 1024 * 1024:
+        if ok and os.path.getsize(song) < upload_cap_mb() * 1024 * 1024:
             try:
                 await context.bot.send_audio(
                     chat_id=q.message.chat_id,
@@ -2651,7 +2660,7 @@ async def _send_shazam_result(update: Update, context: ContextTypes.DEFAULT_TYPE
     song = os.path.join(DOWNLOAD_DIR, f"song_{int(time.time())}_{result.get('key','x')}.m4a")
     ok = await asyncio.to_thread(
         dl.download_song, result.get("title", ""), result.get("artist", ""), song)
-    if ok and os.path.exists(song) and os.path.getsize(song) < MAX_FILE_SIZE_MB * 1024 * 1024:
+    if ok and os.path.exists(song) and os.path.getsize(song) < upload_cap_mb() * 1024 * 1024:
         fh = None
         try:
             fh = open(song, "rb")
@@ -3672,7 +3681,7 @@ async def _handle_batch_links(update: Update, context: ContextTypes.DEFAULT_TYPE
                 out_path = resolve_out_path(out_path)
                 if ok_dl and out_path and os.path.exists(out_path):
                     size_mb = os.path.getsize(out_path) / (1024 * 1024)
-                    if size_mb <= MAX_FILE_SIZE_MB:
+                    if size_mb <= upload_cap_mb():
                         try:
                             info2 = dict(info)
                             info2["quality"] = quality
@@ -4203,7 +4212,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     v_path = os.path.join(DOWNLOAD_DIR, f"twthv_{uid}_{i}_{j}_{int(time.time())}.mp4")
                     ok_v = await asyncio.to_thread(igtw.download_twitter, url, "best", v_path, v_url)
                     if ok_v and os.path.exists(v_path) and os.path.getsize(v_path) > 0 \
-                            and os.path.getsize(v_path) <= MAX_FILE_SIZE_MB * 1024 * 1024:
+                            and os.path.getsize(v_path) <= upload_cap_mb() * 1024 * 1024:
                         th_media.append(("video", v_path))
                 if len(th_media) > 1:
                     try:
@@ -4285,7 +4294,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         for fname in sorted(os.listdir(out_dir)):
             if fname.endswith((".mp4", ".mkv")):
                 fpath = os.path.join(out_dir, fname)
-                if os.path.getsize(fpath) > MAX_FILE_SIZE_MB * 1024 * 1024:
+                if os.path.getsize(fpath) > upload_cap_mb() * 1024 * 1024:
                     continue
                 await context.bot.send_video(chat_id=update.effective_chat.id, video=open(fpath, "rb"), supports_streaming=True)
                 sent_any = True
@@ -4334,7 +4343,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     await status_msg.edit_text(i18n.t(lang, "download_failed"))
                 return
             size_mb = os.path.getsize(out_path) / (1024 * 1024)
-            if size_mb > MAX_FILE_SIZE_MB:
+            if size_mb > upload_cap_mb():
                 db.record_download(uid, url, site, str(chosen), False)
                 dl.cleanup(out_path)
                 if not gs["silent"]:
@@ -4477,7 +4486,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     size_mb = os.path.getsize(out_path) / (1024 * 1024)
-    if size_mb > MAX_FILE_SIZE_MB:
+    if size_mb > upload_cap_mb():
         db.record_download(uid, url, site, str(best), False)
         await status_msg.edit_text(i18n.t(lang, "too_big").format(size=int(size_mb)))
         dl.cleanup(out_path)
@@ -4993,7 +5002,7 @@ async def _run_download(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return
 
     size_mb = os.path.getsize(out_path) / (1024 * 1024)
-    if size_mb > MAX_FILE_SIZE_MB:
+    if size_mb > upload_cap_mb():
         db.record_download(uid, url, dl.detect_site(url), label, False)
         await msg.edit_text(i18n.t(lang, "too_big").format(size=int(size_mb)))
         dl.cleanup(out_path)
@@ -5216,11 +5225,60 @@ async def _register_commands(app) -> None:
         log.warning("set_my_commands failed: %s", e)
 
 
+def _install_local_file_passthrough(_app) -> None:
+    # With local_mode the local Bot API server can read media straight from
+    # disk when it is handed a file path (file:// URI). The bot's send sites
+    # pass open(..., "rb") handles, which PTB parses via obj.read() — i.e.
+    # the WHOLE file into RAM (a 417 MB video took RSS to 1.4 GB and got
+    # the process OOM-killed). Patch the ExtBot send methods once to hand
+    # over plain paths instead; only installed when TG_API_BASE is set.
+    import io as _io
+    from telegram.ext import ExtBot
+
+    _FILE_KW = ("video", "document", "audio", "animation", "photo",
+                "thumbnail", "cover", "voice")
+
+    def _localize(v):
+        if isinstance(v, _io.IOBase) and isinstance(getattr(v, "name", None), str):
+            return v.name
+        return v
+
+    def _wrap(name):
+        orig = getattr(ExtBot, name)
+
+        async def _wrapped(self, *args, **kwargs):
+            args = tuple(_localize(a) for a in args)
+            for _p in _FILE_KW:
+                if _p in kwargs:
+                    kwargs[_p] = _localize(kwargs[_p])
+            return await orig(self, *args, **kwargs)
+
+        _wrapped.__name__ = name
+        setattr(ExtBot, name, _wrapped)
+
+    for _n in ("send_video", "send_document", "send_audio",
+               "send_animation", "send_photo", "send_voice"):
+        _wrap(_n)
+    log.info("local file passthrough installed (sends use file:// paths)")
+
+
 def main():
     db.init_db()
     cdncache.install_db_helpers()
     cdncache.ensure_table()
-    app = ApplicationBuilder().token(BOT_TOKEN).base_url("http://127.0.0.1:8081/bot").build()
+    _builder = ApplicationBuilder().token(BOT_TOKEN)
+    # Local Bot API server (2 GB uploads) is optional — set TG_API_BASE to
+    # e.g. http://127.0.0.1:8081/bot when one is running, otherwise the
+    # official Telegram API is used (50 MB upload cap).
+    _api_base = os.environ.get("TG_API_BASE", "").strip()
+    if _api_base:
+        # Local Bot API server, run with --local: local_mode turns local file
+        # paths into file:// URIs so the server reads media from disk — the
+        # bot itself must never buffer multi-hundred-MB bodies in RAM.
+        _builder = _builder.base_url(_api_base).local_mode(True)
+    app = _builder.build()
+    if _api_base:
+        _install_local_file_passthrough(app)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
